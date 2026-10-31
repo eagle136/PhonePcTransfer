@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 暴露已接收文件的本地路径，供系统/其它应用用默认程序打开。
+     聊天里点文件「用系统程序打开」时：
+       · 走 MediaStore 落盘的文件是 content://，可直接授权外部应用读取，无需此处；
+       · 走应用专属目录回退（API<29 或 MediaStore 失败）的是绝对路径，必须经 FileProvider 暴露。 -->
+<paths>
+    <external-files-path name="received" path="received" />
+    <external-cache-path name="cache" path="." />
+    <files-path name="files" path="." />
+</paths>

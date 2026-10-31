@@ -1,0 +1,26 @@
+# ============================================================================
+# release（R8）自定义 keep 规则
+#
+# 挂载点：app/build.gradle.kts → buildTypes.release.optimization.keepRules.files
+# ⚠️ 2026-09-15 之前这个文件**从未被挂载**（AGP 9 的 optimization 块必须在 keepRules {}
+#    里显式 files.add 才会读；只写 enable = true 的话规则文件是死的，R8 走纯默认规则）。
+#    现在已接上 —— 改这里才真正生效，改完看 outputs/mapping/release/configuration.txt 复核。
+# ============================================================================
+
+# --- 应用代码：保留名字，但不阻止裁剪与优化 ---
+# 本应用没有反射依赖：唯一一处反射是 LanGate 对 framework 的
+# WifiManager.getMethod("isWifiApEnabled"/"getWifiApState")，作用在平台类上，R8 不会动；
+# 语音用的 concentus 已核对过，零反射、零 JNI。所以不存在"必须整份保留才能活"的类。
+# 保留名字纯粹是为了真机排障：logcat 栈、崩溃栈、javaClass.name 直接可读，
+# 不用每次翻 mapping.txt（本项目是长期在真机上抓日志改代码的节奏）。
+-keepnames class com.phonepctransfer.** { *; }
+
+# --- 落盘数据里的枚举按名字存取（跨版本读旧文件）---
+# data/MsgItem.kt 把 Dir/Kind/Status 用 .name 写进 history/*.jsonl，读回时 valueOf()。
+# R8 默认规则已经保了 values()/valueOf()，且枚举常量的 name 字面量不会被改写
+# （已逐个在 release dex 里核对过 SELF/PEER/TEXT/CLIP/PENDING/... 全部存在）；
+# 这一条是冗余保险：将来若有人把上面的 ** 收窄，也不至于误伤历史与信任名单的解析。
+-keepclassmembers,allowoptimization enum com.phonepctransfer.** { *; }
+
+# --- 崩溃栈/日志里保留真实行号（配合上面的 keepnames，真机栈直接可读）---
+-keepattributes SourceFile,LineNumberTable

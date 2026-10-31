@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 后台保活无障碍服务配置：仅用于保活，不读取任何屏幕内容 / 剪贴板。
+     canRetrieveWindowContent 关闭，不订阅任何事件（事件一律忽略），无选区捕获。 -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeAllMask"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/clip_capture_desc"
+    android:notificationTimeout="100" />

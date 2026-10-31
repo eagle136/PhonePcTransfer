@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.PhonePcTransfer" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <!-- 「复制链接」入口（2026-10-05）：**全透明、无标题、无转场动画**。
+         那个 Activity 没有布局，onCreate 里复制完立刻 finish() —— 主题这边只要保证
+         窗口本身不可见即可（否则会闪 1 帧白/黑底）。用框架的 Translucent 主题做父级，
+         不引 AppCompat。 -->
+    <style name="Theme.PhonePcTransfer.CopyLink" parent="android:Theme.Translucent.NoTitleBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+</resources>

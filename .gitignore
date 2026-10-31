@@ -1,0 +1,50 @@
+# ---- build outputs ----
+/out/
+/build/
+/android/build/
+/android/app/build/
+/android/build-ext/
+/android/.gradle/
+/android/.kotlin/
+/android/local.properties
+/pc/build/
+/pc/dist/
+/pc/installer/
+/pc/*.wxs
+/pc/手机电脑互传-*.wxs
+/tools/ipdata/build/
+
+# ---- runtime data (personal, never commit) ----
+/pc/config.json
+/pc/partials.json
+/pc/pending.jsonl
+/pc/history/
+/pc/history*.jsonl
+/pc/received/
+/pc/thumb_cache/
+/pc/log_ip.txt
+/pc/buildjavac.log
+/unin.log
+
+# ---- bundled toolchains downloaded on demand ----
+/pc/tools/jdk21/
+/pc/tools/wix311/
+/pc/tools/wix311_orig/
+/pc/tools/runtime/
+
+# ---- editor / agent scratch ----
+/_backup/
+/.workbuddy/
+/.vscode/
+/run agent.bat
+/all/
+
+# ---- build products inside tool dirs ----
+*.class
+__pycache__/
+*.bak-*
+*.log
+
+# ---- local signing material ----
+/signing/
+/local-signing/

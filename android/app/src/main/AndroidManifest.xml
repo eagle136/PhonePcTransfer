@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- ===== 语音通话：录音 ===== -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- ===== 视频通话：摄像头 =====
+         required=false：无摄像头的设备仍可装（只是「视频」按钮置灰）。
+         FOREGROUND_SERVICE_CAMERA：Android 9+ 后台应用默认不能开摄像头，
+         只有带 camera 类型的 FGS 才豁免（Android 14 对「后台启动的 FGS」另有额外限制）。 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-feature
+        android:name="android.hardware.camera.any"
+        android:required="false" />
+
+    <!-- ===== 网络连接 ===== -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- ===== 本地网络（Android 16/API 36+ 的硬前提，2026-10-01 实测）=====
+         未声明且未经用户允许的 App，它发出的**局域网包会被系统按 uid 直接丢弃**：
+         TCP 表现为 connect 超时、UDP 双向静默消失，而同机 shell 用户实测连通
+         （Android 16 机型 / ColorOS V17 上 `appops get` 显示 ACCESS_LOCAL_NETWORK: ignore 并带 rejectTime）。
+         本应用全部功能都建立在局域网直连上，缺这条 = 一台设备都连不上。 -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+
+    <!-- ===== 前台服务：WiFi/热点可用时保持链路常驻 ===== -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- mediaPlayback 类型：ColorOS(Hans) 只对带活跃 MediaSession 的媒体型前台服务豁免速冻，
+         dataSync 型实测退后台 ~6s 即被 cgroup 冻结 + OplusNetd DestroyAllSocket 断网 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- 对齐微信：后台语音通话的前台服务类型（API 34+ 必须逐类型声明） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 锁屏来电弹界面的主路径（2026-09-22）：AOSP 的「显示悬浮窗」管理列表只列
+         清单里声明了此权限的应用——不声明则列表里没有本应用、也没法单独跳转授权页 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- ===== 锁屏来电（2026-09-22）=====
+         USE_FULL_SCREEN_INTENT：Android 10(API29)+ 让「来电」通知可以带全屏意图 ——
+         锁屏/息屏时由系统直接把主界面顶到锁屏之上，用户在锁屏上就能按「接听 / 挂断」。
+         ⚠️ Android 14(API34)+ 起，非「通话/闹钟」类应用的这个权限会被系统默认收回，
+         需要在设置里手动允许（应用启动时会检查并引导一次，见 MainActivity.ensureFullScreenIntent）。
+         即便没拿到，通知上的「接听/挂断」按钮仍可在锁屏上直接点（走广播，无需解锁）。 -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+
+    <!-- ===== 存储读取（选文件用；收文件走 MediaStore，API29+ 免权限） ===== -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <!-- 可选：直接浏览 /sdcard 任意目录选文件（跳系统设置授予，不授予也能用 SAF） -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <!-- ===== 安装 APK（聊天里点 APK 消息直接装）=====
+         仅是「可以走系统安装器」的资格声明；Android 8+ 还要求本应用开一次
+         「允许安装应用」开关（首次点击 APK 时引导跳转，之后直达默认安装器） -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- 粘贴板读写不需要任何运行时权限（Android 无公开的 READ_CLIPBOARD），
+         读剪贴板的真实前提是"应用处于前台/持有焦点"，详见 PLAN.md 第 4 节 -->
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.PhonePcTransfer"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleTask"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.PhonePcTransfer"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- ===== 接收系统「分享」：全部格式（*/*）===== -->
+            <!-- 相册/文件管理器/任意应用点「分享」时都能直接选到本应用。
+                 收到后先问「发给哪台设备」，选定即开始传输（见 MainActivity.handleShareIntent）。
+                 SEND       = 单个文件（EXTRA_STREAM 一个 Uri）
+                 SEND_MULTIPLE = 多选文件（EXTRA_STREAM 一串 Uri） -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
+        <!-- ===== 「复制链接」：出现在系统「用浏览器打开」的选择框里（2026-10-05，用户需求）=====
+             android:label = 选择框里显示的名字（与「浏览器」同一注册方式，只是不渲染网页）；
+             选中它 = 把链接写进剪贴板 + 提示一句 + 立即 finish()，全程无界面（透明主题见
+             Theme.PhonePcTransfer.CopyLink）。
+             两个必须项：
+              · taskAffinity="" + singleTask —— **不并入主界面的任务**。否则点链接会把后台的
+                聊天界面连着一块顶到前台（单窗口应用最容易踩这条）；
+              · excludeFromRecents/noHistory —— 不进最近任务、不被系统恢复。 -->
+        <activity
+            android:name=".CopyLinkActivity"
+            android:exported="true"
+            android:label="@string/copy_link_label"
+            android:launchMode="singleTask"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@style/Theme.PhonePcTransfer.CopyLink">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+            </intent-filter>
+        </activity>
+
+        <!-- foregroundServiceType 必须是 runtime 请求类型的**超集**：
+             多声明一个 camera 不会报错（未使用即忽略），但 runtime 多要一个 manifest
+             没声明的类型 → startForeground 抛异常 → 进程崩（本项目已有此坑）。
+             camera 类型用于视频通话期间前台保活（Android 9+ 后台相机限制的豁免）。 -->
+        <service
+            android:name=".TransferService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync|mediaPlayback|camera" />
+
+        <!-- ===== 锁屏来电：通知上的「接听 / 挂断」按钮 =====
+             广播型入口，**锁屏上点一下即生效、不需要先解锁**（点 Activity 型会先弹解锁框）；
+             全屏意图被 ROM 拦掉时靠这条路兜底。非导出，只由本应用自己的通知按钮触发。 -->
+        <receiver
+            android:name=".CallActionReceiver"
+            android:exported="false" />
+
+        <!-- ===== 文件「打开方式」的点选回调（2026-10-15）=====
+             系统选择器（app picker）把用户这次点选的程序用 EXTRA_CHOSEN_COMPONENT 广播到这里，
+             本应用按 MIME 记一条「这类文件用它打开」。记的是本应用自己的偏好，**不写系统默认应用表**，
+             设置页「重置」即全部清空。回调 intent 显式指向本类，所以 exported=false 也能送达。 -->
+        <receiver
+            android:name=".util.OpenChoiceReceiver"
+            android:exported="false" />
+
+        <!-- ===== 后台保活：无障碍服务 =====
+             仅用于让本进程在后台更难被系统冻结/杀掉，从而保证文件传输与语音通话
+             在退到后台后仍能持续运行（ColorOS/Hans 等 ROM 对普通后台进程数秒内即冻结并掐断 socket）。
+             本服务**不读取任何屏幕内容、不读取剪贴板、不做选区捕获**——所有无障碍事件一律忽略。
+             仅系统可绑定（BIND_ACCESSIBILITY_SERVICE 为签名级权限），见 util/ClipCaptureService.kt -->
+        <service
+            android:name=".util.ClipCaptureService"
+            android:exported="true"
+            android:label="@string/clip_capture_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/clip_capture_service_config" />
+        </service>
+
+        <!-- 暴露已接收文件（应用专属目录回退落盘的绝对路径），供「用系统程序打开」授权给外部应用 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.phonepctransfer.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+    </application>
+
+</manifest>

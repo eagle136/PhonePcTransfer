@@ -1,0 +1,7 @@
+device add/edit dialog - text field contrast (WCAG ratio, <3 = invisible)
+== DARK  TEXT_MAIN=#E8EAED FIELD_DARK=#1B1C1F SURFACE=#000000
+DARK  raw  (before) | compFg=#E8EAED | fieldBg(mode)=#1B1C1F 4621/4824px | ink=#E8EAED 203px | contrast=14.14:1  OK
+DARK  field(after ) | compFg=#E8EAED | fieldBg(mode)=#1B1C1F 4603/4824px | ink=#E8EAED 221px | contrast=14.14:1  OK
+== LIGHT TEXT_MAIN=#1F2328 FIELD_DARK=#1B1C1F SURFACE=#FFFFFF
+LIGHT raw  (before) | compFg=#1F2328 | fieldBg(mode)=#FFFFFF 4621/4824px | ink=#1F2328 203px | contrast=15.80:1  OK
+LIGHT field(after ) | compFg=#1F2328 | fieldBg(mode)=#FFFFFF 4603/4824px | ink=#1F2328 221px | contrast=15.80:1  OK

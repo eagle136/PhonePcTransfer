@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#42A5F5"/>
+      <stop offset="100%" stop-color="#1565C0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 圆角背景 -->
+  <rect width="108" height="108" rx="22" fill="url(#bgGrad)"/>
+
+  <!-- 电脑（左侧，右缘 x=52） -->
+  <rect x="14" y="28" width="38" height="28" rx="4" fill="#FFFFFF"/>
+  <rect x="19" y="33" width="28" height="18" rx="2" fill="#1565C0"/>
+  <rect x="29" y="56" width="8" height="4" fill="#FFFFFF"/>
+  <rect x="22" y="60" width="22" height="4" rx="2" fill="#FFFFFF"/>
+
+  <!-- 手机（右侧，左缘 x=76） -->
+  <rect x="76" y="38" width="22" height="40" rx="5" fill="#FFFFFF"/>
+  <rect x="80" y="44" width="14" height="28" rx="2" fill="#1565C0"/>
+  <rect x="83" y="75" width="8" height="1.5" rx="0.75" fill="#1565C0"/>
+
+  <!-- 上箭头：手机→电脑（向左），白色 -->
+  <rect x="58" y="44" width="14" height="4" rx="2" fill="#FFFFFF"/>
+  <path d="M 58 41 L 52 46 L 58 51 Z" fill="#FFFFFF"/>
+
+  <!-- 下箭头：电脑→手机（向右），亮青 -->
+  <rect x="54" y="64" width="14" height="4" rx="2" fill="#4FC3F7"/>
+  <path d="M 68 61 L 74 66 L 68 71 Z" fill="#4FC3F7"/>
+</svg>

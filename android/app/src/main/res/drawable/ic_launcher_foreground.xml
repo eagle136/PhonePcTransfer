@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 图标前景：左电脑屏幕 + 右手机，中间双向箭头 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 显示区域背景色（用于挖空屏幕内框） -->
+    <path
+        android:fillColor="#0E4C8A"
+        android:pathData="M24,36 H62 V56 H24 Z" />
+    <path
+        android:fillColor="#0E4C8A"
+        android:pathData="M76,52 H92 V84 H76 Z" />
+
+    <!-- 电脑屏幕外壳 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M20,30 H66 A3,3 0 0 1 69,33 V59 A3,3 0 0 1 66,62 H47 V68 H56 V73 H33 V68 H42 V62 H23 A3,3 0 0 1 20,59 V33 A3,3 0 0 1 23,30 Z" />
+
+    <!-- 手机外壳 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M73,46 H95 A3,3 0 0 1 98,49 V87 A3,3 0 0 1 95,90 H73 A3,3 0 0 1 70,87 V49 A3,3 0 0 1 73,46 Z" />
+
+    <!-- 双向箭头（手机 → 电脑 / 电脑 → 手机） -->
+    <path
+        android:fillColor="#FFD54F"
+        android:pathData="M30,80 H52 V76 H30 Z" />
+    <path
+        android:fillColor="#FFD54F"
+        android:pathData="M50,73 L60,78 L50,83 Z" />
+    <path
+        android:fillColor="#4FC3F7"
+        android:pathData="M28,92 H50 V96 H28 Z" />
+    <path
+        android:fillColor="#4FC3F7"
+        android:pathData="M30,89 L20,94 L30,99 Z" />
+</vector>

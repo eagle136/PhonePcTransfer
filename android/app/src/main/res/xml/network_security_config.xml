@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 局域网明文 socket 通信（TCP 8765 / UDP 8766）不受此配置约束，
+     此项仅为后续可能的 HTTP 扩展留口。 -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
