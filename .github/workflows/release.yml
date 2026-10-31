@@ -114,14 +114,14 @@ jobs:
         run: |
           export PP_JDK_HOME="$(cygpath -u "$JAVA_HOME")"
           bash make-msi.sh
-          cp "out/手机电脑互传-$APP_VER.msi" "out/PhonePcTransfer-$APP_VER.msi"
+          mkdir -p dist
+          cp "out/手机电脑互传-$APP_VER.msi" "dist/PhonePcTransfer-$APP_VER.msi"
+          cp pc/dist/PhonePcTransfer-PC.jar dist/
 
       - uses: actions/upload-artifact@v4
         with:
           name: pc-dist
-          path: |
-            out/PhonePcTransfer-*.msi
-            pc/dist/PhonePcTransfer-PC.jar
+          path: dist/*
           if-no-files-found: error
 
   release:
@@ -153,7 +153,12 @@ jobs:
 
           注意：CI 构建使用独立签名证书，与本地开发包签名不同，首次安装请先卸载旧版；之后各 Release 之间可直接覆盖升级。
           EOF
-          gh release create -R "$GITHUB_REPOSITORY" "v$APP_VERSION" dist/* \
-            --target "$GITHUB_SHA" \
-            --title "手机电脑互传 $APP_VERSION" \
-            --notes-file notes.md
+          TAG="v$APP_VERSION"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create -R "$GITHUB_REPOSITORY" "$TAG" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "手机电脑互传 $APP_VERSION" \
+              --notes-file notes.md
+          fi
