@@ -31,6 +31,12 @@ android {
             storePassword = keystoreProps.getProperty("storePassword")
             keyAlias = keystoreProps.getProperty("keyAlias")
             keyPassword = keystoreProps.getProperty("keyPassword")
+            // 三重签名：v1(JAR) 兼容老系统与部分校验工具，v2 是 Android 7+ 的默认，
+            // v3 支持密钥轮换（Android 9+）。AGP 在 minSdk 28 下默认只开 v2，
+            // 所以这里三个都显式打开；v4 保持默认关闭（它只是增量安装用的外部 .idsig）。
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
         }
     }
     namespace = "com.phonepctransfer"
