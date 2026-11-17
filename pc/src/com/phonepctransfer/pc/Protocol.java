@@ -13,7 +13,7 @@ import java.util.Map;
 /**
  * 传输协议 v2：帧 = [4 字节大端 uint32 长度][载荷]。
  *
- * v2 起（2026-09-13）：
+ * v2 起：
  *  - 长度字段最高位（0x80000000）为 0 → JSON 控制帧；为 1 → 二进制分片帧（低 31 位为载荷长度）。
  *    文件分片从「256KB + base64 + JSON」改为「1MB + 裸二进制」，消除 33% base64 膨胀和
  *    大字符串 JSON 编解码开销 —— 这是传输速率只有无线网络 35% 左右的主因。
@@ -61,17 +61,17 @@ public final class Protocol {
      */
     public static final int MAX_VIDEO_FRAME = 128 * 1024;
 
-    // ==================== 媒体数据报线格式（任务单 3.1 / 方案 §4.4）====================
+    // ==================== 媒体数据报线格式（方案 §4.4）====================
 
     /**
      * 数据报版本，占 [0] 的高 4 位；低 4 位是流类型。
      *
      * <p>这是**媒体通道自己的**数据报：UDP 档原样发，媒体 TCP 档发同一份报（怎么在字节流上
-     * 框帧方案没写，归 2.6）。带内档不用它 —— 那里仍是上面的 {@code BIN_AUDIO}/{@code BIN_VIDEO}
-     * 帧制（I3 的例外条款）。</p>
+     * 框帧方案没写。带内档不用它 —— 那里仍是上面的 {@code BIN_AUDIO}/{@code BIN_VIDEO}
+     * 帧制（例外条款）。</p>
      *
      * <p>⚠ 本节**没有**新增任何 {@code BIN_*} 主 TCP 二进制子类型：老端读帧遇到未知子类型会
-     * 直接 IOException 断链（I8，与本类 {@code callInvite} 里那句提醒同一个理由）。</p>
+     * 直接 IOException 断链（与本类 {@code callInvite} 里那句提醒同一个理由）。</p>
      */
     public static final int DG_VER = 1;
 
@@ -101,7 +101,7 @@ public final class Protocol {
     /**
      * 头后 4B ts = 发送端**通话相对**毫秒（{@link CallClock#elapsedMs()}，起呼=0）。
      * 宽度与零点口径照带内音视频帧的既有先例（{@link #writeAudio} / {@link #writeVideo} 各 4B 大端）；
-     * 两端各自零点，接收端**不得**拿它与本端墙钟相减（S1 / 任务单 3.8 的两段式帧龄）。
+     * 两端各自零点，接收端**不得**拿它与本端墙钟相减（两段式帧龄）。
      */
     public static final int DG_TS_LEN = 4;
 
@@ -109,7 +109,7 @@ public final class Protocol {
     public static final int DG_OVERHEAD = DG_HEADER_LEN + DG_TS_LEN;
 
     /**
-     * ctrl **整报**上限 64B（§4.4）。音频/视频/反馈报不受它约束 —— 它们的上限是 3.2 的 1200B。
+     * ctrl **整报**上限 64B（§4.4）。音频/视频/反馈报不受它约束 —— 它们的上限是 §3.2 的 1200B。
      */
     public static final int DG_CTRL_MAX_REPORT = 64;
 
@@ -148,8 +148,8 @@ public final class Protocol {
     public static final int SNAP_OFF_FLAGS = 12;        // u16
 
     /**
-     * ownerBits（[6]）：这份快照由哪一组 owner 决策（§3-D14-1 的两组各占一位，其余保留）。
-     * ⚠ 这里只定**位含义**；判权规则（非 owner 写来的同名字段忽略并计 ctrlOwnerViolation）在 3.13。
+     * ownerBits（[6]）：这份快照由哪一组 owner 决策（两组各占一位，其余保留）。
+     * ⚠ 这里只定**位含义**；判权规则（非 owner 写来的同名字段忽略并计 ctrlOwnerViolation）在接收侧校验。
      */
     public static final int OWNER_BIT_PUSH = 0x01;
     public static final int OWNER_BIT_RECV = 0x02;
@@ -157,7 +157,7 @@ public final class Protocol {
     /**
      * 快照 flags（[12..13] 低 7 位）：**位序 = §4.4 括号里的书写序，一位不多一位不少** ——
      * aggregated / camOn / muted / sendingPaused / wantVideo / needKeyframe / bg。
-     * 前四位是推流端 owner 组、后三位是收流端组（顺序照 D14-1 的字段表，不是按字母）。
+     * 前四位是推流端 owner 组、后三位是收流端组（顺序照字段表，不是按字母）。
      */
     public static final int SNAP_FLAG_AGGREGATED = 0x0001;
     public static final int SNAP_FLAG_CAM_ON = 0x0002;
@@ -416,7 +416,7 @@ public final class Protocol {
      * （老端收到未知二进制子类型 0x03 会直接 IOException 断链，见 readFrame）。
      *
      * @param vid   本端**可接收**视频
-     * @param cam   本端**有摄像头可发送**（PC 恒 false —— R2 只收不发）
+     * @param cam   本端**有摄像头可发送**（PC 恒 false —— 只收不发）
      * @param vcodec 本端**可解码**的编码列表，如 ["hevc","h264"]
      */
     public static Map<String, Object> hello(String id, String name, String model,
@@ -654,7 +654,7 @@ public final class Protocol {
      * 文件夹成员发完（无论成败）后的收尾帧。接收端凭此**明确知道传输结束**，
      * 立刻用 dir_meta.list 与实收清单求差集，把缺失项回发 dir_missing。
      *
-     * 为什么必须有这一帧：老流程下接收端只能靠 doneFiles&gt;=count 猜「收齐了」，
+     * 为什么必须有这一帧：接收端只能靠 doneFiles&gt;=count 猜「收齐了」，
      * 而成员在发送端被跳过 / 发送失败时接收端永远等不到 → 静默缺文件。
      */
     public static Map<String, Object> dirEnd(String mid, int sent, boolean last) {
@@ -746,21 +746,17 @@ public final class Protocol {
     }
 
     /**
-     * 呼叫请求 + 视频/语音帧长协商 + **媒体通道协商**（任务单 2.4 / 方案 §4.2）。
-     *
+     * 呼叫请求 + 视频/语音帧长协商 + **媒体通道协商**（方案 §4.2）。
      * <p>三个字段都是**可选、缺省即回退**：本端不声明就发 0 / false / 空串，对端读到同样的
-     * 缺省值 ⇒ 自动落带内档（第五档）。老端根本不认识这些字段 ⇒ 收不到也不断链（I11 改窄：
-     * 不再承诺其行为指标，但**不得因新字段断链**）。</p>
-     *
+     * 缺省值 ⇒ 自动落带内档（第五档）。老端不认识这些字段 ⇒ 收不到也不断链（
+     * **不得因新字段断链**）。</p>
      * <p>⚠ 协商字段**只有这三个**。没有 {@code cport} / {@code cip} —— 那是已被取消的独立
-     * 控制 TCP 通道需要的东西（§4.2 第 5 轮口径 / U9 / N9）。</p>
-     *
+     * 控制 TCP 通道需要的东西（§4.2）。</p>
      * <p>⚠ 这里只有 JSON 可选字段，**没有**新增任何二进制帧子类型 —— 未知子类型会被老端
-     * 直接抛 IOException 断链（本类读帧处那句 "未知二进制帧子类型"，I8）。</p>
-     *
+     * 直接抛 IOException 断链（本类读帧处那句 "未知二进制帧子类型"）。</p>
      * @param mport 本端媒体端口；0 = 未 bind / 未定档 ⇒ 对端只能走带内
      * @param mudp  本端媒体端口是否 UDP；false = 未声明（媒体 TCP / 带内）
-     * @param msid  本次通话的随机 token（串话隔离用，**不是安全边界**，S12）；空 = 未声明
+     * @param msid  本次通话的随机 token（串话隔离用，**不是安全边界**）；空 = 未声明
      */
     public static Map<String, Object> callInvite(String callerName, String callerIp,
                                                  boolean vid, int lv, int af,
@@ -796,7 +792,7 @@ public final class Protocol {
      * {@link #callInvite(String, String, boolean, int, int, int, boolean, String)}）。
      *
      * <p>⚠ **没有**新增 ip 字段：call_accept 从来不带本机地址（对照 callInvite 独有的
-     * {@code name}/{@code ip} 两项），媒体方向靠 probe + learn-by-receiving 定（任务单 2.7），
+     * {@code name}/{@code ip} 两项），媒体方向靠 probe + learn-by-receiving 定，
      * 不靠报文里的地址声明。</p>
      */
     public static Map<String, Object> callAccept(boolean vid, int lv, int af,
@@ -812,23 +808,19 @@ public final class Protocol {
     }
 
     /**
-     * 振铃期的**逐档媒体协商帧**（任务单 2.5 / 方案 §4.3① 的「交换」那一步）。
-     *
+     * 振铃期的**逐档媒体协商帧**（方案 §4.3① 的「交换」那一步）。
      * <p>为什么需要第三条帧：§4.2 只把三元组挂在 {@code call_invite} / {@code call_accept} 上，
      * 而这两条各只有一次发言机会（主叫发 invite、被叫发 accept）。§4.3⑤ 要求「本档不通就换下一档、
      * 回到 ①」——被叫在第 2/3/4 档**没有任何帧**能把新 bind 出来的本端端口带出去，
-     * 主叫就永远学不到对端的新端口，双向 probe 无法继续。
-     * （2026-10-02 用户点 (a)：允许新增这条 JSON 协商帧；§4.2 标题「不新增往返」读作
-     * **不新增 TCP 往返、不新增二进制子类型**，主 TCP 早已连好，多一条 JSON 帧不算往返。）</p>
-     *
-     * <p>⚠ 只新增 JSON 的 {@code type} 值，**没有**新增二进制帧子类型（I8：未知二进制子类型会让
+     * 主叫就学不到对端的新端口，双向 probe 无法继续。
+     * 新增这条 JSON 帧不算 TCP 往返：主 TCP 早已连好，且**不新增二进制子类型**。</p>
+     * <p>⚠ 只新增 JSON 的 {@code type} 值，**没有**新增二进制帧子类型（未知二进制子类型会让
      * 老端直接抛 IOException 断链）。老端读到未知 JSON type 只打一行「未知帧类型」日志、不断链
-     * （{@code Link} 读帧处的 default 分支），所以 I11 的「不得断链」仍然成立。</p>
-     *
+     * （{@code Link} 读帧处的 default 分支），所以「不得断链」仍然成立。</p>
      * @param mport       本端**本档** bind 到的媒体端口；0 = 本端已落带内档（第五档）
      * @param mudp        本端媒体端口是否 UDP（true = UDP 档，false = 媒体 TCP 档或带内）
-     * @param msid        本端为本次通话生成的随机 token（每端各自生成，2026-10-02 用户点；
-     *                    串话隔离用，**不是安全边界**，S12）
+     * @param msid        本端为本次通话生成的随机 token（每端各自生成；
+     *                    串话隔离用，**不是安全边界**）
      * @param tierOrdinal 本端当前档在 {@code AvTransport.Tier} 序列里的序号。
      *                    ⚠ 两端序号**不保证相等**（安卓按 §4.1 跳过两个 443 档），
      *                    所以本字段只用于日志与「对端走到第几档」，连通性判据是 probe 本身
@@ -919,7 +911,7 @@ public final class Protocol {
      *
      * @param fps      实际解码帧率
      * @param drop     丢帧百分比
-     * @param lat      排队延迟 ms（**真实值**；任务单 1.3 起不再用 -1 当丢帧哨兵）
+     * @param lat      排队延迟 ms（**真实值**；不再用 -1 当丢帧哨兵）
      * @param dropping 接收端此刻是否正处于丢帧期（与 lat 分开说，两者不再混在一个数里）
      * @param kbps     实际接收码率
      */
@@ -943,7 +935,7 @@ public final class Protocol {
      *
      * @param key true = 同时请求**立刻一个 IDR**（本端解码进程刚换代，只能从关键帧起解，
      *            而编码器 GOP=1s ⇒ 不主动要就要白等最多一秒）。只在 true 时落键：老对端收到的
-     *            帧与改前逐字节一致，新对端缺键按 false（I11）。
+     *            帧与旧行为逐字节一致，新对端缺键按 false。
      */
     public static Map<String, Object> videoReq(boolean on, boolean key) {
         Map<String, Object> m = msg("video_req");
@@ -954,7 +946,7 @@ public final class Protocol {
         return m;
     }
 
-    // ==================== 媒体数据报编解码（任务单 3.1）====================
+    // ==================== 媒体数据报编解码 ====================
 
     /**
      * 一份解码后的媒体数据报。{@code payload} **含** ctrl 子类型首字节（原样保留，本类不猜语义）。
@@ -962,7 +954,7 @@ public final class Protocol {
     public static final class Datagram {
         public final int ver;
         public final int type;
-        /** 按 type 独立计数的流内序号（S10）；16 位，回绕由调用方自己处理 */
+        /** 按 type 独立计数的流内序号；16 位，回绕由调用方自己处理 */
         public final int streamSeq;
         public final int flags;
         public final int sliceIdx;

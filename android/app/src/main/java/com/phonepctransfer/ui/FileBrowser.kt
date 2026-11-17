@@ -65,21 +65,11 @@ import kotlinx.coroutines.withContext
 
 
 /**
- * 内置文件浏览器（2026-10-05）：**同一窗口内的全屏页面**，代替系统文件选择器。
- *
- * 为什么要有它：系统选择器（SAF）一次只能选一个文件、或只能整目录授权，用户想挑
- * 「某个目录里的几个文件」非常别扭（交互参考 HybridFileXfer 的 FileSelectAdapter 重做）。
- *
- * 交互（用户 2026-10-05 定稿）：
- *  - **长按文件** = 进入多选 / 切换这一条的选中；**点击已选中的 = 取消选择**
- *    （「选择文件只能靠长按」——所以多选态里点未选中的文件不加进来）
- *  - **长按文件夹** = 只选这个文件夹，并**清空已选文件**（两类互斥）
- *  - 多选里没有文件夹 → 「发送 N 个文件」逐个排队发；是文件夹 → 「发送文件夹」整目录发
- *  - 非多选态：点文件夹进目录、点文件无动作（与参考实现的交互一致）
- *  - 顶栏「↑」返回上级；每层记住滚动位置，返回时恢复
- *
- * 读手机文件的三条路径见 [LocalFs]：普通模式（「所有文件访问」）→ root 模式（设置里手动开）
- * → SAF 目录树（未授权时的降级，此时页面给「去授权 / 改用系统选择器选目录」的引导）。
+ * 内置文件浏览器：同一窗口内的全屏页面，代替系统文件选择器（系统选择器一次只能选一个文件或整目录授权，挑「某目录里的几个文件」很别扭）。
+ * 交互：长按文件 = 多选/切换选中（点已选中 = 取消，多选只能靠长按）；长按文件夹 = 只选该文件夹并清空已选文件（两类互斥）；
+ * 多选无文件夹 → 「发送 N 个文件」逐个排队；是文件夹 → 「发送文件夹」整目录发；非多选态：点文件夹进目录、点文件无动作；
+ * 顶栏「↑」返回上级；每层记住滚动位置，返回时恢复。
+ * 读手机文件的三条路径见 [LocalFs]：普通 → root（设置里手动开）→ SAF 目录树（未授权降级）。
  */
 @Composable
 internal fun FileBrowser(onClose: () -> Unit) {
@@ -125,12 +115,9 @@ internal fun FileBrowser(onClose: () -> Unit) {
     }
 
     /**
-     * 定起点（2026-10-05 调顺序）：root 模式（先探 su）→ 普通模式（「所有文件访问」）
-     * → **上次用系统选择器授权的目录** → 引导页。
-     *
-     * 为什么把 SAF 目录排在引导页之前：Android 17 起「所有文件访问」失效（见
-     * [LocalFs.isAndroid17Plus]），**系统自带文件选择器授权的目录才是主路径** ——
-     * 用户授权过一次以后，再打开浏览器就该直接进那个目录，而不是又看一页引导。
+     * 定起点:root 模式（先探 su）→ 普通模式（「所有文件访问」）→ 上次用系统选择器授权的目录 → 引导页。
+     * SAF 目录排在引导页之前:Android 17 起「所有文件访问」失效（见 [LocalFs.isAndroid17Plus]）,系统自带文件选择器授权的目录才是主路径——
+     * 用户授权过一次以后,再打开浏览器就该直接进那个目录,而不是又看一页引导。
      */
     fun initLoc() {
         val t = savedTreeLoc()
@@ -145,8 +132,7 @@ internal fun FileBrowser(onClose: () -> Unit) {
                     guide = Guide.ROOT_FAILED
                 }
             }
-            // Android 17：整盘授权**形同虚设**（见 [LocalFs.isAndroid17Plus]）—— 已有系统选择器
-            // 授权的目录就优先用它，免得每次打开都先撞一次「权限给了却读不到」的错误页
+            // Android 17：整盘授权形同虚设（见 [LocalFs.isAndroid17Plus]）—— 优先用已有系统选择器授权的目录，免得每次打开都先撞一次「权限给了却读不到」的错误页
             t != null && LocalFs.isAndroid17Plus() -> {
                 guide = null
                 stack.clear()
@@ -163,8 +149,7 @@ internal fun FileBrowser(onClose: () -> Unit) {
                 stack.add(t)
             }
             else -> {
-                // 没有任何可用后端：Android 17 与老系统的引导文案/按钮不同
-                //（17 上不能再劝用户去「所有文件访问」设置页 —— 那是死路）
+                // 没有任何可用后端：Android 17 与老系统的引导文案/按钮不同（17 上不能再劝用户去「所有文件访问」设置页 —— 那是死路）
                 guide =
                     if (LocalFs.isAndroid17Plus()) Guide.ONLY_SYSTEM_PICKER else Guide.NO_ALL_FILES
             }
@@ -172,8 +157,8 @@ internal fun FileBrowser(onClose: () -> Unit) {
     }
 
     /**
-     * 系统自带的文件选择器：授权一棵目录树。降级路径与 **Android 17 主路径**都用它；
-     * 授权成功即**记进 Prefs**（下次打开直接进这个目录，顶栏还有「换目录」）。
+     * 系统自带的文件选择器：授权一棵目录树。降级路径与 Android 17 主路径都用它；
+     * 授权成功即记进 Prefs（下次打开直接进这个目录，顶栏还有「换目录」）。
      */
     val treePick =
         rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -208,8 +193,7 @@ internal fun FileBrowser(onClose: () -> Unit) {
         val r = withContext(Dispatchers.IO) { LocalFs.list(ctx, l) }
         list = r
         loading = false
-        // 记录的「上次授权目录」已失效（系统回收了授权 / 目录被删）：清掉记录 + 回引导页，
-        // 并**明确告诉用户要重选** —— 不静默画一个空目录（沿用仓库铁律：失败绝不冒充空）
+        // 记录的「上次授权目录」已失效（系统回收了授权 / 目录被删）：清掉记录 + 回引导页，明确告诉用户要重选（不静默画空目录，失败绝不冒充空）
         if (r.error != null && l is LocalFs.Loc.Tree && l.treeUri.toString() == AppCore.prefs.safTreeUri) {
             AppCore.prefs.clearSafTree()
             stack.clear()
@@ -248,7 +232,7 @@ internal fun FileBrowser(onClose: () -> Unit) {
         stack.removeAt(stack.lastIndex)
     }
 
-    // ==================== 选择交互（用户 2026-10-05 定稿）====================
+    // ==================== 选择交互 ====================
 
     fun onTap(e: LocalFs.Entry) {
         val d = selDir
@@ -306,9 +290,9 @@ internal fun FileBrowser(onClose: () -> Unit) {
         onClose()
     }
 
-    // 系统返回键（全仓第一个 BackHandler，只在这个页内页面上生效）：先取消选择，再往上一层目录走，
-    // 已经在最上面就关掉浏览器 —— 不然在浏览器里按返回会把应用退到后台，与「这是一层页面」的直觉不符。
-    // 位置必须在 [up] 之后：Kotlin 的局部函数只能引用**前面**声明过的。
+    // 系统返回键（全仓第一个 BackHandler，只在这个页内页面上生效）：先取消选择，再往上一层目录走；
+    // 已经在最上面就关掉浏览器（不然在浏览器里按返回会把应用退到后台，与「这是一层页面」的直觉不符）。
+    // 位置必须在 [up] 之后：Kotlin 的局部函数只能引用前面声明过的。
     BackHandler {
         if (selDir != null || selFiles.isNotEmpty()) {
             clearSel()
@@ -343,8 +327,7 @@ internal fun FileBrowser(onClose: () -> Unit) {
                     onGrantAllFiles = { openAllFilesSettings(ctx) },
                     onPickTree = { treePick.launch(null) },
                     onRetry = { initLoc() },
-                    // Android 17 引导页的「开启 root 模式」：就地开 + 立刻探 su
-                    //（通了直接进 /data/media/0，不通会切到 ROOT_FAILED 页如实说明）
+                    // Android 17 引导页的「开启 root 模式」：就地开 + 立刻探 su（通了直接进 /data/media/0，不通会切到 ROOT_FAILED 页如实说明）
                     onTurnOnRoot = {
                         AppCore.prefs.rootFs = true
                         LocalFs.rootEnabled = true
@@ -398,8 +381,7 @@ internal fun FileBrowser(onClose: () -> Unit) {
 private enum class Guide {
     /**
      * **Android 17+**：整盘访问已被系统关闭（「所有文件访问」不再生效，见 [LocalFs.isAndroid17Plus]）——
-     * 只剩两条路：用系统自带的文件选择器授权一个目录，或开 root。这一页**不提供**
-     * 「去系统设置授权」按钮（那条路用户已经被系统顶回来过了）。
+     * 只剩两条路：用系统自带的文件选择器授权一个目录，或开 root；本页不提供「去系统设置授权」按钮（那条路用户已经被系统顶回来过了）。
      */
     ONLY_SYSTEM_PICKER,
 
@@ -416,8 +398,7 @@ private enum class Guide {
 
 /**
  * 顶栏：左「↑ 返回上级」、中间路径、右「刷新 / ✕ 关闭」。
- * 状态栏内边距加在 Surface **内部**（与 [HeaderBar] 同一口径）：
- * 底色一直铺到屏幕最顶边，时间/电量那一条与顶栏同色。
+ * 状态栏内边距加在 Surface 内部（与 [HeaderBar] 同一口径）：底色铺到屏幕最顶边，时间/电量条与顶栏同色。
  */
 @Composable
 private fun BrowserTopBar(
@@ -432,11 +413,9 @@ private fun BrowserTopBar(
     onClose: () -> Unit
 ) {
     Surface(color = MaterialTheme.colorScheme.surfaceVariant) {
-        // 栏 + 下缘分界线（2026-10-05 高对比度整改）：surfaceVariant 与页面底 background 只差
-        // 1.04:1（浅）/1.11:1（深），不加线整条栏都「看不见」；线用 outline —— 对栏底 3.88:1（浅）/
-        // 5.62:1（深），满足 WCAG 1.4.11 的 3:1。**不能**用 HorizontalDivider 的默认色
-        // outlineVariant（浅色只有 ~1.35:1，等于没画；DeviceList/SettingsSheet 用默认色是列表内部分隔，
-        // 语境不同）。分隔线放在 statusBars 内边距**之下** = 栏的视觉下缘。
+        // 栏 + 下缘分界线（高对比整改）：surfaceVariant 与页面底 background 只差 1.04:1（浅）/1.11:1（深），不加线整条栏都「看不见」；
+        // 线用 outline（对栏底 3.88:1 浅/5.62:1 深，满足 WCAG 1.4.11 的 3:1）；不能用 HorizontalDivider 默认色 outlineVariant（浅色只有 ~1.35:1 等于没画，与 DeviceList/SettingsSheet 的列表内部分隔语境不同）。
+        // 分隔线放在 statusBars 内边距之下 = 栏的视觉下缘。
         Column {
             Row(
                 modifier = Modifier
@@ -519,7 +498,7 @@ private fun EntryList(
     }
 }
 
-/** 选中行左侧竖条宽度（2026-10-05 高对比度整改定稿；配合 [EntryRow] 的 drawBehind） */
+/** 选中行左侧竖条宽度（高对比整改；配合 [EntryRow] 的 drawBehind） */
 private val SEL_BAR_W = 3.dp
 
 /** 一行：图标（选中 → 对勾）+ 名字 + 大小/时间 */
@@ -529,12 +508,9 @@ private fun EntryRow(e: LocalFs.Entry, selected: Boolean, onTap: () -> Unit, onL
     val bg = if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent
     val tint =
         if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-    // 选中提示的「第三条通道」（2026-10-05 高对比度整改）：选中行底色 primaryContainer 与页面底
-    // background 只差 1.13:1（浅）/1.61:1（深），底色这一路不足以让人一眼看出选中，补一条 primary
-    // 竖条 —— 对页面底 浅 4.72:1 / 深 10.71:1（≥ WCAG 1.4.11 要求的 3:1），而且「左侧多一条」不依赖
-    // 颜色，色觉障碍用户也认得出。
-    // 画在 `.background(bg)` **之后**（先底色后竖条）；用 drawBehind 而不是铺一个 3dp 的 Box：
-    // LazyColumn 给 item 的高度约束是 unbounded，fillMaxHeight 会退化成 0 高（得再套 IntrinsicSize.Min）。
+    // 选中提示的「第三条通道」（高对比整改）：选中行底色 primaryContainer 与页面底 background 只差 1.13:1（浅）/1.61:1（深），不足以让人一眼看出选中，
+    // 补一条 primary 竖条 —— 对页面底 浅 4.72:1 / 深 10.71:1（≥ WCAG 1.4.11 要求的 3:1），而且「左侧多一条」不依赖颜色，色觉障碍用户也认得出。
+    // 画在 `.background(bg)` 之后（先底色后竖条）；用 drawBehind 而不是铺一个 3dp 的 Box（LazyColumn 给 item 的高度约束是 unbounded，fillMaxHeight 会退化成 0 高，得再套 IntrinsicSize.Min）。
     val barColor = if (selected) MaterialTheme.colorScheme.primary else Color.Transparent
     Row(
         modifier = Modifier
@@ -595,8 +571,7 @@ private fun ErrorBody(err: String, onRetry: () -> Unit, onPickTree: () -> Unit) 
         Spacer(Modifier.height(12.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(onClick = onRetry) { Text("重试") }
-            // Android 17：整盘读取被系统关掉时，「重试」永远是错的 —— 必须给出口，
-            // 否则用户会卡死在这一页（现象：权限明明给了，却只看到拒绝读取）。
+            // Android 17：整盘读取被系统关掉时，「重试」永远是错的 —— 必须给出口，否则用户会卡死在这一页。
             if (LocalFs.isAndroid17Plus()) {
                 Button(onClick = onPickTree) { Text("用系统选择器选目录") }
             }
@@ -614,8 +589,7 @@ private fun BrowserBottomBar(
 ) {
     val hasSel = selDirName != null || selCount > 0
     Surface(color = MaterialTheme.colorScheme.surfaceVariant) {
-        // 上缘分界线（2026-10-05 高对比度整改，理由同 [BrowserTopBar]）：outline 对栏底
-        // 浅 3.88:1 / 深 5.62:1；线放在 navigationBars 内边距**之上** = 栏的视觉上缘。
+        // 上缘分界线（高对比整改，理由同 [BrowserTopBar]）：outline 对栏底浅 3.88:1 / 深 5.62:1；线放在 navigationBars 内边距之上 = 栏的视觉上缘。
         Column {
             HorizontalDivider(thickness = 1.dp, color = MaterialTheme.colorScheme.outline)
             Row(
@@ -673,9 +647,8 @@ private fun GuideBody(
         verticalArrangement = Arrangement.Center
     ) {
         when (kind) {
-            // Android 17+：明确提醒「只能用系统自带文件选择器，或用 root 权限」——
-            // 用户 2026-10-05 真机实测后要的口径，也是唯一两条走得通的路。
-            // 按钮顺序＝系统选择器（主）→ root（次）；**故意不出现**「去系统设置授权」。
+            // Android 17+：明确提醒「只能用系统自带文件选择器，或用 root 权限」——唯一两条走得通的路。
+            // 按钮顺序＝系统选择器（主）→ root（次）；「去系统设置授权」故意不出现。
             Guide.ONLY_SYSTEM_PICKER -> {
                 Text("Android 17：只能用系统选择器或 root", style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.height(10.dp))

@@ -6,27 +6,13 @@ import android.os.Build
 import android.util.Log
 
 /**
- * 视频档位表 + 升/降档状态机 + 编解码器选择（计划 §3.5 / §4.3 / §9）。
- *
- * **2026-09-15 起（用户要求）**：三档 = 流畅 480P / 标清 720P / 高清 1080P，
- * 默认 1080P（2 Mbps）。档位**同时决定编码分辨率**（真分辨率切换，方案 A）：
- * 降档时 1080p → 720p → 480p 逐级降，升档同理逐级升。
- *
- * **2026-10-03 加第四档（用户点）**：超清 = **1080P / 5 Mbps** —— 分辨率与高清档**完全相同**，
- * 只有码率差 ⇒ 选它不引入任何新的采集/编码尺寸（`pickPreviewSize` 那条 HAL 尺寸坑与本档无关），
- * 也不改变换档代价（只换码率 = `setParameters()` 零中断）。
- * 用户同时定的两条语义（本文件的 `DEFAULT`/`MAX` 与 `CallManager` 的起始档都按这个走）：
- *  ① **选定的档位就是上限**：自动升降档不许越过本次用户选的那一档（`QualityController.maxLevel`
- *     = 选定档，`current.idx >= maxLevel.idx` 即不再升 —— 这条本来就成立，本档只是把它延伸到 L3）；
- *  ② **起始码率仍从推荐档（高清 2M）起**：选「超清」也不一上来就 5M，要等 `QualityController`
- *     的五重升档闸门（健康窗口 [QualityController.UP_HEALTHY_MS]、距上次升档
- *     [QualityController.UP_MIN_GAP_MS]、降档冷静期 [QualityController.UP_AFTER_DOWN_MS]、
- *     本窗无本地丢帧、对端实收 >0k）全满足，才逐级升到选定档。
- *
- * 切档代价与做法（[com.phonepctransfer.video.VideoCall.applyLevel]）：
- *  - 只换码率 → `setParameters()`，零中断；
- *  - 分辨率变了 → 重建编码器 + `capture.updateTargets()`（画面中断 ~200–400ms），
- *    并重发 `video_cfg` 让对端按新尺寸重建解码器。
+ * 视频档位表 + 升/降档状态机 + 编解码器选择。
+ * 四档：流畅 480P / 标清 720P / 高清 1080P（默认）/ 超清 1080P·5Mbps（与高清同分辨率，只码率不同）。
+ * 档位**同时决定编码分辨率**：升降档时分辨率逐级切换。
+ * 两条语义：① **选定档位即上限**（`QualityController.maxLevel` = 选定档，超过不再升）；
+ * ② **起始码率仍从推荐档（高清 2M）起**，要等升档五重闸门全满足才逐级升到选定档。
+ * 切档做法（[com.phonepctransfer.video.VideoCall.applyLevel]）：只换码率 → `setParameters()`，零中断；
+ * 分辨率变了 → 重建编码器 + `capture.updateTargets()`（中断 ~200–400ms），并重发 `video_cfg`。
  */
 enum class VideoLevel(
     val idx: Int,
@@ -44,14 +30,13 @@ enum class VideoLevel(
     val audioBitrate: Int
 ) {
     // ⚠ 480P 曾用 854x480（FWVGA）：a12/a16 两台机的相机 StreamConfigurationMap 都没有
-    // 这个尺寸（最接近 720x480/864x480），且 854 非 16 对齐常被硬编码器拒 → 480P 档
-    // 无视频输出、预览空白（2026-09-16 a12 实锤）。640x480 = VGA，是 Camera2 强制的
-    // 预览尺寸、所有硬编都支持，作为「流畅」档的编码分辨率。渲染侧对任意宽高比
-    // 都会等比留边/裁剪（videoFitMatrix），4:3 没有问题。
+    // 这个尺寸（最接近 720x480/864x480），且 854 非 16 对齐常被硬编码器拒 → 480P 档无视频输出、预览空白。
+    // 640x480 = VGA，是 Camera2 强制的预览尺寸、所有硬编都支持，作为「流畅」档的编码分辨率。
+    // 渲染侧对任意宽高比都会等比留边/裁剪（videoFitMatrix），4:3 没有问题。
     L0(0, "流畅", "480P", 640, 480, 30, 500, 32_000),
     L1(1, "标清", "720P", 1280, 720, 30, 1500, 64_000),
     L2(2, "高清", "1080P", 1920, 1080, 30, 2000, 64_000),
-    // 1080P / 5 Mbps（2026-10-03 用户点）：分辨率与 L2 逐字节相同 ⇒ 升/降这一档只动码率，
+    // 1080P / 5 Mbps（用户点）：分辨率与 L2 逐字节相同 ⇒ 升/降这一档只动码率，
     // 走 `setParameters()` 零中断那条路（不重建编码器、不重发分辨率、对端解码器不动）。
     // ⚠ 两个由 5M 带出来的事实，写在这里免得下一轮当新 bug 查：
     //   ① CBR/GOP=1s 下 IDR ≈ 2M 档实测最大值 143,590B 的 ~2.5 倍 ⇒ **带内档（第 5 档）的
@@ -89,10 +74,8 @@ enum class VideoLevel(
 }
 
 /**
- * 编解码器选择（两端能力协商的落点）。
- *
- * 前提（已实测，见计划 §15.1）：两台测试机都有 HEVC 硬件编码器；
- * a16 还有 `*.hevc.decoder.low_latency`。
+ * 编解码器选择（两端能力协商的落点）：
+ * 两台测试机都有 HEVC 硬件编码器，a16 还有 `*.hevc.decoder.low_latency`。
  */
 object VideoCodecs {
     private const val TAG = "PP-VideoCodec"
@@ -176,13 +159,10 @@ object VideoCodecs {
     fun hasHardwareEncoder(mime: String): Boolean = findHardwareEncoder(mime) != null
 
     /**
-     * 按对端能力选编码 MIME（R4 的回落链）。
-     *
-     * ```
-     * 1) 对端可解 hevc 且本端有 HEVC 硬编 → HEVC 硬编（优先）
-     * 2) 对端可解 h264 且本端有 H.264 硬编 → H.264 硬编（回落）
-     * 3) 都不满足 → null（禁用视频，记 warning）
-     * ```
+     * 按对端能力选编码 MIME（R4 的回落链）：
+     * 1) 对端可解 hevc 且本端有 HEVC 硬编 → HEVC 硬编（优先）；
+     * 2) 对端可解 h264 且本端有 H.264 硬编 → H.264 硬编（回落）；
+     * 3) 都不满足 → null（禁用视频，记 warning）。
      */
     fun pickEncoderMime(peerVcodec: List<String>): String? {
         val peerHevc = peerVcodec.isEmpty() || peerVcodec.any { it.equals("hevc", true) }
@@ -210,21 +190,14 @@ object VideoCodecs {
 
 /**
  * 升/降档状态机（R7 核心）。**降档激进、升档保守**。
- *
  * 判据（发送侧采集，接收侧反馈）：
  *  1. 本端发送阻塞：每帧写入耗时 `writeMs`，2s 均值；
  *  2. 对端反馈 `video_fb{drop, lat, kbps}`（每 2s 一次）；
- *  3. 本端**本地丢帧**（一帧大得过不了单帧闸门，整帧没上线）—— 这条是问题2 的自愈入口，
- *     前两条都在量"发出去之后"，只有这条量"根本没发出去"。
- *
+ *  3. 本端**本地丢帧**（一帧大得过不了单帧闸门，整帧没上线）——前两条都在量"发出去之后"，只有这条量"根本没发出去"。
  * 降档（快）：2s 均值 >120ms 或 drop>8% 或 lat>400ms，**连续 2 次采样（≈4s）** → 降一档；
  *            两次降档至少间隔 3s；60s 内最多降 3 档。
- * 升档（慢）：五重闸门 —— ①距上次升档 ≥30s（「半分钟只能触发一次」）
- *            ②距上次降档 ≥60s（冷静期）③健康窗口连续 ≥15s ④未到上限
- *            ⑤对端**实收码率 > 0**（任务单 1.4：报 0k = 这一档的流根本没到，
- *              此时 drop/lat 再干净也不是健康证据，不该继续往上加档）。
- *
- * 「不激进」落到代码里是可验证的常量，而不是形容词。
+ * 升档（慢）：五重闸门 —— ①距上次升档 ≥30s ②距上次降档 ≥60s（冷静期）③健康窗口连续 ≥15s
+ *            ④未到上限 ⑤对端**实收码率 > 0**（报 0k = 流根本没到，drop/lat 再干净也不算健康）。
  */
 class QualityController(
     /** 上限（两端协商档位与用户设置取 min） */
@@ -267,7 +240,7 @@ class QualityController(
     @Volatile private var fbDrop = 0
     @Volatile private var fbLat = 0
 
-    /** 对端 2s 窗口内的实收码率 kbps（任务单 1.4：升档闸门⑤用它） */
+    /** 对端 2s 窗口内的实收码率 kbps（升档闸门⑤用它） */
     @Volatile private var fbKbps = 0
     @Volatile private var fbAt = 0L
 
@@ -283,7 +256,7 @@ class QualityController(
     private var lastEvalAt = 0L
 
     /**
-     * 本窗内**发端本地丢帧**的次数（问题2 的根：一帧大得过不了单帧闸门 ⇒ 整帧没发出去）。
+     * 本窗内**发端本地丢帧**的次数（一帧大得过不了单帧闸门 ⇒ 整帧没发出去）。
      * ⚠ 与 avgWrite 的区别是这条不是"假拥塞"：avgWrite 量的是主 TCP 写锁排队（文件/音频抢锁会虚高），
      *   而这个数是**这一帧确实一个字节都没上线**。收端因此等不到关键帧 → 卡在两个 IDR 之间 → 花屏，
      *   唯一的自愈就是把每帧的数据量降下来，所以它必须进拥塞判据。
@@ -348,7 +321,7 @@ class QualityController(
         }
     }
 
-    /** 收到对端 video_fb（每 2s）。[rxKbps] = 对端窗口内实收码率（任务单 1.4） */
+    /** 收到对端 video_fb（每 2s）。[rxKbps] = 对端窗口内实收码率 */
     @Synchronized
     fun onFeedback(drop: Int, lat: Int, rxKbps: Int, nowMs: Long = System.currentTimeMillis()) {
         fbDrop = drop
@@ -377,7 +350,7 @@ class QualityController(
             (fresh && drop > DROP_DOWN_PCT) || (fresh && lat > LAT_DOWN_MS) ||
             localDrops > 0
         // 健康窗口要求「对端真的收到了流」：实收 0k 时 drop/lat 再干净也不是升档证据
-        // （旧口径下这种场景照样攒满 15s 健康窗口并升档 —— 任务单 1.4 的假信号）
+        // （旧口径下这种场景照样攒满 15s 健康窗口并升档）
         // ⚠ 还要加上"本窗没有本地丢帧"：超闸门丢帧说明这一档的每帧数据量已经超了通道容量，
         //   此刻写锁再空闲也不是健康，绝不能当成升档理由（否则会在超帧与升档之间来回打摆）。
         val healthy = (avg in 0..HEALTHY_WRITE_MS) && localDrops == 0 &&
@@ -397,7 +370,7 @@ class QualityController(
             healthySince = 0L
         }
 
-        // ===== 升档：五重闸门（R7 + 任务单 1.4 的实收码率）=====
+        // ===== 升档：五重闸门（R7 + 实收码率）=====
         if (current.idx >= maxLevel.idx) return
         if (nowMs - lastUpAt < UP_MIN_GAP_MS) return
         if (lastDownAt > 0 && nowMs - lastDownAt < UP_AFTER_DOWN_MS) return

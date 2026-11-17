@@ -10,11 +10,9 @@ import java.net.NetworkInterface
 
 /**
  * 门禁：只有在「WiFi 已连接」或「本机热点已开启」或「有线以太网」时才允许传输。
- *
- * 三级判定，任一命中即放行：
- *  1. ConnectivityManager 的活动网络具备 TRANSPORT_WIFI / ETHERNET
- *  2. 反射 WifiManager.isWifiApEnabled() / getWifiApState()（Android 12 上是隐藏 API，失败不影响）
- *  3. 遍历网卡，存在 ap* / swlan* / softap* / wlan1 等热点桥接口且 isUp
+ * 三级判定，任一命中即放行：1. ConnectivityManager 的活动网络具备 TRANSPORT_WIFI / ETHERNET；
+ * 2. 反射 WifiManager.isWifiApEnabled() / getWifiApState()（Android 12 上是隐藏 API，失败不影响）；
+ * 3. 遍历网卡，存在 ap* / swlan* / softap* / wlan1 等热点桥接口且 isUp。
  */
 class LanGate(private val ctx: Context) {
 
@@ -34,12 +32,8 @@ class LanGate(private val ctx: Context) {
     }
 
     /**
-     * 本机当前是否走**运营商数据网络**（无 WiFi / 以太网 / 热点）。
-     *
-     * 这是「使用数据流量」的唯一判据（v2.7）：发文件 / 语音 / 视频前，只有本机真的在
-     * 蜂窝数据上才需要提醒本机用户 —— 与对端 IP 属于哪个网段无关（那只能说明
-     * 「这条链路没走局域网」，不能说明「本机在花流量」）。
-     *
+     * 本机当前是否走**运营商数据网络**（无 WiFi / 以太网 / 热点）：这是「使用数据流量」的唯一判据，
+     * 发文件 / 语音 / 视频前，只有本机真的在蜂窝数据上才需要提醒本机用户——与对端 IP 属于哪个网段无关（那只能说明「这条链路没走局域网」，不能说明「本机在花流量」）。
      * @param force 调试开关（设置里的「强制启用」）为真时一律视为不在数据网络。
      */
     fun onCellular(force: Boolean = false): Boolean {
@@ -48,6 +42,20 @@ class LanGate(private val ctx: Context) {
         if (hotspotEnabled()) return false
         if (hotspotInterfaceUp() != null) return false
         return true
+    }
+
+    /**
+     * 本机是否有 VPN 在运行（含本应用流量被 VPN 接管的情况）：VPN 把 0.0.0.0/0 路由进 tun 后，发往局域网的 TCP 会先被 VPN 截走，
+     * 轻则「TCP 已连通但握手无响应」，重则连接超时（源地址是 10.x 的 tun 地址），应用侧表现为所有设备都连不上。界面据此给一条常驻提示。
+     */
+    fun vpnActive(): Boolean {
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return false
+        return runCatching {
+            cm.allNetworks.any { n ->
+                cm.getNetworkCapabilities(n)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+            }
+        }.getOrDefault(false)
     }
 
     private fun wifiOrEthernet(): Boolean {
@@ -114,11 +122,8 @@ class LanGate(private val ctx: Context) {
         fun log(s: String) = Log.i(TAG, s)
 
         /**
-         * 对端 IP 是否属于「局域网侧」：私有 IPv4 段（10/8、172.16/12、192.168/16、
-         * 链路本地 169.254/16、回环）+ IPv6 ULA/链路本地。
-         *
-         * **只在兼容旧版本对端时使用**（v2.7）：老端没有 `dm` 能力位、不会回
-         * `data_ans`，只能沿用改造前的「对端不在局域网段 → 提示本机用户」这条老口径。
+         * 对端 IP 是否属于「局域网侧」：私有 IPv4 段（10/8、172.16/12、192.168/16、链路本地 169.254/16、回环）+ IPv6 ULA/链路本地。
+         * **只在兼容旧版本对端时使用**：老端没有 `dm` 能力位、不会回 `data_ans`，只能沿用「对端不在局域网段 → 提示本机用户」这条老口径；
          * 新流程一律按 [onCellular]（本机是否在用流量）判定。
          */
         fun isLanPeerIp(ip: String): Boolean {

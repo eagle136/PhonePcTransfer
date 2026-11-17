@@ -20,10 +20,9 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
-    <!-- ===== 本地网络（Android 16/API 36+ 的硬前提，2026-10-01 实测）=====
+    <!-- ===== 本地网络（Android 16/API 36+ 的硬前提）=====
          未声明且未经用户允许的 App，它发出的**局域网包会被系统按 uid 直接丢弃**：
-         TCP 表现为 connect 超时、UDP 双向静默消失，而同机 shell 用户实测连通
-         （Android 16 机型 / ColorOS V17 上 `appops get` 显示 ACCESS_LOCAL_NETWORK: ignore 并带 rejectTime）。
+         TCP 表现为 connect 超时、UDP 双向静默消失，而同机 shell 用户实测连通。
          本应用全部功能都建立在局域网直连上，缺这条 = 一台设备都连不上。 -->
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
 
@@ -37,11 +36,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- 锁屏来电弹界面的主路径（2026-09-22）：AOSP 的「显示悬浮窗」管理列表只列
+    <!-- 锁屏来电弹界面的主路径：AOSP 的「显示悬浮窗」管理列表只列
          清单里声明了此权限的应用——不声明则列表里没有本应用、也没法单独跳转授权页 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
-    <!-- ===== 锁屏来电（2026-09-22）=====
+    <!-- ===== 锁屏来电 =====
          USE_FULL_SCREEN_INTENT：Android 10(API29)+ 让「来电」通知可以带全屏意图 ——
          锁屏/息屏时由系统直接把主界面顶到锁屏之上，用户在锁屏上就能按「接听 / 挂断」。
          ⚠️ Android 14(API34)+ 起，非「通话/闹钟」类应用的这个权限会被系统默认收回，
@@ -109,7 +108,7 @@
             </intent-filter>
         </activity>
 
-        <!-- ===== 「复制链接」：出现在系统「用浏览器打开」的选择框里（2026-10-05，用户需求）=====
+        <!-- ===== 「复制链接」：出现在系统「用浏览器打开」的选择框里 =====
              android:label = 选择框里显示的名字（与「浏览器」同一注册方式，只是不渲染网页）；
              选中它 = 把链接写进剪贴板 + 提示一句 + 立即 finish()，全程无界面（透明主题见
              Theme.PhonePcTransfer.CopyLink）。
@@ -151,7 +150,7 @@
             android:name=".CallActionReceiver"
             android:exported="false" />
 
-        <!-- ===== 文件「打开方式」的点选回调（2026-10-15）=====
+        <!-- ===== 文件「打开方式」的点选回调 =====
              系统选择器（app picker）把用户这次点选的程序用 EXTRA_CHOSEN_COMPONENT 广播到这里，
              本应用按 MIME 记一条「这类文件用它打开」。记的是本应用自己的偏好，**不写系统默认应用表**，
              设置页「重置」即全部清空。回调 intent 显式指向本类，所以 exported=false 也能送达。 -->

@@ -43,9 +43,9 @@ fun SettingsDialog(onDismiss: () -> Unit) {
     var autoSync by remember { mutableStateOf(AppCore.prefs.autoSyncOnSend) }
     var forceLan by remember { mutableStateOf(AppCore.prefs.forceLanEnabled) }
     var clipSync by remember { mutableStateOf(AppCore.prefs.clipSyncMode) }
-    // 内置文件浏览器的 root 开关（2026-10-05）：本地一件状态，开关与 Prefs/LocalFs 同步
+    // 内置文件浏览器的 root 开关：本地一件状态，开关与 Prefs/LocalFs 同步
     var rootFs by remember { mutableStateOf(AppCore.prefs.rootFs) }
-    // 本应用记住的「这类文件用哪个程序打开」（2026-10-15）：本地快照，重置后要立刻反映到界面上
+    // 本应用记住的「这类文件用哪个程序打开」：本地快照，重置后要立刻反映到界面上
     var openers by remember { mutableStateOf(AppCore.prefs.openers()) }
 
     AlertDialog(
@@ -150,11 +150,9 @@ fun SettingsDialog(onDismiss: () -> Unit) {
                     }) { Text(if (granted) "所有文件访问权限：已授予" else "授予所有文件访问权限（可选）") }
                 }
 
-                // ---------- 内置文件浏览器的 root 模式（2026-10-05）----------
-                // 默认关。有「所有文件访问」时不需要它；开了才走 su（KernelSU/Magisk 都支持），
-                // 文件浏览器与「发送文件夹」的浏览根变成 /data/media/0 —— 好处是连
-                // /Android/data、/Android/obb 也能读（那两处是系统的 FUSE 限制，光有
-                // MANAGE_EXTERNAL_STORAGE 也读不到）。用户定调：这一项只在这里手动开。
+                // ---------- 内置文件浏览器的 root 模式 ----------
+                // 默认关。有「所有文件访问」时不需要它；开了才走 su（KernelSU/Magisk 都支持），文件浏览器与「发送文件夹」的浏览根变成 /data/media/0 ——
+                // 好处是连 /Android/data、/Android/obb 也能读（那两处是系统的 FUSE 限制，光有 MANAGE_EXTERNAL_STORAGE 也读不到）。这一项只在这里手动开。
                 SwitchRow("文件浏览用 root 读 /data/media/0（须 KernelSU/Magisk 授权）", rootFs) {
                     rootFs = it
                     AppCore.prefs.rootFs = it
@@ -219,7 +217,7 @@ fun SettingsDialog(onDismiss: () -> Unit) {
                 Text("最近日志", style = MaterialTheme.typography.labelLarge)
                 Text(AppCore.lastLog.ifEmpty { "—" }, style = MaterialTheme.typography.bodySmall)
 
-                // 「清空」单独成区：**逐条删除**（2026-09-21 起，与 PC 端同口径）——
+                // 「清空」单独成区：逐条删除（与 PC 端同口径）——
                 // 不再整删历史文件，否则对端一连上就被 hsync 把文本/图片补回来。
                 HorizontalDivider()
                 Text("清空", style = MaterialTheme.typography.labelLarge)
@@ -237,10 +235,8 @@ fun SettingsDialog(onDismiss: () -> Unit) {
 }
 
 /**
- * 后台保活（无障碍，推荐）。
- *
- * 仅用于让本进程在后台更难被系统冻结/杀掉，从而保证文件传输与语音通话在退到
- * 后台后仍能持续运行。本服务不读取任何屏幕内容、不读取剪贴板。
+ * 后台保活（无障碍，推荐）：仅用于让本进程在后台更难被系统冻结/杀掉，保证文件传输与语音通话在退到后台后仍能持续运行。
+ * 本服务不读取任何屏幕内容、不读取剪贴板。
  */
 @Composable
 private fun A11yRow() {
@@ -264,10 +260,8 @@ private fun A11yRow() {
     TextButton(onClick = {
         runCatching { ctx.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
     }) {
-        // 「✓」→ 矢量 [Glyph.CHECK]（2026-09-19 去 emoji/符号字符）。
-        // 图标放**文字前面**：原本文案是「已开启 ✓（点此管理）」，那个尾巴上的 ✓ 是
-        // 「状态标记」而不是标点，提到行首当状态指示更清楚，也不会在换行时被甩到下一行。
-        // 只在已开启时出现 —— 没开启时不必再画一个「否」的图标。
+        // 「✓」→ 矢量 [Glyph.CHECK]（去 emoji/符号字符）。图标放文字前面：原尾部 ✓ 是「状态标记」而非标点，
+        // 提到行首当状态指示更清楚，也不会在换行时被甩到下一行；只在已开启时出现。
         Row(verticalAlignment = Alignment.CenterVertically) {
             if (enabled) GlyphIcon(Glyph.CHECK, size = 14.dp)
             Text(
@@ -281,9 +275,7 @@ private fun A11yRow() {
 
 /**
  * 记住的打开方式那行要显示的应用名。入参是 `"包名/类名"`。
- *
- * 取不到 label 是**正常情况**（Android 11+ 包可见性：本应用没声明 `<queries>`，
- * 用 PM 查别的应用信息会抛 NameNotFoundException），此时退回显示包名 ——
+ * 取不到 label 是正常情况（Android 11+ 包可见性：本应用没声明 `<queries>`，用 PM 查别的应用信息会抛 NameNotFoundException），此时退回显示包名 ——
  * 只是这一行不够好看，打开文件那条路径用的是显式组件 intent，不受可见性影响。
  */
 private fun openerLabel(ctx: Context, flatComponent: String): String {

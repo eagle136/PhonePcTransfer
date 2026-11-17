@@ -11,9 +11,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import com.phonepctransfer.AppCore
 
-// 高对比配色（2026-10-01 用户定稿，参考截图）：
-//  - 浅色：蓝主色 + 浅灰蓝底；进度条/滑轨浅灰，实心段蓝色
-//  - 深色：绿主色 + 近黑底；进度条轨道近白，实心段绿色
+// 高对比配色：浅色蓝主色 + 浅灰蓝底（进度条轨道浅灰、实心段蓝色）；
+// 深色绿主色 + 近黑底（进度条轨道近白、实心段绿色）。
 private val Light = lightColorScheme(
     primary = Color(0xFF1D5FEF),
     primaryContainer = Color(0xFFD6E4FF),
@@ -61,12 +60,9 @@ internal fun toggleAppTheme(darkNow: Boolean) {
 }
 
 /**
- * @param dark 由调用方（setContent 根作用域）读 [isAppDark] 传进来。
- * **不能**在这里自己读：实测 PPTheme 内部读状态时，切主题只让按钮文案重组，
- * 整棵树的 LocalColorScheme 不刷新，要等一次结构性变化才跟上（2026-10-01）。
- *
- * 系统栏图标外观**不在这里管**：见 MainActivity 的 `enableEdgeToEdge(window, …)` ——
- * 只设 `isAppearanceLightStatusBars` 会被 ColorOS 的 auto（跟随系统）样式盖回去。
+ * dark 由调用方（setContent 根作用域）读 [isAppDark] 传进来；**不能**在这里自己读：
+ * PPTheme 内部读状态时切主题只让按钮文案重组，整棵树的 LocalColorScheme 不刷新，要等一次结构性变化才跟上。
+ * 系统栏图标外观不在这里管：见 MainActivity 的 `enableEdgeToEdge(window, …)` —— 只设 `isAppearanceLightStatusBars` 会被 ColorOS 的 auto（跟随系统）样式盖回去。
  */
 @Composable
 fun PPTheme(dark: Boolean, content: @Composable () -> Unit) {

@@ -100,7 +100,7 @@ public final class ImageCodec {
     /**
      * ImageIO 读取，支持按 maxDim **源端降采样**（setSourceSubsampling，
      * 等价于 Android 的 inSampleSize）：解码时直接跳采样，避免巨图整幅
-     * 解进内存（旧实现 ImageIO.read 无视 maxDim，几十 MP 的照片既慢又费堆）。
+     * 解进内存（巨图整幅解码既慢又费堆）。
      */
     private static BufferedImage readViaImageIO(File src, int maxDim) {
         try (javax.imageio.stream.ImageInputStream iis = ImageIO.createImageInputStream(src)) {

@@ -7,13 +7,6 @@
 
 在 [Releases](https://github.com/eagle136/PhonePcTransfer/releases) 下载最新版：
 
-| 平台 | 文件 | 说明 |
-|---|---|---|
-| Android | `PhonePcTransfer-<版本>.apk` | Android 8.0+，直接安装 |
-| Windows | `PhonePcTransfer-<版本>.msi` | 一键安装，自带运行时与视频解码器 |
-| 任意桌面 | `PhonePcTransfer-PC.jar` | 免安装，需 JDK 17+：`java -jar PhonePcTransfer-PC.jar` |
-
-> CI 构建使用独立签名证书，**首次安装请先卸载本地开发版**；之后各 Release 之间可直接覆盖升级。
 
 ## 使用
 
@@ -21,8 +14,6 @@
 
 1. 安装 MSI，或直接运行 jar。
 2. **首次使用点一次防火墙放行**（入站 TCP 28765 / UDP 28766）：
-   - 安装版：安装目录的 `app\firewall-addrules.cmd`，右键「以管理员身份运行」；
-   - 源码版：`pc\run_admin.bat`。
 3. 启动后常驻系统托盘，关闭窗口只是隐藏到托盘。
 
 注意：**主程序不要用管理员身份运行**，否则拖拽文件会被 Windows 拦掉。
@@ -49,10 +40,8 @@
 
 ## 常见问题
 
-- **电脑和手机互相找不到**：确认在同一网段；路由器关闭 AP 隔离；手机确认已给「本地网络」权限；电脑防火墙已放行 28765/28766。
+- **电脑和手机互相找不到**：确认在同一网段；没有使用VPN拦截通信；路由器关闭 AP 隔离；手机确认已给「本地网络」权限；电脑防火墙已放行 28765/28766。
 - **手机切后台/熄屏就断**：部分 ROM 会冻结后台应用。把本应用加入电池优化白名单（允许完全后台行为）。
-- **电脑关了窗口还在传吗**：关窗口只是隐藏到托盘，程序仍在运行；退出要从托盘菜单退出。
-- **传文件同名不覆盖**：自动加 ` (1)` ` (2)`，序号插在扩展名前。
 
 ## 从源码构建
 
@@ -67,15 +56,11 @@ cd android && ./gradlew :app:assembleRelease
 build.bat
 ```
 
-签名材料不入库：本地放在仓库根 `signing/keystore.properties` 与对应 `.jks`。
-推送到 `main` 会由 GitHub Actions 自动构建三件套并发布 Release（版本号 `1.1.<构建序号>`）。
-
 ## 目录
 
 ```
 android/      Android 端（Kotlin + Jetpack Compose）
 pc/           PC 端（Java Swing + 系统托盘，零第三方运行时依赖）
-docs/         协议规范 docs/PROTOCOL.md 与验证记录
-SOURCE_MAP.md 源码地图（改代码前先在这里定位文件）
-.github/      CI：推送 main 自动构建并发布 Release
+tools/        IP 库生成等辅助工具
+.github/      CI：推送 v* tag 自动构建两端并发布 Release
 ```

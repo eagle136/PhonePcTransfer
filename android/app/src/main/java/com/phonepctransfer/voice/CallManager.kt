@@ -22,18 +22,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 通话状态机（Android 端，与 PC 端 CallManager.java 同构）。
- *
- * 全局**同一时刻最多一个通话**：任何新的呼出请求在已有通话时直接拒绝（不入队），
- * 任何新的呼入在已有通话时回 `call_busy` 静默拒绝（不打扰用户）。
- *
- * 状态：
- *  IDLE → OUTGOING（呼出，等对方接） → TALKING
- *  IDLE → INCOMING（呼入，弹窗等用户选） → TALKING
- *  TALKING → 任一方挂断 / 6 小时超时 → IDLE
- *
- * 音频：TALKING 状态下，VoiceEngine 采集编码经 Link 发出；收到对端音频交 VoiceEngine 播放。
- * 视频（2026-09-15 新增）：`videoMode` 为真时，Android 端在 TALKING 后启动
- * [VideoCall] 的发送/接收半；档位协商在 invite/accept 里完成（两端取 min）。
+ * 全局**同一时刻最多一个通话**：已有通话时新呼出直接拒绝（不入队），新呼入回 `call_busy` 静默拒绝。
+ * 状态：IDLE → OUTGOING（等对方接）/ INCOMING（弹窗等用户选） → TALKING → 任一方挂断 / 6 小时超时 → IDLE。
+ * 音频：TALKING 下 VoiceEngine 采集编码经 Link 发出；对端音频交 VoiceEngine 播放。
+ * 视频：`videoMode` 为真时 TALKING 后启动 [VideoCall] 收发半；档位协商在 invite/accept 里完成（两端取 min）。
  */
 class CallManager(private val link: Link, private val ctx: Context) {
 
@@ -63,9 +55,8 @@ class CallManager(private val link: Link, private val ctx: Context) {
         fun onCallEnded(peerIp: String, reason: String) {}
 
         /**
-         * 通话已结束（v2.7 起带通话形态与时长，供上层**以消息方式记录**）。
+         * 通话已结束（带通话形态与时长，供上层**以消息方式记录**）。
          * 默认实现回落到上面的两参版本，老实现方不会漏收结束事件。
-         *
          * @param video   本次是否视频通话
          * @param durationMs 实际通话时长（未接通为 0）
          * @param outgoing true = 本机发起
@@ -77,8 +68,8 @@ class CallManager(private val link: Link, private val ctx: Context) {
         }
 
         /**
-         * 2.9 / S23：通话中的**媒体侧提示**（"疑似被拦"这一类：只提示，不改变任何传输方式）。
-         * 默认空实现 ⇒ 老实现方不漏收；UI 侧要显示就覆盖它（本单由 AppCore 接到短提示 Toast）。
+         * 通话中的**媒体侧提示**（"疑似被拦"这一类：只提示，不改变任何传输方式）。
+         * 默认空实现 ⇒ 老实现方不漏收；UI 侧要显示就覆盖它（由 AppCore 接到短提示 Toast）。
          * ⚠ 可能在非主线程被调（pp-av-alive）⇒ 实现方自己 marshal，与 onStateChanged 同一约定。
          */
         fun onMediaNotice(text: String) {}
@@ -130,8 +121,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
     private var pendingLevelIdx = VideoLevel.DEFAULT.idx
 
     /**
-     * 对端声明的**语音帧长**（ms，来自 `call_invite`/`call_accept` 的 `af` 字段）。
-     *
+     * 对端声明的**语音帧长**（ms，来自 `call_invite`/`call_accept` 的 `af` 字段）：
      * **0 = 对端是老版本**（没有这个字段）→ 本次通话用 200ms 兼容模式。
      * 帧长是收发硬对称常量，所以绝不能「本端单方面用 20ms」。
      */
@@ -139,10 +129,10 @@ class CallManager(private val link: Link, private val ctx: Context) {
     private var pendingAfMs = 0
 
     /**
-     * 对端在 `call_invite`/`call_accept` 里声明的**媒体通道三元组**（任务单 2.4 / 方案 §4.2）。
+     * 对端在 `call_invite`/`call_accept` 里声明的**媒体通道三元组**（方案 §4.2）。
      * 与 [pendingAfMs] 同一生命周期：每次振铃/应答覆盖，不单独复位。
-     * 缺省值 0 / false / 空 = 对端未声明（老端或老口径）→ 2.5 的定档时序只能落带内档。
-     * ⚠ msid 只做**串话隔离**，不是安全边界（S12）；谁生成、谁回显由 2.5 定（本单只落 wire 字段）。
+     * 缺省值 0 / false / 空 = 对端未声明（老端或老口径）→ 定档时序只能落带内档。
+     * ⚠ msid 只做**串话隔离**，不是安全边界（S12）。
      */
     @Volatile
     private var peerMport = 0
@@ -172,7 +162,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
     private val busy = AtomicBoolean(false)
 
     /**
-     * 媒体传输模块（任务单 2.1；D2「一通电话一个媒体会话」）。
+     * 媒体传输模块（D2「一通电话一个媒体会话」）。
      * 与 PC 端 CallManager.java 同一时机：呼叫一开（振铃期）就建，endCall 里关。
      * 上层只调 start / sendAudio / sendVideo / sendCtrl / stop 这五个方法；
      * 底下是五档里的哪一档由模块内部决定，通话层既不读取也不据此分支（D3 / I17）。
@@ -181,7 +171,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
     private var av: AvTransport? = null
 
     /**
-     * 定档时序**是否已跑完**（任务单 2.5）。与 [pendingStartTalking] 成对：
+     * 定档时序**是否已跑完**。与 [pendingStartTalking] 成对：
      * §4.3 要求七步全在振铃期完成，而"进 TALKING"的两个触发点（用户点接听 / 对端应答）
      * 和时序结论谁先到都不一定 ⇒ 两边在这里会面。
      */
@@ -192,7 +182,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
     @Volatile
     private var pendingStartTalking = false
 
-    /** 模块的收帧出口（过滤口径与改前逐字一致：音频按 state＋源地址，视频半交给 VideoCall 自己判源） */
+    /** 模块的收帧出口（过滤口径与原 onAudio/onVideoFrame 一致：音频按 state＋源地址，视频半交给 VideoCall 自己判源） */
     private val avSink = object : AvTransport.Sink {
         override fun onAudio(fromIp: String, seq: Int, ts: Long, data: ByteArray, len: Int) {
             handleInboundAudio(fromIp, seq, ts, data, len)
@@ -203,7 +193,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
         }
 
         /**
-         * 2.9 / S23：模块判定"本档 1s 一条反馈都没收到"（**上升沿**，一秒最多一次）。
+         * 模块判定"本档 1s 一条反馈都没收到"（**上升沿**，一秒最多一次）。
          * 处置口径是写死的：**只提示、不换档、不换端口、不重开探测**（I17），
          * 所以这里除把话交给 UI 以外不做任何动作 —— 通话层不许读 tier 做分支（D3）。
          */
@@ -214,7 +204,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
         }
 
         /**
-         * 2.9 / P10（2026-10-02 用户认可的默认处置）：媒体通道彻底无流达 10s ⇒ **自动挂断 + 提示**。
+         * 媒体通道彻底无流达 10s ⇒ **自动挂断 + 提示**（默认处置）。
          * ⚠ "媒体存活由通话状态机决定"（I14）⇒ 挂断动作在这里，不在 AvTransport 里。
          * ⚠ 线程：回调来自 pp-av-alive，而安卓这套状态机的约定是"一切迁移走 main"（同 onNegotiated）
          *   ⇒ 整段投到 main 上做，state/peerIp 的重查也放在 main 里，迟到的回调不会复活上一通。
@@ -231,16 +221,15 @@ class CallManager(private val link: Link, private val ctx: Context) {
     }
 
     /**
-     * 建本次通话的媒体会话。2.5 起这一步就把**第 0 档 bind 好**（§4.3①「先 bind 出本档端口，
+     * 建本次通话的媒体会话。这一步就把**第 0 档 bind 好**（§4.3①「先 bind 出本档端口，
      * 再交换 mport/mudp/msid」——端口要随 invite/accept 出去），并由调用方紧接着发 invite/accept、
      * 再 [startNegotiation] 把七步时序跑完。
-     *
-     * @param caller true = 本端是主叫（媒体 TCP 档由主叫发起连接，见 AvTransport 2.5 块「我的推论③」）
+     * @param caller true = 本端是主叫（媒体 TCP 档由主叫发起连接）
      */
     private fun openTransport(ip: String, caller: Boolean) {
         val t = AvTransport(link, avSink)
-        // 三元组的本端一份（localMsid，每端各自生成 —— 2026-10-02 用户点）+ 对端一份
-        // （主叫此刻还没有 ⇒ 0/false/空；被叫就是 invite 里带进来的那一份，2.4 的字段从本条起有读者）
+        // 三元组的本端一份（localMsid，每端各自生成）+ 对端一份
+        // （主叫此刻还没有 ⇒ 0/false/空；被叫就是 invite 里带进来的那一份）
         t.start(
             AvTransport.Spec(
                 ip, randomMsid(),
@@ -250,11 +239,11 @@ class CallManager(private val link: Link, private val ctx: Context) {
                 caller
             )
         )
-        // 2.10 / P6 + S14：媒体 TCP **被叫侧 accept** 的准入判据（三条件里的前三样在本机的表上，
+        // 媒体 TCP **被叫侧 accept** 的准入判据（三条件里的前三样在本机的表上，
         // msid 那一半在模块里 —— AvTransport.admitMediaInbound，两边**与**起来才放行）。
         // ⚠ 每条都当场读 volatile 状态，不是在 openTransport 时刻快照：时序跑在 pp-av-negotiate 上，
         //   跑到 ④ 时本通可能已经挂了，那时必须判为"不在通话中"。
-        // ⚠ **没有**动 link.incomingGate（AppCore.kt:437 那条 2026-10-01 真机验证过的后台闸门）：
+        // ⚠ **没有**动 link.incomingGate（AppCore.kt:437 那条真机验证过的后台闸门）：
         //   它管的是消息端口 28765 的 accept，媒体监听器是模块自己 bind 的、根本不经过它
         //   ⇒ S14 那句"不能整条关掉 incomingGate"因此天然成立。
         t.mediaInboundAdmit = { rip ->
@@ -265,7 +254,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
                 // ②b 既有网段黑名单：高风险段 + 本机设备级标记（与 adopt 那道同源）
                 && !com.phonepctransfer.net.BlocklistIpv6.isHighRisk(rip) && !pf.isBlockedAddr(rip)
                 // ② 已知设备。⚠ 安卓这张表按 **IP** 存（PC 按设备组键存，两端这里不同构），
-                //   所以再补 D10 那一半：与通话对端**同组**的其它地址（另一块网卡，2.7 的教训）
+                //   所以再补 D10 那一半：与通话对端**同组**的其它地址（另一块网卡）
                 //   且该组已知，才算已知设备。不能只写 tr.isTrusted(rip) —— 那会把多地址设备判死；
                 //   也不能写 rip == pip —— 会话地址≠界面地址。
                 && (tr.isTrusted(rip) || (pip.isNotEmpty() && tr.isTrusted(pip)
@@ -286,12 +275,11 @@ class CallManager(private val link: Link, private val ctx: Context) {
 
     /**
      * 在振铃期把 §4.3 的七步时序跑完（独立线程：每一步都可能按窗口阻塞，绝不能在 main 上跑）。
-     * 结果只决定「定在哪一档 + 能不能进 TALKING」，不决定媒体帧今天怎么走（3.3 之前恒带内，
+     * 结果只决定「定在哪一档 + 能不能进 TALKING」，不改变媒体帧当前的走法（带内，
      * 见 [AvTransport.mediaUsesMainTcp]）。
-     *
-     * ⚠ 与 PC 端唯一差一处：结论**回投 main**（[main.post]）再做状态迁移 —— 安卓这套状态机的
-     *   约定是「一切迁移走 ui{} / main 线程」（见 AppCore 的 listener 转发），而 PC 端
-     *   CallManager 的方法本身没有线程域约束。时序线程自己绝不碰 voice / video。
+     * ⚠ 与 PC 端唯一差一处：结论**回投 main**（[main.post]）再做状态迁移——安卓这套状态机的
+     *   约定是「一切迁移走 ui{} / main 线程」（见 AppCore 的 listener 转发），而 PC 端 CallManager 没有线程域约束。
+     *   时序线程自己绝不碰 voice / video。
      */
     private fun startNegotiation() {
         val t = av ?: return
@@ -314,10 +302,10 @@ class CallManager(private val link: Link, private val ctx: Context) {
             return   // 这一通已经结束了（挂断 / 超时 / 对端取消都会叫停时序），不要复活它
         }
         if (ok && mediaDowngraded) {
-            // 2.11 / §4.3⑥：UI **明示**降级（不是只写日志）。走 2.9 那条 onMediaNotice ——
+            // §4.3⑥：UI **明示**降级（不是只写日志）。走 onMediaNotice——
             // 它本来就是"媒体侧提示"的通道，不再为降级另立第三个回调（D3：上层只读标志位，不读 tier）。
             // ⚠ 一次通话只跑一次时序（startNegotiation 的调用点是振铃期那两处）⇒ 天然不重复提示，
-            //   所以没有另设"提示过没有"的闩锁（1.6 的口径）。本方法已经在 main 上（onNegotiated 的约定）。
+            //   所以没有另设"提示过没有"的闩锁。本方法已经在 main 上（onNegotiated 的约定）。
             listener?.onMediaNotice(
                 "本次通话媒体已降级：走消息端口的带内通道（第五档）。" +
                         "通话期间文件不发送、聚合恒关（D16 / I13）"
@@ -325,7 +313,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
         }
         negotiated = true
         if (!ok) {
-            // ⑦（U11②，2026-10-02 用户点）：带内也不成立 ⇒ 提示呼叫失败，**不进 TALKING**
+            // ⑦：带内也不成立 ⇒ 提示呼叫失败，**不进 TALKING**
             when (state) {
                 State.OUTGOING -> {
                     link.sendCallCancel(ip)
@@ -362,7 +350,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
 
     /**
      * 关本次通话的媒体会话（endCall 与"invite 都没发出去"这一条失败分支都走这里）。
-     * 可重入：重复调用不出异常（任务单 2.9 的五条退出路径最终都汇聚到这一个 close）。
+     * 可重入：重复调用不出异常（所有退出路径最终都汇聚到这一个 close）。
      */
     private fun closeTransport() {
         val t = av
@@ -372,9 +360,9 @@ class CallManager(private val link: Link, private val ctx: Context) {
     }
 
     /**
-     * 2.11：本次通话是否**落到带内档**（第五档 = 媒体跑在主 TCP 的消息端口上）。
+     * 本次通话是否**落到带内档**（第五档 = 媒体跑在主 TCP 的消息端口上）。
      * 上层只读这一个标志，**不读 tier**（D3：五档互换时通话层零改动）；
-     * UI 的降级文案（ChatScreen 的通话条）与 2.12 的文件闸门读的都是它。
+     * UI 的降级文案（ChatScreen 的通话条）与文件闸门读的都是它。
      * ⚠ av 为 null（还没 openTransport / 已 closeTransport）时为 false：
      *   那时本通没有媒体结论可展示，不能把"未定档"显示成"已降级"。
      */
@@ -445,12 +433,12 @@ class CallManager(private val link: Link, private val ctx: Context) {
         pendingVideo = wantVideo
         pendingLevelIdx = lv
 
-        // 媒体会话先建再发 invite：任务单 2.4/2.5 要在 invite 里带上本端 bind 出来的媒体端口，
+        // 媒体会话先建再发 invite：invite 里要带上本端 bind 出来的媒体端口，
         // 所以定档必须早于协商报文（振铃期完成，§4.3）。
-        // invite 发不出去 ⇒ 就地关掉，不留半个已 bind 的会话（2.9 的"呼叫失败也必须释放"从这条分支开始成立）。
+        // invite 发不出去 ⇒ 就地关掉，不留半个已 bind 的会话（呼叫失败也必须释放）。
         openTransport(ip, true)
         // 末尾三项 = 本端第 0 档的媒体通道三元组（§4.3①：start() 已把这一档 bind 好，
-        // 端口在这里带出去，2.4 的 wire 字段从本条起有真实值）。bind 不成立 ⇒ 0/false，对端落带内档。
+        // 端口在这里带出去）。bind 不成立 ⇒ 0/false，对端落带内档。
         val t0 = av
         if (!link.sendCallInvite(
                 name, AppCore.localIp, wantVideo, lv, VoiceEngine.VOICE_FRAME_MS_LOWLAT,
@@ -516,8 +504,8 @@ class CallManager(private val link: Link, private val ctx: Context) {
         peerMport = mport
         peerMudp = mudp
         peerMsid = msid
-        // 被叫侧也在**振铃期**建媒体会话并起时序（任务单 2.5；原先这一步在 acceptIncoming 里，
-        // 那时无条件回 call_accept ⇒ 端口只能广告"未声明"，七步时序没地方跑）。
+        // 被叫侧也在**振铃期**建媒体会话并起时序：
+        // 若拖到 acceptIncoming 才建，那时已无条件回 call_accept ⇒ 端口只能广告"未声明"，七步时序没地方跑。
         // 未接听的来电在 endCall（拒绝 / 对方取消 / 超时）里由 closeTransport 释放端口。
         openTransport(peerIp, false)
         setState(State.INCOMING)
@@ -530,9 +518,8 @@ class CallManager(private val link: Link, private val ctx: Context) {
     fun acceptIncoming() {
         if (state != State.INCOMING) return
         val ip = peerIp
-        // 媒体会话与七步时序在**振铃期**就起好了（onIncoming 里 openTransport + startNegotiation，
-        // 原先这一步在本方法里 ⇒ 那时还没有任何端口可广告）。这里只把当前正在广告的那一档
-        // 带进 call_accept；对端随后仍会由 call_media 收到更新后的三元组（时序可能还在往后档推进）。
+        // 媒体会话与七步时序在**振铃期**就起好了（onIncoming 里 openTransport + startNegotiation）。
+        // 这里只把当前正在广告的那一档带进 call_accept；对端随后仍会由 call_media 收到更新后的三元组（时序可能还在往后档推进）。
         val t = av
         // 回带本端期望的语音帧长：双方都声明 20ms 才会真正启用低延迟模式
         link.sendCallAccept(
@@ -579,11 +566,10 @@ class CallManager(private val link: Link, private val ctx: Context) {
     }
 
     /**
-     * 对端在振铃期逐档交换过来的媒体三元组（任务单 2.5 / 方案 §4.3①，2026-10-02 用户点的 (a) 口径）。
-     *
+     * 对端在振铃期逐档交换过来的媒体三元组（方案 §4.3①）。
      * 这是**唯一**能在时序进行中更新「对端此刻听哪个端口」的通道：accept 只有一帧，
      * 而五档一轮一轮地推进，每一轮本端端口都会变（§4.1：逐档换端口、不复用）。
-     * mtier 只进日志，不参与定档判断 —— 双端的档位清单长度不同（安卓滤掉两条 443 档），
+     * mtier 只进日志，不参与定档判断——双端的档位清单长度不同（安卓滤掉两条 443 档），
      * 序号无法对齐，能对齐的是**协议类**（UDP 对 UDP、媒体 TCP 对媒体 TCP）。
      */
     fun onCallMedia(peerIp: String, mport: Int, mudp: Boolean, msid: String, mtier: Int) {
@@ -639,14 +625,11 @@ class CallManager(private val link: Link, private val ctx: Context) {
 
     /**
      * 会话层发现「通话对端的健康会话已经不在了」时调用（Link 掉线 → AppCore 转发）。
-     *
      * 必须显式处理：`link` 掉线只走 `onState/onPeersChanged`，CallManager 不挂在那条链路上，
-     * 没人通知就会永远停在 TALKING（最坏 6 小时）—— 表现为计时条一直转、「挂断」之外
-     * 什么都不响应，且「视频」按钮因 `callState != IDLE` **恒久置灰**
-     * （2026-09-15 实测：手机互打时按钮点不动，与 PC 通话却正常）。
-     *
+     * 没人通知就会永远停在 TALKING（最坏 6 小时）——表现为计时条一直转、「挂断」之外什么都不响应，
+     * 且「视频」按钮因 `callState != IDLE` **恒久置灰**。
      * 不做静默变 IDLE：必须给文案，否则用户感知是「用了就自己断了」。
-     * 两端对称 —— 对端会话掉线时，本端也会各自走到这里。
+     * 两端对称——对端会话掉线时，本端也会各自走到这里。
      */
     fun onPeerDisconnected(ip: String) {
         if (state == State.IDLE) return
@@ -658,12 +641,12 @@ class CallManager(private val link: Link, private val ctx: Context) {
 
     // ==================== 音频 / 视频 ====================
 
-    /** 收到对端音频（Link 读线程回调）⇒ 交给媒体模块分发（任务单 2.1）。ts = 对端通话相对毫秒 */
+    /** 收到对端音频（Link 读线程回调）⇒ 交给媒体模块分发。ts = 对端通话相对毫秒 */
     fun onAudio(peerIp: String, seq: Int, ts: Long, data: ByteArray, len: Int) {
         av?.deliverAudio(peerIp, seq, ts, data, len)
     }
 
-    /** 模块收帧回调（守卫与改前 onAudio 逐字一致） */
+    /** 模块收帧回调（守卫与原 onAudio 逐字一致） */
     private fun handleInboundAudio(fromIp: String, seq: Int, ts: Long, data: ByteArray, len: Int) {
         if (state != State.TALKING || this.peerIp != fromIp) return
         voice.onAudioReceived(seq, ts, data, len)
@@ -674,7 +657,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
         av?.deliverVideo(peerIp, seq, ts, flag, data, len)
     }
 
-    /** 模块收帧回调（守卫与改前 onVideoFrame 逐字一致：源地址仍由 VideoCall 首源锁定处理，2.7 统一） */
+    /** 模块收帧回调（守卫与原 onVideoFrame 逐字一致：源地址仍由 VideoCall 首源锁定处理） */
     private fun handleInboundVideo(
         fromIp: String, seq: Int, ts: Long, flag: Int, data: ByteArray, len: Int
     ) {
@@ -717,7 +700,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
     // ==================== 音频输出路由（媒体 ⇄ 通话通道 + 免提/听筒） ====================
 
     /**
-     * 输出通道（2026-09-16 用户定调）：**每次通话默认「媒体通道」**——
+     * 输出通道（用户定调）：**每次通话默认「媒体通道」**——
      * 播放轨用 USAGE_MEDIA（媒体音量、音量大），AudioManager 保持 MODE_NORMAL，
      * 输出设备由系统按媒体路由决定：**插着有线/蓝牙耳机就走耳机，手机不外放**。
      * 可切「电话通道」：MODE_IN_COMMUNICATION + USAGE_VOICE_COMMUNICATION（通话音量），
@@ -884,19 +867,19 @@ class CallManager(private val link: Link, private val ctx: Context) {
     private fun startTalking() {
         if (state != State.OUTGOING && state != State.INCOMING) return
         stopRinger()
-        // 媒体帧 ts 的零点（任务单 1.1）：与 PC 端 CallManager.startTalking 同位置置零。
+        // 媒体帧 ts 的零点：与 PC 端 CallManager.startTalking 同位置置零。
         // 音频与视频**共用这一个零点**，所以两端能各自做本端 A/V 对轴。
         CallClock.reset()
-        // 分段延迟计量起表（任务单 1.2）：每秒一行 p50/p95/max，挂断即停表
+        // 分段延迟计量起表：每秒一行 p50/p95/max，挂断即停表
         SegMeter.start { AppCore.appendLogPublic(it) }
-        // 通话计数器清零（任务单 1.7）：计数口径 = 本次 TALKING 段，与 CallClock/SegMeter 同位置，
-        // 双端同序。挂断时在 endCall 打唯一一行汇总。
+        // 通话计数器清零：计数口径 = 本次 TALKING 段，与 CallClock/SegMeter 同位置，双端同序。
+        // 挂断时在 endCall 打唯一一行汇总。
         CallCounters.reset()
         talkStartMs = System.currentTimeMillis()
         videoMode = pendingVideo
         level = VideoLevel.of(minOf(pendingLevelIdx, maxVideoLevelIdx))
         setState(State.TALKING)
-        // 2.12 / D16：进入 TALKING ⇒ "通话中"这一票投 1（用户点的边界：**仅接通后**，振铃期不投，
+        // 进入 TALKING ⇒ "通话中"这一票投 1（边界：**仅接通后**，振铃期不投，
         // 所以不是 isBusy()）。此后文件与目录一律不入网、在传的在分片/成员边界暂停。
         link.setFileVote(Link.VOTE_IN_CALL, true)
         //  ⚠ 音频设备初始化（AudioRecord/AudioTrack 打开）与相机/编码器启动都可能阻塞数百毫秒~数秒，
@@ -996,13 +979,13 @@ class CallManager(private val link: Link, private val ctx: Context) {
     private fun startVideo() {
         val ip = peerIp
         if (state != State.TALKING) return
-        // 2026-09-16：旋转全部收敛到「本机渲染侧」（AppCore.videoRemoteRot/videoLocalRot，
+        // 旋转全部收敛到「本机渲染侧」（AppCore.videoRemoteRot/videoLocalRot，
         // 见 ChatScreen.applyRemote/LocalTransform），不注入采集侧、不污染发出的 video_cfg.rot。
         val peerCanRecv = link.peerVidCap(ip)
         val localCanSend = link.localCamCap
         if (peerCanRecv && localCanSend) {
-            // 用户本次选的档 = **上限**（QualityController 的 maxLevel，自动回升不许越过它，
-            // 10-03 用户点）；而**起始**码率最高只到推荐档 [VideoLevel.DEFAULT]（= 高清 2M）：
+            // 用户本次选的档 = **上限**（QualityController 的 maxLevel，自动回升不许越过它）；
+            // 而**起始**码率最高只到推荐档 [VideoLevel.DEFAULT]（= 高清 2M）：
             // 选「超清 5M」也先按 2M 出帧，等 QualityController 的五重升档闸门全满足才升到 5M。
             // 这样"超清"不会一上就把发端单 tick 的 256 片预算顶满（2M 档实测最大 IDR=143KB≈121 片）。
             video.maxLevelIdx = level.idx
@@ -1053,11 +1036,11 @@ class CallManager(private val link: Link, private val ctx: Context) {
                 val dMis = mis - lastMissed
                 lastReceived = rcv
                 lastMissed = mis
-                // 任务单 1.5：积压口径 = 队列 ms + 线内未播 ms（只算队列虚好 40–43ms）。
-                // 任务单 4：这个毫秒口径现在**同时是码率自适应的判据**（原来判据是「≥2 帧」，
+                // 积压口径 = 队列 ms + 线内未播 ms（只算队列虚好 40–43ms）。
+                // 这个毫秒口径现在**同时是码率自适应的判据**（原判据是「≥2 帧」，
                 // 20ms 帧下 = 40ms，比接收端水位目标 80ms 还低，稳态必误判）。
                 // 线内不可测（-1）时如实打"不可测"，不折成 0 少算。
-                // 任务单 3.3：末尾带出向队列帧数 —— 发端只入队不入网的那一段，收端计数器看不见。
+                // 末尾带出向队列帧数——发端只入队不入网的那一段，收端计数器看不见。
                 val qMs = voice.backlogQueueMs
                 val wMs = voice.backlogWireMs
                 val backlogMs = qMs + if (wMs < 0L) 0L else wMs
@@ -1084,15 +1067,15 @@ class CallManager(private val link: Link, private val ctx: Context) {
         val wasVideo = videoMode
         val wasOutgoing = state == State.OUTGOING
         stopRinger()
-        // 时长必须在清 talkStartMs 之前算好（v2.7：上层要把它记成一条通话消息）
+        // 时长必须在清 talkStartMs 之前算好：上层要把它记成一条通话消息
         val durationMs = if (wasTalking && talkStartMs > 0) System.currentTimeMillis() - talkStartMs else 0L
         // 先摘监听（立刻停止后续音频发送），音频设备与相机释放放后台：
         // 若音频初始化线程仍持有 VoiceEngine 的锁（startRecord 阻塞中），同步 stopAll
         // 会把调用线程（主线程/读线程）一起卡住 —— 通话已结束但界面/会话卡死。
         voice.setListener(null)
         voiceQuality = null
-        // 媒体会话关闭（任务单 2.1 建、此处收；2.9 会把"挂断/异常/对端消失/切后台/呼叫失败"
-        // 五条路径全部汇聚到这一个 closeTransport）
+        // 媒体会话关闭："挂断/异常/对端消失/切后台/呼叫失败"
+        // 五条路径全部汇聚到这一个 closeTransport
         closeTransport()
         Thread({
             runCatching { voice.stopAll() }
@@ -1109,13 +1092,13 @@ class CallManager(private val link: Link, private val ctx: Context) {
         negotiated = false
         pendingStartTalking = false
         setState(State.IDLE)
-        // 2.12 / D16：挂断 ⇒ "通话中"这一票收回为 0。若三票全为 0，setFileVote 内部会自动
+        // 挂断 ⇒ "通话中"这一票收回为 0。若三票全为 0，setFileVote 内部会自动
         // 续发一次待发队列（对端没应答就停在 PAUSED 等手动「继续」）。
         link.setFileVote(Link.VOTE_IN_CALL, false)
         listener?.onCallEnded(ip, reason, wasVideo, durationMs, wasOutgoing)
         if (wasTalking) {
             AppCore.appendLogPublic("${if (wasVideo) "视频" else ""}通话结束（$reason）")
-            // 计数器唯一打印点（任务单 1.7）：一行 17 项，全 0 也要出现（缺行 = 没接上）
+            // 计数器唯一打印点：一行 17 项，全 0 也要出现（缺行 = 没接上）
             CallCounters.logSummary { AppCore.appendLogPublic(it) }
         }
     }
@@ -1126,7 +1109,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
     }
 
     /**
-     * 2.9 的"切后台 / 实例销毁"这一条退出路径的落点。
+     * "切后台 / 实例销毁"这一条退出路径的落点。
      * ⚠ 这里必须先 [closeTransport]：媒体会话是振铃期就建的（[openTransport]），
      *   本方法过去只收尾音频、视频与音频设备回调 ⇒ 走这条路径退出会留下已 bind 的 UDP/TCP 端口、
      *   ④ 预建那条连接，以及 pp-av-alive 线程（"结束后记得关闭传输线程"正是防这个）。

@@ -30,10 +30,8 @@ import javax.swing.SwingUtilities;
 
 /**
  * PC 端视频窗口（**只显示，不采集**）。
- *
  * 职责：把 {@link FfmpegDecoder} 解出来的 BGRA 帧按"适应窗口 + letterbox + 旋转"画出来，
  * 并提供 [静音] [挂断] 浮动圆钮 + 标题栏右上角的 [放大/还原]（双击画面同样切换）。
- *
  * <h3>三处关键设计</h3>
  * <ol>
  *   <li><b>最新帧优先</b>：解码线程调用 {@link #onFrame}，若上一次重绘还没被 EDT 执行完，
@@ -46,8 +44,8 @@ import javax.swing.SwingUtilities;
  *      （后者由画面上的旋转钮改，按设备记在 {@code Store.rotRemote}）。</li>
  * </ol>
  *
- * <p>注意：PC 端**禁止 emoji**（YaHei 会渲染成方框）；既有按钮保持中文文本
- *（2026-09-16 定调：**本轮新加的文案一律英文**，不再新增中文）。
+ * <p>注意：PC 端**禁止 emoji**（YaHei 会渲染成方框）；既有按钮保持中文文本，
+ * 新加文案一律英文。
  */
 public final class VideoWindow {
 
@@ -73,11 +71,10 @@ public final class VideoWindow {
      * 画面上的浮动圆钮：静音（左下）/ 旋转（挂断左侧）/ 挂断（下中，红色大圆）。
      *
      * 全部按钮**默认隐藏**，鼠标移进窗口才出现（[poke]），停 5s 又自动隐藏
-     *（2026-09-16 用户定调：「鼠标移到窗口内才显示」）。
+     *（「鼠标移到窗口内才显示」）。
      *
-     * <p><b>全屏钮不在这里</b>（2026-10-03）：原来它是一个默认隐藏的右下圆钮，
-     * 用户三轮报告「视频窗上没有全屏按钮，鼠标移上去也没有」⇒ 改到标题栏右上角，
-     * 与普通程序一样常驻可见；画面上的入口改为**双击切换**（对应用户「双击没反应」）。
+     * <p><b>全屏钮不在这里</b>：它是标题栏右上角的「放大/还原」钮，
+     * 与普通程序一样常驻可见；画面上的入口是**双击切换**。
      */
     private final JButton muteBtn;
     private final JButton rotBtn;
@@ -148,8 +145,8 @@ public final class VideoWindow {
 
         // 自绘 chrome（必须在 setVisible 之前）：把整个内容面板（含 panel + 状态条）
         // 包进圆角外壳 + 深灰标题栏；X = 挂断（与 windowClosing 同语义）。
-        // 第 3 参 = 最小化钮（2026-10-30 用户定调）；第 4/5 参 = 标题栏右上角常驻
-        // 「放大/还原」钮，动作就是切全屏（2026-10-03）。
+        // 第 3 参 = 最小化钮；第 4/5 参 = 标题栏右上角常驻
+        // 「放大/还原」钮，动作就是切全屏。
         chrome = WindowChrome.install(frame, title, true, true, this::toggleFullscreen, () -> {
             Actions a = actions;
             if (a != null) {
@@ -159,10 +156,10 @@ public final class VideoWindow {
             }
         });
 
-        // ===== 画面浮动控件（默认隐藏，鼠标移进窗口才显示，2026-09-16 用户定调） =====
+        // ===== 画面浮动控件（默认隐藏，鼠标移进窗口才显示） =====
         Color ctrlBg = new Color(0, 0, 0, 115); // 半透明黑
         muteBtn = CallIcons.circleButton(CallIcons.speakerOn(24), ctrlBg, "静音", 44);
-        // 旋转钮：手调本机看到的画面角度，按设备记住（用户定调「电脑端新加的部分不要用中文」）
+        // 旋转钮：手调本机看到的画面角度，按设备记住（「电脑端新加的部分不要用中文」）
         rotBtn = CallIcons.circleButton(CallIcons.rotate(22), ctrlBg, "Rotate", 44);
         hangBtn = CallIcons.circleButton(CallIcons.hangup(26),
                 new Color(0xD3, 0x2F, 0x2F), "挂断", 60);
@@ -204,7 +201,7 @@ public final class VideoWindow {
         hangBtn.addMouseListener(pokeListener);
         hangBtn.addMouseMotionListener(pokeListener);
 
-        // 双击画面 = 切全屏/还原（2026-10-03 用户定调：「双击没反应」）。
+        // 双击画面 = 切全屏/还原。
         // 只挂在 panel 上：三个浮动圆钮是独立子组件，它们自己消费点击，不会连带切换。
         panel.addMouseListener(new java.awt.event.MouseAdapter() {
             @Override
@@ -318,7 +315,7 @@ public final class VideoWindow {
      * 点「旋转」：叠加 90° 并立即重绘，同时回调外部**按设备**持久化。
      *
      * 渲染用的是 `(对端基线 + 本机手调角) % 360`；手调角按设备记在 `Store.rotRemote`，
-     * 下次和这台设备通话时自动装回（用户定调：只要不卸载客户端就一直沿用）。
+     * 下次和这台设备通话时自动装回（只要不卸载客户端就一直沿用）。
      */
     private void rotateByUser() {
         int next = (userRot + 90) % 360;
@@ -535,8 +532,8 @@ public final class VideoWindow {
         savedBounds = frame.getBounds();
         // 全屏/最大化 = 满屏矩形：圆角归零、背景改不透明（否则四角透出桌面）；
         // 「不支持全屏 → 改为最大化」分支同样要走这套（否则那条路径四角透出桌面）。
-        // 标题栏**不再隐藏**（2026-10-03）：它就是「放大/还原」钮的落点，一隐藏全屏里
-        // 就没有可见出口了（画面右下那个浮动圆钮三轮都被用户报告「看不见」）。
+        // 标题栏**不再隐藏**：它就是「放大/还原」钮的落点，一隐藏全屏里
+        // 就没有可见出口了。
         chrome.setCornerRadius(0);
         chrome.setMaximized(true);
         savedBg = frame.getBackground();
@@ -566,7 +563,7 @@ public final class VideoWindow {
         }
         frame.dispose();
         // 注意：这里**不能** setUndecorated(false)——那会把原生白色标题栏请回来
-        //（R3 在"全屏进出一次之后"复现）；只恢复圆角/透明 + 钮字形
+        //（"全屏进出一次之后"复现）；只恢复圆角/透明 + 钮字形
         chrome.setCornerRadius(WindowChrome.RADIUS);
         chrome.setMaximized(false);
         if (savedBg != null) {

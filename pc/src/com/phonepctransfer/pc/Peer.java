@@ -10,7 +10,7 @@ import java.util.Map;
  *  - `ip`        连接地址（用户可改）
  *  - `remark`    用户备注名（右键可改）；为空时回退到广播名、再回退到 IP
  *  - `lastId/…`  UDP 自动发现时记录的对方标识与广播名
- *  - `devs`      同一个 IP 上出现过的**其它**设备身份（2026-10-05 同 IP 多设备）
+ *  - `devs`      同一个 IP 上出现过的**其它**设备身份
  */
 public final class Peer {
 
@@ -25,9 +25,9 @@ public final class Peer {
      * id + 广播名 + **它自己**最近一次广播/握手的时间。
      *
      * <p>为什么需要：两台不同的物理设备可能落在同一个 IP 上（同一路由 DHCP 复用、或者
-     * 一端主动连入导致本端只能看到对方的 IP）。旧模型「一个 IP = 一台设备」会让两台设备
+     * 一端主动连入导致本端只能看到对方的 IP）。「一个 IP = 一台设备」会让两台设备
      * 抢同一行 —— 广播每 2s 交替覆盖 lastId，组键来回漂移、备注/当前地址被反复搬运
-     *（用户看到的「切换不过去 + 卡」）。现在：谁先在这个 IP 上被识别谁就是**活动设备**，
+     *（用户看到的「切换不过去 + 卡」）。谁先在这个 IP 上被识别谁就是**活动设备**，
      * 后来者只登记在这里当**别名**（列表里显示成「名字-2」那一行），等用户手动确认
      *（断开旧连接）才切换（见 Store.promoteDev）；活动设备自己那条记录用来判「它是否已离开」。
      */
@@ -103,7 +103,7 @@ public final class Peer {
      * 记一次「这个 IP 上又看到了这台设备」。
      *
      * <p>时间戳每次都刷新（静默，不算结构变化）；返回值只表示**用户可见的结构**动了
-     * —— 新出现的设备身份、或者名字变了。沿用 lastSeenAt 的老口径：每 2s 一次广播
+     * —— 新出现的设备身份、或者名字变了。lastSeenAt 每 2s 一次广播
      * 不能让界面/状态栏刷屏。
      */
     public boolean noteDev(String id, String name, long seenAt) {
@@ -147,7 +147,7 @@ public final class Peer {
         m.put("lastId", lastId == null ? "" : lastId);
         m.put("lastName", lastName == null ? "" : lastName);
         m.put("lastSeenAt", Long.valueOf(lastSeenAt));
-        // 没有别名时**不写这个 key**：老配置格式一字不变（向后兼容、便于人工比对）
+        // 没有别名时**不写这个 key**：配置格式一字不变（向后兼容、便于人工比对）
         if (!devs.isEmpty()) {
             List<Object> arr = new ArrayList<Object>();
             for (Dev d : devs) {

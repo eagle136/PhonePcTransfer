@@ -17,7 +17,7 @@ import java.awt.Font;
 import java.awt.Frame;
 
 /**
- * PC 端**语音通话**独立窗口（2026-09-16 用户定调）：
+ * PC 端**语音通话**独立窗口：
  * 上部 = 对方备注（大字）+ IP（小字）；中部 = 通话状态（正在呼叫…/通话中）+ 时长（大字）；
  * 底部 = 红色「挂断」圆形电话图标（与视频窗口、呼入弹窗同源）。
  *
@@ -57,7 +57,7 @@ public final class VoiceCallWindow {
         frame.setUndecorated(true);
         // 高 = 内容 420 + 标题栏 32
         frame.setSize(320, 420 + WindowChrome.DIALOG_TITLE_H);
-        // 不置顶、不抢焦点（2026-09-16 用户反馈：振铃期窗口挡住主窗/来电弹窗）。
+        // 不置顶、不抢焦点（振铃期窗口挡住主窗/来电弹窗）。
         // 摆到主窗右侧；主窗最大化等放不下时回正中，普通窗口点击才会带到前面。
         frame.setLocationRelativeTo(owner);
         if (owner != null && owner.isShowing()) {
@@ -85,7 +85,7 @@ public final class VoiceCallWindow {
         root.setBorder(BorderFactory.createEmptyBorder(28, 16, 24, 16));
         frame.add(root, BorderLayout.CENTER);
         // 自绘 chrome（必须在 setVisible 之前）：把整个内容面板（含 root）
-        // 包进圆角外壳 + 深灰标题栏；X = 挂断；最小化钮照常缩到任务栏（2026-10-30 用户定调）
+        // 包进圆角外壳 + 深灰标题栏；X = 挂断；最小化钮照常缩到任务栏
         chrome = WindowChrome.install(frame, "语音通话 - " + label, true, this::fireHangup);
 
         // 大字号（21px）：全局关 AA 下 outline 会锯齿 → 用 AALabel 局部显式开 AA
@@ -166,7 +166,7 @@ public final class VoiceCallWindow {
     }
 
     /**
-     * 是否显示通话计时（用户 2026-09-19 定调）。
+     * 是否显示通话计时。
      *
      * 呼叫中 / 振铃期只是「呼叫提示」——不该出现 00:00 这种通话页才有的东西；
      * 双方接听后（TALKING）才切为完整通话页，计时区此时才出现。

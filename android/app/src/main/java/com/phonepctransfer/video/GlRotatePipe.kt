@@ -20,35 +20,11 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * GL 中间层（二期，2026-09-22）：`相机 →【GL 转正】→ 编码器输入 Surface`。
- *
- * ### 为什么要有这一层
- * 一期方案 B 里 Camera2 把**传感器原生方向**的画面直喂编码器，发出的数据是侧倒的，
- * 只能靠 `video_cfg.rot` 让**接收端**转——但两台设备的后置表现完全不同（手调记忆角
- * 互相打架）。微信同款做法：**发送端先把数据转正再编码**，发出的数据方向就是正的，
- * 接收端默认零旋转、无需任何按机型的补偿。
- *
- * ### 结构
- *  - 私有 `pp-video-gl` 线程 + EGL 上下文（编码器 Surface 需 `EGL_RECORDABLE_ANDROID`）；
- *  - 相机 target = 我们自己的 `SurfaceTexture`（OES 纹理）；其**缓冲尺寸 = 相机输出
- *    尺寸（横向）**，与「编码输出尺寸」是**两回事**，两者分开钉
- *    （[start] 的 camW/camH 与 outW/outH 参数）；
- *  - 每帧：`updateTexImage` → 采样 OES 纹理（套 ST 矩阵）→ **按内容真实宽高比等比
- *    contain 到编码输出尺寸**（`uFit`）→ `eglSwapBuffers`；
- *  - 本地预览**不走这层**（相机多 target 直喂预览 ST，预览路径保持一期原样）。
- *
- * ### ⚠ 为什么必须有 `uFit`（2026-09-22 实测定案）
- * 相机 `SurfaceTexture.getTransformMatrix()` 给的是**转置矩阵**
- * （`u'=1-v, v'=1-u`，实测值 `[0,-1,0,0, -1,0,0,0, 0,0,1,0, 1,1,0,1]`）——
- * 即**系统已把 sensor 横向缓冲转成竖立方向**。此时若仍「全屏 quad 铺满编码器
- * 1920x1080」（= 把 1080x1920 的竖立内容塞进 16:9 横框），**发出的流本身就是
- * 压扁 3.16 倍的**；接收端「看着正常」只是因为它的 View 恰好是竖长条、各向异性
- * 铺满把这份压扁反向抵消掉了（巧合，换 PC/宽屏立刻露出）。
- * 所以这里必须：① 按内容方向选编码尺寸（上层 [start] 的 outW/outH 会在竖持时与
- * 档位宽高交换）；② 再套一层等比 contain 兜底 —— 即便 out 尺寸选错，也只是留黑边，
- * **绝不再变形**。
- *
- * ⚠ 所有 EGL/GL 调用都必须在 gl 线程；对外接口用 CountDownLatch 同步（启动 ≤2s）。
+ * GL 中间层：`相机 →【GL 转正】→ 编码器输入 Surface`。发送端先把数据转正再编码，接收端默认零旋转、无需按机型补偿。
+ * 结构：私有 `pp-video-gl` 线程 + EGL 上下文（编码器 Surface 需 `EGL_RECORDABLE_ANDROID`）；
+ * 相机 target = 自己的 `SurfaceTexture`（OES）；每帧 `updateTexImage` → 采样 OES 纹理 → 按内容真实宽高比等比 contain 到编码输出尺寸（`uFit`）→ `eglSwapBuffers`；本地预览不走这层。
+ * ⚠ 系统已把 sensor 横向缓冲转成竖立方向（ST 矩阵为转置）：若不套 `uFit` 直接铺满 16:9 编码器输出，发出的流会被压扁 3.16 倍；fit 兜底后即便 out 尺寸选错也只得黑边、不变形。
+ * ⚠ 所有 EGL/GL 调用必须都在 gl 线程；对外接口用 CountDownLatch 同步（启动 ≤2s）。
  */
 class GlRotatePipe(
     private val onLog: (String) -> Unit,
@@ -59,27 +35,15 @@ class GlRotatePipe(
         private const val TAG = "PP-VideoGl"
 
         /**
-         * UV 旋转符号（2026-09-22 定，实测可翻转）：对 UV 做 `±effRot` 旋转（= 内容转 effRot）。
-         * **若实测画面转过头（差 180° 附近不对），把 [UV_ROT_SIGN] 改 -1 即可。**
+         * UV 旋转符号：对 UV 做 `±effRot` 旋转（= 内容转 effRot）；若实测画面转过头（差 180° 附近不对），把 [UV_ROT_SIGN] 改 -1 即可。
          */
         private const val UV_ROT_SIGN = 1f
 
         /**
-         * 摆正角公式里的"ST 已转角度"量级（度）：
-         *
-         * ```
-         * effRot = A − base，A = { +90  反置 ST（m[1] < 0，后置式）
-         *                        { −90  正置 ST（m[1] > 0，前置式，HAL 已带镜像）
-         * ```
-         *
-         * 定案依据（2026-09-22，两轮真机数据）：
-         *  - **竖持**：base=90（后）/270（前）→ effRot 均为 **0**（两端实测：后置本来就正；
-         *    前置原公式给 180 → 对端看到**倒立**，就是这条公式的错）；
-         *  - **横持**（base=0/180）：effRot = ±90，与横持时期的历史观测一致
-         *    （后置需顺时针 90、前置需逆时针 90）。
-         *
-         * 👉 前后置 `rotationDegrees()` 相差 180°，所以**任何只看 base 的公式必然给两者相差 180**，
-         *    而实测要求两者同为 0 —— 这就是必须有 ST 符号项（区分前后置）的原因。
+         * 摆正角公式里的"ST 已转角度"量级（度）：effRot = A − base，
+         * A = +90（反置 ST，m[1]<0，后置）/ −90（正置 ST，m[1]>0，前置，HAL 已带镜像）。
+         * 真机实测：竖持前后置 effRot 均为 0；横持 effRot = ±90；前后置 `rotationDegrees()` 相差 180°，只看 base 的公式无法两者同得 0，
+         * 故必须有 ST 符号项区分前后置。
          */
         private const val ROT_BASE_QUARTER = 90
 
@@ -142,18 +106,15 @@ class GlRotatePipe(
     private var camH = 0
 
     /**
-     * 原始「转正角」（上层传 `VideoCapture.rotationDegrees()`，随握姿变化）。
-     *
-     * ⚠ 它不是直接拿去转 UV 的角 —— 见 [ROT_BASE_QUARTER] 里的 `effRot = A − base`。
+     * 原始「转正角」（上层传 `VideoCapture.rotationDegrees()`，随握姿变化）：
+     * ⚠ 它不是直接拿去转 UV 的角——见 [ROT_BASE_QUARTER] 里的 `effRot = A − base`。
      */
     @Volatile
     var baseRotationDeg = 0
 
     /**
-     * 当前用的是不是**前置**摄像头（上层 `VideoCapture.isFront`，切摄时同步）。
-     *
-     * 用途仅一个：ST 符号与摄像头位置**不一致**时兜底（万一某机型前置的 ST 矩阵不带镜像，
-     * 即 `m[1] < 0` 与后置同形）。此时按前置口径取 `A = −90` —— 竖持仍得 0，不会又倒过来。
+     * 当前用的是不是**前置**摄像头（上层 `VideoCapture.isFront`，切摄时同步）：
+     * 用途仅一个——ST 符号与摄像头位置**不一致**时兜底（万一某机型前置的 ST 矩阵不带镜像，即 `m[1] < 0` 与后置同形），此时按前置口径取 `A = −90`，竖持仍得 0。
      */
     @Volatile
     var frontCam = false
@@ -172,10 +133,8 @@ class GlRotatePipe(
 
     /**
      * 「允许绘制」闸门（方案 A）：[stop] 在**入队释放任务之前**置 false，
-     * [drawFrame] 在入口与各原生阻塞点（updateTexImage / eglSwapBuffers）
-     * 返回后检查并早退 —— 给正卡在原生层里的 drawFrame 尽早退出、
-     * 让排在其后的释放任务得以执行的机会。
-     *
+     * [drawFrame] 在入口与各原生阻塞点（updateTexImage / eglSwapBuffers）返回后检查并早退——
+     * 给正卡在原生层里的 drawFrame 尽早退出、让排在其后的释放任务得以执行的机会。
      * 只由实例默认值（true）与 [stop]（false）翻转，帧回调不写它。
      */
     @Volatile
@@ -184,13 +143,9 @@ class GlRotatePipe(
     // ==================== 生命周期 ====================
 
     /**
-     * 启动（同步，≤2s）。
-     *
-     * @param encoderSurface MediaCodec.createInputSurface() 的产物
-     * @param camW/camH 相机输出尺寸（= GL 输入 ST 的缓冲尺寸，**横向**）
-     * @param outW/outH 编码输出尺寸（GL viewport；竖持时与档位宽高交换，见上层 outDim）
-     * @param baseRotDeg 原始转正角（`VideoCapture.rotationDegrees()`）
-     * @return false = EGL/初始化失败（上层应禁用视频）
+     * 启动（同步，≤2s）：encoderSurface=MediaCodec.createInputSurface() 的产物；camW/camH=相机输出尺寸（= GL 输入 ST 的缓冲尺寸，**横向**）；
+     * outW/outH=编码输出尺寸（GL viewport；竖持时与档位宽高交换，见上层 outDim）；baseRotDeg=原始转正角（`VideoCapture.rotationDegrees()`）；
+     * false = EGL/初始化失败（上层应禁用视频）。
      */
     fun start(
         encoderSurface: Surface, camW: Int, camH: Int, outW: Int, outH: Int, baseRotDeg: Int
@@ -220,9 +175,8 @@ class GlRotatePipe(
     }
 
     /**
-     * 分辨率切档：GL 输出换到新编码器 Surface，输入缓冲同步钉新尺寸。
-     * 相机侧 target（[cameraSurface]）**不变**——输入 ST 与编码器解耦，
-     * 上层只需重建 captureSession（updateTargets）。
+     * 分辨率切档：GL 输出换到新编码器 Surface，输入缓冲同步钉新尺寸；
+     * 相机侧 target（[cameraSurface]）**不变**（输入 ST 与编码器解耦），上层只需重建 captureSession（updateTargets）。
      */
     fun setOutput(encoderSurface: Surface, camW: Int, camH: Int, outW: Int, outH: Int): Boolean {
         val h0 = handler ?: return false
@@ -442,12 +396,9 @@ class GlRotatePipe(
 
     /**
      * 按 ST 矩阵与 [baseRotationDeg] 算出本帧的 UV 旋转角与等比 fit 缩放（gl 线程）。
-     *
-     *  - 摆正角 `effRot = A − base`（A 见 [ROT_BASE_QUARTER]）：竖持恒 0（帧与内容同向）、
-     *    横持 ±90（帧横内容竖）；
+     *  - 摆正角 `effRot = A − base`（A 见 [ROT_BASE_QUARTER]）：竖持恒 0（帧与内容同向）、横持 ±90（帧横内容竖）；
      *  - 内容逻辑尺寸 = 相机尺寸经「ST 转置」与「额外旋转 90/270」两次 swap 的叠加；
-     *  - `fit` = 内容等比 contain 到 outW/outH：out 选对时恒为 (1,1)（无黑边），
-     *    选错也只是留黑边，**永不变形** —— 这是 2026-09-22 那轮「流被压扁」的兜底。
+     *  - `fit` = 内容等比 contain 到 outW/outH：out 选对时恒为 (1,1)（无黑边），选错也只是留黑边，**永不变形**——「流被压扁」的兜底。
      */
     private fun applyGeometry(m: FloatArray) {
         val swapSt = Math.abs(m[1]) > Math.abs(m[0])
@@ -488,13 +439,9 @@ class GlRotatePipe(
     }
 
     /**
-     * 摆正角（UV 旋转，顺时针度）：`A − base`。
-     *
-     * A 由 ST 矩阵的**符号**决定（区分前后置的传感器安装方向）：
-     *  - 反置（`m[1] < 0`，`u'=1-v`）= 后置式 → A = +90
-     *  - 正置（`m[1] > 0`，`u'=v`）  = 前置式（HAL 在 ST 里带了镜像）→ A = −90
-     *  - 未转置（`|m[0]| > |m[1]|`，实测从未见）→ A = 0
-     *
+     * 摆正角（UV 旋转，顺时针度）：`A − base`。A 由 ST 矩阵的**符号**决定（区分前后置的传感器安装方向）：
+     *  - 反置（`m[1] < 0`，`u'=1-v`）= 后置式 → A = +90；正置（`m[1] > 0`，`u'=v`）= 前置式（HAL 在 ST 里带了镜像）→ A = −90；
+     *  - 未转置（`|m[0]| > |m[1]|`，实测从未见）→ A = 0。
      * 符号与摄像头位置不一致时（见 [frontCam]）按前置口径兜底。
      */
     private fun computeEffRot(m: FloatArray, swapSt: Boolean): Int {

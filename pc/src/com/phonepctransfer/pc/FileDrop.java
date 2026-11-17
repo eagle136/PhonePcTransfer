@@ -23,9 +23,9 @@ import javax.swing.TransferHandler;
  *     所以这里不能覆盖、只能包一层：文件列表我们自己处理，其余原样转发给它自带的处理器
  *     （直接 setTransferHandler(null) 会把输入框的复制/粘贴一起废掉）。
  *
- * 目标设备 = **当前活动会话**（左侧列表点了哪台就是哪台）。<b>设备离线也接受拖入</b>
- *（2026-10-30 用户定调）：内容进待发队列，该设备握手成功时由 {@code Link.flushPending}
- * 自动补发；同时顺手发起一次连接尝试，设备其实在线就当场连上、马上发出去。
+ * 目标设备 = **当前活动会话**（左侧列表点了哪台就是哪台）。<b>设备离线也接受拖入</b>：
+ * 内容进待发队列，该设备握手成功时由 {@code Link.flushPending} 自动补发；同时顺手发起一次
+ * 连接尝试，设备其实在线就当场连上、马上发出去。
  * **一台设备都没选**时仍然只提示、不发送 —— 没有目标地址，待发记录无处归属。
  */
 final class FileDrop {
@@ -190,13 +190,13 @@ final class FileDrop {
             }
 
             // 把链路的发送目标对齐到界面正在显示的对话（shownIp）：
-            // 启动自动连接多台设备后 selectedIp 与 shownIp 可能各停在一台（2026-09-23 修），
+            // 启动自动连接多台设备后 selectedIp 与 shownIp 可能各停在一台，
             // 不对齐的话 sendFile 实际发给 selectedIp 那台，气泡却按 shownIp 归属 ——
             // 聊天区什么都不显示，看着就是「确认后毫无反应」。
             // ⚠ 必须早于下面的发送循环与 selectedLabel() 读取。
             win.syncTargetToShown();
 
-            // 离线不拦（2026-10-30 用户定调）：sendFile/sendFolder 在无会话时自动进待发队列，
+            // 离线不拦：sendFile/sendFolder 在无会话时自动进待发队列，
             // 该设备握手成功时由 flushPending 补发。这里只记下状态用于文案与之后的就地连接。
             // 判据与设备列表绿点同口径 —— **按设备**（组内任意地址有健康会话），见 sendFile 路由。
             final boolean online = link.isDeviceConnected(selIp);

@@ -15,36 +15,18 @@ import java.util.Map;
 import javax.imageio.ImageIO;
 
 /**
- * 透明 PNG 圆角卡片贴图工具（2026-09-28 新增）——「界面内圆角卡片」的**唯一**绘制入口。
- *
- * <p>为什么要有这个类（承接 Ui.java 里 2026-09-27/09-28 两次实测的历史）：
- * <ul>
- *   <li><b>问题一：矢量描边在分数 DPI 下四边粗细不一。</b>边框原先用 Java2D 现画
- *       （1px {@code drawRoundRect} 描边 → 后改「外框填 border 色 + 内框填 fill 色」的填充环）。
- *       在 Windows 125% 缩放下（旧钉定值；2026-09-29 起钉 100%、坐标全整数，但「跟随系统缩放」
- *       模式下分数坐标仍会出现）组件坐标系落到分数设备像素，四条边命中的亚像素偏移各不相同，
- *       于是同一条边一会儿几乎隐形、一会儿发虚变粗（用户实测「设置」按钮上边框消失、右边框缺失）。</li>
- *   <li><b>问题二：文字被自己所在组件的 bounds 裁掉。</b>JLabel/JButton 首选宽 = FontMetrics
- *       .stringWidth（零容差），而抗锯齿渲染的实际墨迹比度量宽 5~13%（见
- *       {@code ChatDevices.INK_SAFETY = 1.12} 同源口径），首末字形会被组件自身边界削边。</li>
- * </ul>
- *
- * <p>本类的做法：卡片边界**不再每次重绘现算矢量**，而是<b>预先栅格化成一张真正的透明 PNG 图</b>
- * （Java2D 画 → {@code ImageIO} 编码 PNG 字节 → 再解码回 {@code Image}），抗锯齿结果固化在像素里；
- * 绘制时按 <b>9 宫格</b>拉伸铺满目标矩形（四角 1:1 锐利、四边单向拉伸、中心双向拉伸）。
- * 这样任意 DPI 下四边粗细一致，且卡片总是先画在组件背景层，文字/图标随后覆盖其上
- * ⇒ 文本永不被卡片边界裁掉、也不会被卡片盖住。
- *
- * <p><b>线程约定：</b>{@link #paint} 只允许在 EDT / Swing 绘制线程调用（贴图缓存的同步只保证
- * 不损坏 {@code HashMap}，并不保证与组件树并发访问安全）。贴图缓存本身是线程安全的。
- *
- * <p>零外部依赖：只用 JDK 自带 AWT / ImageIO。
+ * 透明 PNG 圆角卡片贴图工具 ——「界面内圆角卡片」的**唯一**绘制入口。
+ * <p>为什么预渲染贴图:分数 DPI 下矢量描边四边粗细不一,且抗锯齿文字会被自己组件的 bounds 裁掉;
+ * 所以把卡片边界栅格化成透明 PNG(抗锯齿结果固化在像素里),绘制时按<b>9 宫格</b>拉伸铺满目标矩形
+ * ⇒ 任意 DPI 下四边粗细一致,且文本永不被卡片边界裁掉。
+ * <p><b>线程约定:</b>{@link #paint} 只允许在 EDT / Swing 绘制线程调用;贴图缓存本身是线程安全的。
+ * <p>零外部依赖:只用 JDK 自带 AWT / ImageIO。
  */
 final class CardSkin {
 
     private CardSkin() { }
 
-    /** 默认环宽（逻辑像素）——2026-09-29 起 100% 钉定下取整 2.0（旧 1.8 在整数像素下仍发虚） */
+    /** 默认环宽（逻辑像素）:100% 钉定下取整 2.0 */
     private static final double DEFAULT_RING_PX = 2.0;
 
     /** 贴图缓存：key = arc|fillArgb|borderArgb|ringPx。贴图数量天然有限（几种圆角 × 几种配色），无需淘汰 */
@@ -103,16 +85,15 @@ final class CardSkin {
 
     /**
      * 取（必要时生成）「透明 PNG 圆角卡片」贴图。
-     *
-     * <p>生成步骤照需求照做，顺序不能变：
+     * <p>生成步骤顺序不能变：
      * <ol>
      *   <li>{@code BufferedImage(TYPE_INT_ARGB)}，尺寸 {@code S = 2*(arc+1) + 2}，角块 {@code c = arc+1}；</li>
      *   <li>Java2D 开抗锯齿：外圆角矩形填 border（若有），内圆角矩形（inset = ringPx）填 fill；
      *       {@code fill == null} 时用 {@link AlphaComposite#Clear} 把内圆角矩形<b>挖成透明</b>，
-     *       得到**空心环**（芯完全透明，才不会盖住底下/上面的文字）；</li>
-     *   <li>{@code ImageIO.write(img, "png", baos)} 编码成 PNG 字节 → {@code ImageIO.read} 读回 Image。
-     *       <b>这一步是需求要求（要的是真正的透明 PNG 贴图），不是多余动作</b>：它把抗锯齿墨迹、
-     *       圆角色与环宽全部固化成一份可复用的像素资源，而不是每次重绘重跑一遍矢量栅格化。</li>
+     *       得到**空心环**（芯完全透明，才不盖住底下/上面的文字）；</li>
+     *   <li>{@code ImageIO.write(img, "png", baos)} 编码成 PNG 字节 → {@code ImageIO.read} 读回 Image：
+     *       要的是真正的透明 PNG 贴图——把抗锯齿墨迹、圆角色与环宽固化成可复用的像素资源，
+     *       而不是每次重绘重跑一遍矢量栅格化。</li>
      * </ol>
      * 失败（IOException，例如编码器不可用）时降级返回原 {@code BufferedImage} 并写日志，
      * 保证界面永远画得出来（贴图退化、观感不变）。
@@ -150,8 +131,7 @@ final class CardSkin {
                 g.fill(new RoundRectangle2D.Double(half, half, s - 1.0, s - 1.0, arc, arc));
             }
             // 内缩量：只有「有边框」时才内缩出环宽；**无边框（border==null）必须铺满整张贴图**，
-            // 否则实心卡片四周会留出一条约 ringPx 宽的透明缝（气泡/主按钮会在父底色上现出一圈细边，
-            // 视觉上卡片比组件小 —— 2026-09-28 由 T4 实测发现）。
+            // 否则实心卡片四周会留出一条约 ringPx 宽的透明缝(视觉上卡片比组件小)。
             double ri = (border == null) ? 0.0 : Math.max(0.0, ringPx);
             double innerArc = Math.max(0.0, arc - ri);  // 内圆角与外圆角同心 ⇒ 四边环宽恒等
             RoundRectangle2D inner = new RoundRectangle2D.Double(

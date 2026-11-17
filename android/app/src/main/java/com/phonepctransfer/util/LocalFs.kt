@@ -11,20 +11,11 @@ import java.io.InputStream
 import java.util.concurrent.TimeUnit
 
 /**
- * 本机文件访问的**唯一入口**（内置文件浏览器 + 「发送文件夹」的递归枚举都走这里）。
- *
- * 三种后端（同一套 [Entry] 输出，上层不必关心差异）：
- *  1. **普通模式**：`java.io.File` 直读。需要「所有文件访问」(MANAGE_EXTERNAL_STORAGE) 才能
- *     浏览 /sdcard 全盘；Android 11+ 即使有该权限，`/Android/data`、`/Android/obb` 也读不到
- *     —— 那是系统的 FUSE 限制，不是我们的 bug（列表页会如实说明）。
- *  2. **root 模式**（设置里手动开，默认关）：所有枚举与读取都过 `su -c`，浏览根改为
- *     `/data/media/0`（= /sdcard 的底层真实目录，见 [ROOT_MEDIA]），于是 `/Android/data` 也能读。
- *     KernelSU 与 Magisk 的 `su` 都支持 `su -c "命令"`，所以一套实现同时覆盖两者。
- *  3. **SAF 模式**（未授权「所有文件访问」时的降级）：只在用户授权的那棵目录树内浏览。
- *
- * 铁律（沿用仓库既有约束）：**枚举失败绝不冒充空目录** —— 失败一律返回 [FsList.error] 非空，
- * 调用方必须如实提示（这条与 `FileIO.listTree` 的 skipped 记账同源，是「传文件夹漏文件」的
- * 根治手段）。
+ * 本机文件访问的**唯一入口**（内置文件浏览器 + 「发送文件夹」的递归枚举都走这里），三种后端（同一套 [Entry] 输出）：
+ * 1. **普通模式**：`java.io.File` 直读；浏览 /sdcard 全盘需「所有文件访问」权限，Android 11+ 即使有权限也读不到 `/Android/data`、`/Android/obb`（系统 FUSE 限制，列表页如实说明）；
+ * 2. **root 模式**（设置里手动开，默认关）：所有枚举与读取过 `su -c`，浏览根改为 `/data/media/0`（/sdcard 的底层真实目录，[ROOT_MEDIA]），`/Android/data` 也能读；KernelSU/Magisk 一套实现覆盖；
+ * 3. **SAF 模式**（未授权时降级）：只在用户授权的目录树内浏览。
+ * 铁律：**枚举失败绝不冒充空目录** —— 失败一律返回 [FsList.error] 非空，调用方必须如实提示。
  */
 object LocalFs {
 
@@ -37,18 +28,10 @@ object LocalFs {
     private const val SDK_ANDROID_17 = 37
 
     /**
-     * 是否 Android 17+（2026-10-05 新增，用户真机实测驱动）。
-     *
-     * 为什么单列一条：Android 17 上「所有文件访问」(MANAGE_EXTERNAL_STORAGE) **已经不再生效** ——
-     * 权限声明还在、设置页也打得开，但**授予后系统仍不放行整盘读取**，并提示「只能使用系统自带的
-     * 文件选择器」。所以在这个版本上：
-     *  · 引导页**不能再把用户推去「所有文件访问」设置页**（死路，用户已被系统顶回来过）；
-     *  · 必须直接给两条可用路径：**系统自带文件选择器（SAF 目录树）** 或 **root 模式**。
-     * 判定用 API level（33=Android 13、37=Android 17，一一对应），不看 ROM 自定义版本号。
-     *
-     * 本机 SDK 证据（`platforms/android-37.0`）：`Manifest.permission.MANAGE_EXTERNAL_STORAGE`
-     * 与 `Environment.isExternalStorageManager()` 都还在（`api-versions.xml` 里 `since="30"`、
-     * 无 deprecated 标记）→ 是**运行期策略收紧**，不是 API 被删。
+     * 是否 Android 17+（判定用 API level，37=Android 17，不看 ROM 自定义版本号）。
+     * Android 17 上「所有文件访问」(MANAGE_EXTERNAL_STORAGE) **已经不再生效**：权限声明还在、设置页也打得开，但**授予后系统仍不放行整盘读取**，
+     * 并提示「只能使用系统自带的文件选择器」→ 引导页不能再把用户推去「所有文件访问」设置页（死路），必须直接给两条可用路径：
+     * **系统自带文件选择器（SAF 目录树）** 或 **root 模式**。这是**运行期策略收紧**，不是 API 被删（两者声明都还在）。
      */
     fun isAndroid17Plus(): Boolean = Build.VERSION.SDK_INT >= SDK_ANDROID_17
 
@@ -56,10 +39,8 @@ object LocalFs {
     const val ROOT_MEDIA = "/data/media/0"
 
     /**
-     * root 模式开关（由 AppCore 从 Prefs 注入；设置页手动开，**默认关**）。
-     *
-     * 注意：开关只是「用户想用 root」，真能不能用由 [probeRoot] 决定 —— 开关开着但 root 没授权时，
-     * 列表会**如实报错**（而不是画一个空目录让人以为手机是空的）。
+     * root 模式开关（由 AppCore 从 Prefs 注入；设置页手动开，**默认关**）：开关只是「用户想用 root」，真能不能用由 [probeRoot] 决定——
+     * 开关开着但 root 没授权时，列表会**如实报错**（而不是画一个空目录让人以为手机是空的）。
      */
     @Volatile
     var rootEnabled: Boolean = false
@@ -79,14 +60,9 @@ object LocalFs {
         Build.VERSION.SDK_INT < SDK_ALL_FILES ||
             runCatching { Environment.isExternalStorageManager() }.getOrDefault(false)
 
-    /**
-     * 一条目录项。
-     *
-     * @param key 同一目录内的唯一标识：普通/root 模式 = 绝对路径；SAF 模式 = documentId
-     * @param uri **发送这一项时用的地址**：普通/root = `file://`，SAF = 树内文档 `content://`
-     *            （单文件直接发它；文件夹把它当「树」交给 [FileIO.scanTree]）
-     * @param mtime 毫秒；0 = 未知（root 模式下 stat 失败时会出现，界面按「未知」处理）
-     */
+    /** 一条目录项：key=同一目录内的唯一标识（普通/root=绝对路径；SAF=documentId）；
+     * uri=**发送这一项时用的地址**（普通/root=`file://`，SAF=树内文档 `content://`；单文件直接发它；文件夹把它当「树」交给 [FileIO.scanTree]）；
+     * mtime 毫秒，0 = 未知（root 模式下 stat 失败时会出现，界面按「未知」处理） */
     data class Entry(
         val name: String,
         val key: String,
@@ -150,12 +126,8 @@ object LocalFs {
     }
 
     /**
-     * root 模式列目录：**一条 shell 命令跑完整目录**。
-     *
-     * 为什么不是「先 ls 拿名字、再逐个 stat」：那样每个条目都要 fork 一次 toybox，
-     * 一个几百项的目录会慢到不可用；这里循环在 shell 里跑，只有一次 `su` 进程开销。
-     * 输出格式固定四列（类型/大小/mtime/名字，**名字放最后**），按 TAB 切分 ——
-     * 这样带空格的目录名不会被切坏（只有含 TAB/换行的极端名字会失真，可接受）。
+     * root 模式列目录：**一条 shell 命令跑完整目录**——循环在 shell 里跑，只有一次 `su` 进程开销（逐个 stat 每个条目 fork 一次 toybox 会慢到不可用）。
+     * 输出格式固定四列（类型/大小/mtime/名字，**名字放最后**），按 TAB 切分——这样带空格的目录名不会被切坏。
      */
     private fun listPathRoot(path: String): FsList {
         val r = su(listCmd(path))
@@ -238,10 +210,8 @@ object LocalFs {
     // ==================== root：su 封装 ====================
 
     /**
-     * 跑一次 `su -c <cmd>` 并拿回结果。
-     *
-     * stdout/stderr **合并**读（输出都很小，不会撑满管道）；非 0 退出码一律由调用方当失败处理
-     * —— KernelSU/Magisk 拒绝授权时 `su` 自己就以非 0 退出并打印原因，正好当提示文案用。
+     * 跑一次 `su -c <cmd>` 并拿回结果：stdout/stderr **合并**读（输出都很小，不会撑满管道）；非 0 退出码一律由调用方当失败处理
+     *（KernelSU/Magisk 拒绝授权时 `su` 自己就以非 0 退出并打印原因，正好当提示文案用）。
      */
     private fun su(cmd: String, timeoutSec: Long = 25): Sh {
         return try {
@@ -308,11 +278,8 @@ object LocalFs {
     private const val ROOT_CACHE_MS = 60_000L
 
     /**
-     * root 模式读一个文件（`su -c cat`）。
-     *
-     * **先判可读**：不可读直接返回 null，让上层抛 `SourceError` 如实报失败 ——
-     * 绝不能给一个「空流」把 0 字节当成功发出去（那会变成对端收到空文件还不知道）。
-     * 返回的流 close 时会一并销毁 `cat` 子进程（否则它会一直挂着）。
+     * root 模式读一个文件（`su -c cat`）：**先判可读**，不可读直接返回 null，让上层抛 `SourceError` 如实报失败——
+     * 绝不能给一个「空流」把 0 字节当成功发出去（那会变成对端收到空文件还不知道）；返回的流 close 时会一并销毁 `cat` 子进程（否则它会一直挂着）。
      */
     fun openRootStream(path: String): InputStream? {
         if (!probeRoot()) return null

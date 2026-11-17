@@ -52,14 +52,10 @@ import com.phonepctransfer.data.TextUtil
 import kotlinx.coroutines.delay
 
 /**
- * 消息气泡：**自己发出的靠右、收到的靠左**。
- * 超过 300+150 字的内容只显示头尾，短按可展开/收起。
+ * 消息气泡：**自己发出的靠右、收到的靠左**；超过 300+150 字只显示头尾，短按展开/收起；
  * 图片文件显示缩略图；文件名一律**中间省略**（长名不折行、扩展名始终可见）。
- * **整个气泡统一手势**（combinedClickable，子组件不再各自消费点击）：
- *  - **短按** = 打开内容：文本 → 展开/收起；图片 → 全屏查看；已完成的文件 → 交给系统打开
- *  - **长按** = 弹小菜单（2026-09-19 改版，原来是直接弹删除确认）：
- *      「复制文本」**只在纯文本消息（Kind.TEXT）上出现**，其余一律只有「删除」；
- *      「删除」仍走二次确认（文本/图片会同步删除在线对端的记录，见 AppCore.deleteMessage）
+ * **整个气泡统一手势**（combinedClickable）：短按 = 打开内容（文本展开/收起、图片全屏、已完成文件交系统打开）；
+ * 长按 = 弹小菜单（「复制文本」只在纯文本消息上出现，其余一律只有「删除」；「删除」仍走二次确认，见 AppCore.deleteMessage）
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -78,8 +74,8 @@ fun MessageBubble(
     val isImage = m.kind == Kind.FILE && !m.isDir && isImageName(m.fileName)
     val imageSource = if (isImage) rememberImageSource(m.localUri, m.fileName) else null
     val ctx = LocalContext.current
-    // 点气泡也要收起输入法（2026-09-29 Q2「微信式」）。与 ChatScreen 的空白热区同一套动作，
-    // 函数体在 ChatScreen.kt（internal，同包可直接调、无需 import）。
+    // 点气泡也要收起输入法（「微信式」）。与 ChatScreen 的空白热区同一套动作，
+    // 函数体在 ChatScreen.kt（internal，同包可直接调、无需 import）
     val focusManager = LocalFocusManager.current
     val hostView = LocalView.current
     // 长按小菜单开关；「复制文本」只在纯文本消息（Kind.TEXT）上出现，且内容非空
@@ -122,13 +118,11 @@ fun MessageBubble(
                         bottomStart = if (isSelf) 12.dp else 3.dp,
                         bottomEnd = if (isSelf) 3.dp else 12.dp
                     ),
-                    // 整个气泡统一手势：短按打开内容、长按弹小菜单（2026-09-19 起不再直接删）。
-                    // 缩略图/文件名不再挂 clickable（之前子组件消费点击导致长按很难触发）；
-                    // 仅「展开全文」「取消发送」两个 TextButton 保留自身点击
+                    // 整个气泡统一手势：短按打开内容、长按弹小菜单（不再直接删）；
+                    // 缩略图/文件名不再挂 clickable（之前子组件消费点击导致长按很难触发）；仅「展开全文」「取消发送」保留自身点击
                     modifier = Modifier.combinedClickable(
                         // 先收键盘再执行原动作：顺序不能反 ——
-                        // 原动作可能打开全屏图片 / 跳系统应用（新建 Dialog / 切窗口），
-                        // 那时再取 window 收 IME 会落到错的 window 上。
+                        // 原动作可能打开全屏图片/跳系统应用（新建 Dialog/切窗口），那时再取 window 收 IME 会落到错的 window 上
                         onClick = { dismissIme(focusManager, hostView); onShortPress() },
                         onLongClick = { menuOpen = true }
                     )
@@ -142,9 +136,8 @@ fun MessageBubble(
                                 imageSource = imageSource
                             )
 
-                            // 剪贴板标签：**矢量图标 + 文字**（2026-09-19 去 emoji，见 [GlyphIcon]）。
-                            // 图标与文字必须同行 Row 居中对齐 —— 塞进字符串里就会各按各的基线走，
-                            // 这正是原来 emoji 方案「忽高忽低、某些机型变方框」的根源。
+                            // 剪贴板标签：**矢量图标 + 文字**（去 emoji，见 [GlyphIcon]）；
+                            // 图标与文字必须同行 Row 居中对齐（塞进字符串会各按各的基线走，正是原 emoji 方案「忽高忽低、变方框」的根源）
                             Kind.CLIP -> {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     GlyphIcon(
@@ -162,7 +155,7 @@ fun MessageBubble(
                                 Text(text = shown, style = MaterialTheme.typography.bodyMedium)
                             }
 
-                            // 通话记录（v2.7）：纯文本留痕 ——「语音通话 00:12」「视频通话 对方拒绝」
+                            // 通话记录：纯文本留痕（「语音通话 00:12」「视频通话 对方拒绝」）
                             Kind.CALL -> Text(text = m.text, style = MaterialTheme.typography.bodyMedium)
 
                             Kind.TEXT -> Text(text = shown, style = MaterialTheme.typography.bodyMedium)
@@ -182,9 +175,8 @@ fun MessageBubble(
                     }
                 }
 
-                // 长按小菜单（2026-09-19）：**复制文本只在纯文本消息上出现**（用户定调：
-                // 剪贴板气泡、通话记录、文件/图片都没有这一项，只有「删除」）。
-                // 「删除」不直接删：仍然走原来的二次确认（[DeleteMessageDialog]）。
+                // 长按小菜单：**复制文本只在纯文本消息上出现**（剪贴板气泡、通话记录、文件/图片都没有这一项，只有「删除」）；
+                // 「删除」不直接删：仍然走原来的二次确认（[DeleteMessageDialog]）
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                     if (canCopyText) {
                         DropdownMenuItem(
@@ -223,20 +215,8 @@ fun MessageBubble(
 }
 
 /**
- * 文件 / 文件夹名的**中间省略字符预算**（2026-09-19 用户要求「长文件名省略中间，太长」）。
- *
- * 为什么不沿用 `TextUtil.middleEllipsis` 的默认 26：这一行是 **bodyMedium（14sp）+ 粗体**
- * 且带前缀，26 个汉字 ≈ 364dp、加前缀 ≈ 394dp，而气泡内宽只有
- * `330dp − 左右各 10dp = 310dp` → 一定会折成两行（这正是用户看到的「太长」）。
- * 20 个汉字 ≈ 280dp + 前缀 ≈ 310dp，正好一行放得下；扩展名由 `middleEllipsis` 保证留在尾部，
- * 另有 `maxLines = 1` 兜底（系统大字号下宁可尾部截断也不折行）。
- *
- * 前缀口径（2026-09-19 去 emoji 后变宽裕）：原先是「📄 / 📁 」emoji ≈ 30dp，
- * 现在换成 [GlyphIcon] 的 14dp 矢量图 + 5dp 间距 = **19dp**，比原来省 11dp ——
- * 所以 20 字这个预算只会更宽松，**不需要跟着调**（避免动一个已经稳定的观感点）；
- * 若日后想再多显示两个字符，把它调到 22 即可。
- *
- * 图片名那一行是 labelSmall（约 11sp）、没有前缀，预算仍是默认的 26。
+ * 文件 / 文件夹名的**中间省略字符预算**：这一行 bodyMedium（14sp）+ 粗体且带前缀，默认 26 字 ≈ 394dp 超过气泡内宽 310dp 必折行，
+ * 20 字 ≈ 280dp + 前缀 ≈ 310dp 正好一行；扩展名由 middleEllipsis 留在尾部，另有 maxLines = 1 兜底（图片名行 labelSmall、无前缀，仍默认 26）
  */
 private const val FILE_NAME_BUDGET = 20
 
@@ -253,14 +233,12 @@ private fun FileBubbleBody(
     isImage: Boolean,
     imageSource: String?
 ) {
-    // 「取消发送」按钮也收键盘（2026-09-29 T11）：本函数是独立 composable，
-    // MessageBubble 里的 focusManager/hostView 不在作用域 → 这里再取一次
-    // （LocalFocusManager / LocalView 任意 composable 都能取，与 MessageBubble 同一套动作）。
+    // 「取消发送」按钮也收键盘：本函数是独立 composable，
+    // MessageBubble 里的 focusManager/hostView 不在作用域 → 这里再取一次（与 MessageBubble 同一套动作）
     val focusManager = LocalFocusManager.current
     val hostView = LocalView.current
     if (m.isDir) {
-        // 文件夹传输气泡：整目录一个气泡，进度按字节聚合
-        // 前缀「📁」→ 矢量 [Glyph.FOLDER]（2026-09-19）
+        // 文件夹传输气泡：整目录一个气泡，进度按字节聚合；前缀为矢量 [Glyph.FOLDER]
         Row(verticalAlignment = Alignment.CenterVertically) {
             GlyphIcon(Glyph.FOLDER, size = FILE_GLYPH_SIZE)
             Text(
@@ -286,18 +264,15 @@ private fun FileBubbleBody(
         )
     } else if (isImage) {
         // 图片：小图预览；短按（气泡层）打开全屏。
-        // readyKey 传「是否已收完」（progress 到 100 或状态不再是 OK）：只在**收完那一刻**
-        // 变一次 → 重新解码，保证图片收完立即出现，不必切走再切回（2026-09-19 修）。
-        // 不用裸 progress 当键：接收中它每几百毫秒变一次，会把解码协程反复打断重来。
+        // readyKey = 「是否已收完」：只在**收完那一刻**变一次 → 重新解码，图片收完立即出现，不必切走再切回；
+        // 不用裸 progress 当键：接收中它每几百毫秒变一次，会把解码协程反复打断重来
         ImageThumb(
             source = imageSource,
             maxSize = 200.dp,
             readyKey = m.progress >= 100 || m.status != Status.OK
         )
-        // 图片文件名**中间省略**（2026-09-19）：原来直接摊 `m.fileName`，超长名会一路
-        // 撑满气泡宽度还折行。缩略图下这行是 labelSmall（约 11sp），26 个字符 ≈ 286dp，
-        // 落在气泡内宽之内；`maxLines = 1 + Ellipsis` 只是兜底（系统大字号下尾部截断，
-        // 绝不折行 —— 折行会让「缩略图 + 文件名」整块看着很臃肿）。
+        // 图片文件名**中间省略**：缩略图下这行是 labelSmall（约 11sp），26 个字符 ≈ 286dp 落在气泡内宽之内；
+        // maxLines = 1 + Ellipsis 只是兜底（系统大字号下尾部截断，绝不折行 —— 折行会让「缩略图 + 文件名」整块看着很臃肿）
         Text(
             text = TextUtil.middleEllipsis(m.fileName),
             style = MaterialTheme.typography.labelSmall,
@@ -307,8 +282,7 @@ private fun FileBubbleBody(
             modifier = Modifier.padding(top = 3.dp)
         )
     } else {
-        // 文件名不再单独 clickable——短按打开由气泡层的 combinedClickable 统一处理
-        // 前缀「📄」→ 矢量 [Glyph.FILE]（2026-09-19）
+        // 文件名不再单独 clickable（短按打开由气泡层的 combinedClickable 统一处理）；前缀为矢量 [Glyph.FILE]
         Row(verticalAlignment = Alignment.CenterVertically) {
             GlyphIcon(Glyph.FILE, size = FILE_GLYPH_SIZE)
             Text(
@@ -331,9 +305,8 @@ private fun FileBubbleBody(
         )
     }
 
-    // 进度条：DENIED（数据流量未同意）时**不画** —— 它并没有在传，画个 0% 条会误导
-    // 2026-10-01 高对比口径：实心段 = 主题主色（浅=蓝 / 深=绿），轨道 = [trackColor]
-    //（浅色浅灰、深色近白，与参考截图滑条一致），加粗到 6dp 圆头。
+    // 进度条：DENIED（数据流量未同意）时**不画** —— 它并没有在传，画个 0% 条会误导；
+    // 高对比口径：实心段 = 主题主色（浅=蓝 / 深=绿），轨道 = [trackColor]（浅色浅灰、深色近白），加粗到 6dp 圆头
     if (m.progress in 0..99 && m.status != Status.DENIED) {
         LinearProgressIndicator(
             progress = { m.progress / 100f },
@@ -346,10 +319,9 @@ private fun FileBubbleBody(
     }
 
     // 自己发出的消息 filePath 是 content:// URI，摊开没有意义；
-    // 只有收到的文件才显示「已保存」绿色钩（左下角，不再冗长显示路径）
-    // 「✅」→ 矢量 [Glyph.CHECK]（2026-09-19）
+    // 只有收到的文件才显示绿色钩「已保存」（左下角，不再冗长显示路径），图标为矢量 [Glyph.CHECK]
     if (!isSelf && m.status == Status.OK && m.filePath.isNotEmpty()) {
-        // 深色主题下 0x2E7D32 太暗，改用与主题主色同档的亮绿（高对比，2026-10-01）
+        // 深色主题下 0x2E7D32 太暗，改用与主题主色同档的亮绿（高对比）
         val savedGreen = if (isAppDark()) Color(0xFF3CD97E) else Color(0xFF2E7D32)
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -365,9 +337,8 @@ private fun FileBubbleBody(
         }
     }
 
-    // 数据流量被拒（本机或对端）：把原因摊在文件名下面 —— 只在 DENIED 状态渲染，
-    // 所以重试成功（转 SENDING）后这一行会自动消失，不需要额外清理字段。
-    // 「⚠」→ 矢量 [Glyph.WARN]（2026-09-19）
+    // 数据流量被拒（本机或对端）：把原因摊在文件名下面（只在 DENIED 状态渲染，
+    // 重试成功转 SENDING 后这一行自动消失，不需要额外清理字段），图标为矢量 [Glyph.WARN]
     if (m.kind == Kind.FILE && m.status == Status.DENIED && m.text.isNotEmpty()) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -384,12 +355,10 @@ private fun FileBubbleBody(
     }
 
     // 暂停（PAUSED）—— 两个方向都会出现（2.12 / D16 起）：
-    //  - 接收方向：本机收流停滞 30s，对端那侧留着半成品（文案「重连后自动续传」，无按钮）。
-    //  - 发送方向：文件排他投票 = 1（通话中／没网络／被拒），在传的那条在分片或成员边界就地暂停，
-    //    条目留在待发台账。投票翻回全 0 时自动发**一次** file_query；对端没应答就停在这一行，
-    //    等用户点末尾的「继续」（与 DENIED 的红色叹号同一先例，都走 AppCore.retryFileSend）。
-    // 只在 PAUSED 态渲染 —— 续传成功（回 SENDING）或收尾 OK 后这一行自动消失。
-    // 「⏸」→ 矢量 [Glyph.PAUSE]（2026-09-26）
+    //  - 接收方向：本机收流停滞 30s，对端那侧留着半成品（文案「重连后自动续传」，无按钮）；
+    //  - 发送方向：文件排他投票 = 1（通话中／没网络／被拒），在传的那条在分片或成员边界就地暂停，条目留在待发台账；
+    //    投票翻回全 0 时自动发**一次** file_query，对端没应答就停在这一行，等用户点末尾的「继续」
+    //（与 DENIED 的红色叹号同一先例，都走 AppCore.retryFileSend）。只在 PAUSED 态渲染，续传成功/收尾 OK 后自动消失
     if (m.kind == Kind.FILE && m.status == Status.PAUSED) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -429,10 +398,8 @@ private fun FileBubbleBody(
 }
 
 /**
- * 红色感叹号图标（**矢量绘制，等价于一张 SVG**：红色实心圆 + 白色叹号）。
- *
- * 用在「数据流量未同意」而留在聊天里的文件消息上（消息末尾）。点一下**重试发送**：
- * 会重新走一遍数据流量提醒流程（本机提醒 + 对端确认），同意后这条会被移到最新一条再开传。
+ * 红色感叹号图标（矢量绘制：红色实心圆 + 白色叹号），用在「数据流量未同意」而留在聊天里的文件消息上（消息末尾）。
+ * 点一下**重试发送**：重新走一遍数据流量提醒流程（本机提醒 + 对端确认），同意后这条会被移到最新一条再开传
  */
 @Composable
 private fun DenyRetryIcon(onClick: () -> Unit) {
@@ -465,15 +432,10 @@ private fun DenyRetryIcon(onClick: () -> Unit) {
 }
 
 /**
- * 进度行：「`87%`」+（正在传时）「` · 0.95M/s`」（2026-09-22 用户要求，两端同口径）。
- *
- * 单独拆成一个小 composable 的理由：速率每 500ms 就变一次，如果让整个气泡跟着重组
- * （里面还有图片解码、手势、多个 Text）代价太大 —— 拆开后**只有这一行**重组。
- *
- * 速率什么时候不显示（都不需要额外清理字段）：
- *  - 状态不是 [Status.SENDING]（待发队列里等着 = 用户说的「暂停」）
- *  - 样本过期（`AppCore.speedBpsOf` 判 1.5s 没新样本：卡住 / 传完）
- * 所以传完那一刻数字自己就消失了。
+ * 进度行：「`87%`」+（正在传时）「` · 0.95M/s`」（两端同口径）。
+ * 单独拆成一个小 composable：速率每 500ms 就变一次，让整个气泡跟着重组（里面还有图片解码、手势、多个 Text）代价太大 —— 拆开后只有这一行重组。
+ * 速率不显示的情况（都不需要额外清理字段）：状态不是 [Status.SENDING]（待发队列里等着 = 「暂停」）；
+ * 样本过期（AppCore.speedBpsOf 判 1.5s 没新样本：卡住 / 传完）—— 传完那一刻数字自己就消失
  */
 @Composable
 private fun TransferLine(mid: String, status: Status, pct: Int) {
@@ -505,6 +467,6 @@ private fun statusSuffix(m: MsgItem): String = when (m.status) {
     // 「数据流量未同意」的说明已经写在气泡里（文件名下方 + 末尾红色叹号），
     // 这里不再叠一串字，避免把一行挤成两行。
     Status.DENIED -> ""
-    // 接收停滞暂停（v2.8）：灰色 ⏸ 行在文件名下方，时间行补一个短后缀
+    // 接收停滞暂停：灰色 ⏸ 行在文件名下方，时间行补一个短后缀
     Status.PAUSED -> " · 已暂停"
 }

@@ -45,7 +45,7 @@ final class LinkCall {
      *
      * ⚠ 六个入口都由 UI 回调（EDT）调用，必须走 L.uiSendExec：EDT 直连 socket 时，
      * 一旦对端读不动就会把界面卡住（Android 端更狠 —— 直接抛 NetworkOnMainThreadException，
-     * 被 sendOrDrop 当成断链，点一下通话按钮就掉线，见 2026-09-15 日志）。
+     * 被 sendOrDrop 当成断链，点一下通话按钮就掉线）。
      * 与 Android 端 io{} 对称。
      *
      * 返回「有没有可用会话」而非「是否已写出」：写操作已入队，尽力而为。
@@ -57,7 +57,7 @@ final class LinkCall {
     /**
      * 发起呼叫（带视频协商）。
      *
-     * ⚠ PC 端**恒以 vid=false 发出**（R2：PC 没有采集能力），走这个入口只为与 Android 对称，
+     * ⚠ PC 端**恒以 vid=false 发出**（PC 没有采集能力），走这个入口只为与 Android 对称，
      * 真正的「PC 不能发起视频」在 {@link #startVideoOutgoing()} 处硬拒绝。
      */
     public boolean sendCallInvite(String name, String ip, boolean vid, int lv) {
@@ -124,7 +124,7 @@ final class LinkCall {
     }
 
     /**
-     * 振铃期逐档交换本端媒体三元组（任务单 2.5 / 方案 §4.3①）。
+     * 振铃期逐档交换本端媒体三元组（方案 §4.3①）。
      * 字段语义见 {@link Protocol#callMedia(int, boolean, String, int)}。
      *
      * ⚠ 由 **pp-av-negotiate 线程**调用（振铃期的定档时序），不是 EDT；仍走 L.uiSendExec
@@ -185,7 +185,7 @@ final class LinkCall {
     }
 
     /**
-     * PC 端发起视频：**恒拒绝**（R2）。
+     * PC 端发起视频：**恒拒绝**（无采集能力）。
      * 留这个入口只为把「PC 不能发起视频」这件事收敛到一个可断言的点上。
      */
     public boolean startVideoOutgoing() {
@@ -228,7 +228,7 @@ final class LinkCall {
         }
     }
 
-    /** 接收侧健康反馈（每 2s 一次）。{@code dropping}=接收端正处丢帧期（任务单 1.3） */
+    /** 接收侧健康反馈（每 2s 一次）。{@code dropping}=接收端正处丢帧期 */
     public void sendVideoFb(String ip, int fps, int drop, int lat, boolean dropping, int kbps) {
         Session s = L.sessionOf(ip);
         if (s != null) {
@@ -247,7 +247,7 @@ final class LinkCall {
 
     /**
      * 请求对端**立刻给一个 IDR**（本端解码进程换代后用）。
-     * 走主 TCP 既有的 video_req 帧 —— 控制帧的合法落点之一（I16），非阻塞：只 execute 进 uiSendExec。
+     * 走主 TCP 既有的 video_req 帧 —— 控制帧的合法落点，非阻塞：只 execute 进 uiSendExec。
      */
     public void sendVideoKeyRequest(String ip) {
         Session s = L.sessionOf(ip);

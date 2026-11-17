@@ -15,20 +15,14 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * PC 端本地存储。**根目录 = 用户数据目录**（`%APPDATA%\PhonePcTransfer`，见 [defaultRoot]），
- * 与程序目录彻底分开 —— 升级 / 重装 MSI 不会碰数据：
- *  - <root>/config.json         配置（deviceId / 端口 / 设备列表 / 开关）
- *  - <root>/history/&lt;设备组键&gt;.jsonl  聊天历史（**按对端设备分文件**，行分隔 JSON，追加写）
- *  - <root>/pending.jsonl       待发队列（每条带 peer 字段，标明目的设备）
- *  - <root>/received/           收到的文件（用户可在设置里改保存位置）
+ * PC端本地存储。根目录=用户数据目录(`%APPDATA%\PhonePcTransfer`,见[defaultRoot]),与程序目录彻底分开——升级/重装MSI不会碰数据:
+ *  - <root>/config.json         配置(deviceId/端口/设备列表/开关)
+ *  - <root>/history/<设备组键>.jsonl  聊天历史(按对端设备分文件,行分隔JSON,追加写)
+ *  - <root>/pending.jsonl       待发队列(每条带peer字段,标明目的设备)
+ *  - <root>/received/           收到的文件(用户可在设置里改保存位置)
  *  - <root>/logs/               运行日志
- *
- * 历史按对端分文件是"多设备互不干扰"的落点：A 的聊天记录物理上就不在 C 的文件里，
- * 切换会话只是换一个文件读，不存在把别人的内容带出来的可能。
- *
- * ⚠️ 2026-09-21 之前在**程序目录**（源码运行 = `pc/`；安装版 = `%LOCALAPPDATA%\手机电脑互传\`）。
- *    老数据首次启动会被复制一份过来（不删除老目录），见 [migrateLegacyData]。
- */
+ * 历史按对端分文件是"多设备互不干扰"的落点:A的聊天记录物理上就不在C的文件里,切换会话只是换一个文件读
+ * ⚠️老版本数据曾放在程序目录;首次启动会把老数据复制一份过来(不删除老目录),见[migrateLegacyData] */
 public final class Store {
 
     public final Path root;
@@ -52,14 +46,11 @@ public final class Store {
 
     // ==================== 视频通话配置（PC 只收不发） ====================
 
-    /** 全局视频开关。false = 完全走改造前的音频路径（回退开关，见 VIDEO_CALL_PLAN §13） */
+    /** 全局视频开关。false = 完全走纯音频路径（回退开关，见 VIDEO_CALL_PLAN §13） */
     private boolean videoEnabled = true;
 
-    /**
-     * 档位表上限（= 安卓端 {@code VideoLevel.MAX.idx}，2026-10-03 由 2 加到 3：
-     * 新增「超清 1080P/5M」）。PC 端没有档位表，只按码率阈值反推 L 数（见
-     * {@code CallManager.onVideoCfg}），所以这里只需要一个数字上限；改档位表必须同步改它。
-     */
+    /** 档位表上限(=安卓端{@code VideoLevel.MAX.idx},含"超清1080P/5M")。
+     *  PC端没有档位表,只按码率阈值反推L数(见{@code CallManager.onVideoCfg}),所以这里只需要一个数字上限;改档位表必须同步改它 */
     public static final int VIDEO_MAX_LEVEL = 3;
 
     /** 可接受的最高档位（0=流畅 480P / 1=标清 720P / 2=高清 1080P/2M / 3=超清 1080P/5M）。接听视频来电时与呼叫方取 min */
@@ -71,50 +62,40 @@ public final class Store {
     /** ffmpeg 硬件加速方式；空 = 纯软解（实测 673 fps，软解余量已足够，默认关） */
     private String ffmpegHwaccel = "";
 
-    // ==================== UI 缩放钉定（2026-09-27） ====================
+    // ==================== UI 缩放钉定 ====================
 
     /**
-     * 渲染缩放钉定值（config.json 的 {@code uiScale}，缺省 1.0）。
-     *
-     * <p>背景：JBR 的 Swing 是 DPI-aware，字体与像素都按系统缩放等比渲染 —— 界面**比例**
-     * 在 100%~200% 下不会破，但「物理观感」跟着系统缩放变（200% 下固定窗口还会超出逻辑屏）。
-     * 用户定调（2026-09-29）：把渲染缩放钉在 1.0（100%）—— 1 逻辑 px = 1 物理 px，
-     * 组件坐标、边框、字体底边全部落整数像素网格，消除分数 DPI 的抗锯齿抖动；
-     * 宋体小字号（12~16px）内嵌点阵位图可 1:1 命中，笔画最锐利（字体与字号改造见
-     * {@code Fonts} 与 README §1.2）。由 {@code PcMain} 在任何 AWT 初始化之前
-     * 设 {@code sun.java2d.uiScale}（实测 -D 与程序内 setProperty 都生效）。
-     * {@code uiScale: 0} 或 {@code "system"} = 取消钉定，跟随系统缩放。
-     */
+     * 渲染缩放钉定值(config.json的{@code uiScale},缺省1.0)。
+     * <p>背景:JBR的Swing是DPI-aware,字体与像素都按系统缩放等比渲染——界面比例在100%~200%下不会破,但"物理观感"跟着系统缩放变(200%下固定窗口还会超出逻辑屏)。
+     * 把渲染缩放钉在1.0(100%)——1逻辑px=1物理px,组件坐标、边框、字体底边全部落整数像素网格,消除分数DPI的抗锯齿抖动;
+     * 宋体小字号(12~16px)内嵌点阵位图可1:1命中,笔画最锐利(字体与字号改造见{@code Fonts}与README §1.2)。
+     * 由{@code PcMain}在任何AWT初始化之前设{@code sun.java2d.uiScale}(实测-D与程序内setProperty都生效)。
+     * {@code uiScale: 0}或{@code "system"}=取消钉定,跟随系统缩放 */
     static final double DEFAULT_UI_SCALE = 1.0;
 
     /** 当前生效的钉定值；&le;0 表示跟随系统（save() 时写成 "system"） */
     private double uiScale = DEFAULT_UI_SCALE;
 
-    // ==================== 主题（2026-09-27） ====================
+    // ==================== 主题 ====================
 
-    /** 深色主题开关（config.json 的 {@code darkTheme}，缺省 false = 浅色）；由左下角「主题」按钮切换 */
+    /** 深色主题开关(config.json的{@code darkTheme},缺省false=浅色);由左下角"主题"按钮切换 */
     private boolean darkTheme = false;
 
     /** 设备列表（备注 + IP）；旧配置里的纯 IP 会在 load() 里迁移进来 */
     private final List<Peer> peerList = new ArrayList<Peer>();
 
-    // ==================== 设备身份与分组（2026-09-16，与 Android 端同构） ====================
+    // ==================== 设备身份与分组(与Android端同构) ====================
     //
-    // 一台设备可能有多个地址（WiFi / 热点 / 网卡），它们都会在握手里自报同一个 deviceId。
-    // 于是「设备」才是会话的单位：备注、聊天记录、当前地址都挂在**组**（= deviceId）上。
-    // 组键解析必须能在**任意线程**被调用（发送热路径），所以权威来源是一张
-    // ConcurrentHashMap（[ckeys]），不去碰受锁保护的 peerList。
+    // 一台设备可能有多个地址(WiFi/热点/网卡),它们都会在握手里自报同一个deviceId。
+    // 于是"设备"才是会话的单位:备注、聊天记录、当前地址都挂在组(=deviceId)上。
+    // 组键解析必须能在任意线程被调用(发送热路径),所以权威来源是一张ConcurrentHashMap([ckeys]),不去碰受锁保护的peerList
 
     /** 权威绑定表：ip → 对端 deviceId */
     private final Map<String, String> bindings = new LinkedHashMap<String, String>();
     /**
-     * 被用户**明确删掉**的别名设备（设备身份 → "1"）。
-     *
-     * <p>这些是「同一 IP 上还有另一台设备」那种**别名行**：用户右键「删除（不再显示这台设备）」
-     * 就记在这里。不记的话对方每 2s 一次广播，2 秒后这条别名行又回来了 —— 用户看到的就是
-     * 「删不掉」。该设备**真的占到某个地址**（成为活动设备）时自动解除（见 {@link #unignoreDev}），
-     * 那时它是正经设备，就该出主行。
-     */
+     * 被用户明确删掉的别名设备(设备身份→"1")。
+     * <p>这些是"同一IP上还有另一台设备"那种别名行:用户右键"删除(不再显示这台设备)"就记在这里。不记的话对方每2s一次广播,2秒后这条别名行又回来了——用户看到的就是"删不掉"。
+     * 该设备真的占到某个地址(成为活动设备)时自动解除(见{@link #unignoreDev}),那时它是正经设备,就该出主行 */
     private final Map<String, String> ignoredDevs = new LinkedHashMap<String, String>();
 
     /** 组备注：deviceId → 备注（仅本机可见，绝不上协议） */
@@ -132,22 +113,16 @@ public final class Store {
             new java.util.concurrent.ConcurrentHashMap<String, String>();
 
     /**
-     * 「已知设备」名单（后台允许连入的白名单）：组键 → 标志位串。
-     *
-     * 与安卓端 TrustedPeers 同规则（2026-10-01 定稿）：**握手成功过（含 'c'）**且
-     * **有过消息/文件往来（含 'f'）**两个位都置齐，才算 trusted。
-     * 位序固定 "cf"；连接路径（adopt 闸门）无锁读，写入走 synchronized + save()。
-     */
+     * "已知设备"名单(后台允许连入的白名单):组键→标志位串。
+     * 与安卓端TrustedPeers同规则:握手成功过(含'c')且有过消息/文件往来(含'f')两个位都置齐,才算trusted。
+     * 位序固定"cf";连接路径(adopt闸门)无锁读,写入走synchronized+save() */
     private final java.util.concurrent.ConcurrentHashMap<String, String> trustedPeers =
             new java.util.concurrent.ConcurrentHashMap<String, String>();
 
     /**
-     * 每台设备的**视频画面旋转角**（组键 → 度）。
-     *
-     * 只记**用户手动叠加**的那部分（0/90/180/270），对端给的 `video_cfg.rot` 基线由
-     * CallManager 每次通话重新下发 —— 记绝对值会和对端基线打架。
-     * 与安卓端同规则：按组键（= 设备）分开记，只要不卸载客户端就一直沿用。
-     */
+     * 每台设备的视频画面旋转角(组键→度)。
+     * 只记用户手动叠加的那部分(0/90/180/270),对端给的`video_cfg.rot`基线由CallManager每次通话重新下发——记绝对值会和对端基线打架。
+     * 与安卓端同规则:按组键(=设备)分开记,只要不卸载客户端就一直沿用 */
     private final Map<String, String> rotRemote = new LinkedHashMap<String, String>();
     /** 组键缓存（线程安全；ip → deviceId），由 bindings / peer.lastId 维持 */
     private final java.util.concurrent.ConcurrentHashMap<String, String> ckeys =
@@ -171,11 +146,9 @@ public final class Store {
     }
 
     /**
-     * 老版本的 history.jsonl 是「所有设备混在一个文件里」。
-     *
-     * 分不出来源就没法按对端拆开，硬塞给某一台设备反而是编造数据，所以直接改名归档
-     * （`history.legacy-<时间戳>.jsonl`，内容一字不改地留着），新版本从空历史开始。
-     */
+     * 老版本的history.jsonl是"所有设备混在一个文件里"。
+     * 分不出来源就没法按对端拆开,硬塞给某一台设备反而是编造数据,所以直接改名归档
+     * (`history.legacy-<时间戳>.jsonl`,内容一字不改地留着),新版本从空历史开始 */
     private void migrateLegacyHistory() {
         Path legacy = root.resolve("history.jsonl");
         if (!Files.exists(legacy)) {
@@ -198,12 +171,9 @@ public final class Store {
     }
 
     /**
-     * 会话组键：对端 deviceId（已知时），否则回退该 IP。
-     *
-     * 聊天记录、待发队列、消息归属一律按它对齐（同一台设备的多个地址 = 同一份会话）。
-     * **无锁实现**：读的是 ConcurrentHashMap，可被发送热路径任意线程调用；
-     * 权威来源由 [bindDevice] / [upsertPeer] 维护，启动时从 peer.lastId 播种。
-     */
+     * 会话组键:对端deviceId(已知时),否则回退该IP。
+     * 聊天记录、待发队列、消息归属一律按它对齐(同一台设备的多个地址=同一份会话)。
+     * 无锁实现:读的是ConcurrentHashMap,可被发送热路径任意线程调用;权威来源由[bindDevice]/[upsertPeer]维护,启动时从peer.lastId播种 */
     public String convKeyOf(String ip) {
         String v = ip == null ? "" : ip.trim();
         if (v.isEmpty()) {
@@ -214,28 +184,23 @@ public final class Store {
     }
 
     /**
-     * 把某个地址绑定到对端设备 id 上（对端在握手 hello 里自报过它的 id）。
-     * 同一 id 绑多个地址 = 同一台设备有多个地址 → 自动成组。
-     *
-     * @return true 表示绑定关系发生了变化
-     */
+     * 把某个地址绑定到对端设备id上(对端在握手hello里自报过它的id)。同一id绑多个地址=同一台设备有多个地址⇒自动成组。
+     * @return true表示绑定关系发生了变化 */
     public synchronized boolean bindDevice(String ip, String deviceId) {
         String v = ip == null ? "" : ip.trim();
         String d = deviceId == null ? "" : deviceId.trim();
         if (v.isEmpty() || d.isEmpty()) {
             return false;
         }
-        // 绑定**前**这个地址的组键：若它自成一组（= 地址自身，例如手工添加、还没连过的行），
-        // 绑上之后这一组就要并进设备 d —— 组上挂的本机状态（备注 / 当前地址）要跟着搬。
+        // 绑定前这个地址的组键:若它自成一组(=地址自身,例如手工添加、还没连过的行),绑上之后这一组就要并进设备d——组上挂的本机状态(备注/当前地址)要跟着搬
         String oldKey = convKeyOf(v);
         boolean changed = false;
         if (!d.equals(bindings.get(v))) {
             bindings.put(v, d);
             changed = true;
         }
-        // ⚠️ ckeys 一定要落（2026-09-21 修）：它是 convKeyOf 唯一的热路径判据（无锁读）。
-        //    原来只在「bindings 变了」时才写 → 若 bindings 早就对上了（配置里存着）而 ckeys
-        //    是空的（播种顺序 bug），这里会 early-skip，组键永远退回 IP，绑定等于没生效。
+        // ⚠️ckeys一定要落:它是convKeyOf唯一的热路径判据(无锁读)。
+        //    原来只在"bindings变了"时才写⇒若bindings早就对上了(配置里存着)而ckeys是空的(播种顺序bug),这里会early-skip,组键永远退回IP,绑定等于没生效
         boolean ckeyChanged = !d.equals(ckeys.get(v));
         if (ckeyChanged) {
             ckeys.put(v, d);
@@ -246,8 +211,7 @@ public final class Store {
             changed = true;
         }
         if (changed || ckeyChanged) {
-            // 组键真的动了（含「之前退回 IP、这次才认出来」的修复路径）→ 把挂在旧组键上的
-            // 本机状态（备注 / 当前地址 / 旋转角）搬过来，否则那些设置会取不出来
+            // 组键真的动了(含"之前退回IP、这次才认出来"的修复路径)⇒把挂在旧组键上的本机状态(备注/当前地址/旋转角)搬过来,否则那些设置会取不出来
             migrateGroupState(oldKey, d);
         }
         // 用户手工把这个地址指给这台设备 = 明确要用它 → 作废「不再显示」标记
@@ -259,19 +223,11 @@ public final class Store {
     }
 
     /**
-     * 握手 / 发现带来的**被动绑定**：只有当目标地址**还没有别的活动设备**（或那台已经离开）时才真的绑定。
-     *
-     * <p>为什么需要（2026-10-05 同 IP 多设备）：两台设备落在同一个 IP 上时，双方每次握手/广播都会
-     * 自报自己的 id —— 若照旧无条件绑定，两个 id 会每 2s 轮流覆盖 `bindings[ip]`，组键来回漂移、
-     * 备注/当前地址被反复搬运（用户看到的「切换不过去 + 卡」）。被动路径必须让**先来的那台守住地址**，
-     * 后来者只登记成别名（列表里的「名字-2」那行），要不要换由用户点那行时确认
-     *（见 ChatWindow.switchConflictDevice）。
-     *
-     * <p>用户手工声明「这个地址也属于某台设备」（ChatDevices.editPeer）仍走强绑定
-     * {@link #bindDevice}——那是明确意图，不是被动发现。
-     *
-     * @return true 表示绑定关系发生了变化
-     */
+     * 握手/发现带来的被动绑定:只有当目标地址还没有别的活动设备(或那台已经离开)时才真的绑定。
+     * <p>为什么需要(同IP多设备):两台设备落在同一个IP上时,双方每次握手/广播都会自报自己的id——若无条件绑定,两个id会每2s轮流覆盖`bindings[ip]`,组键来回漂移、备注/当前地址被反复搬运(用户看到的"切换不过去+卡")。
+     * 被动路径必须让先来的那台守住地址,后来者只登记成别名(列表里的"名字-2"那行),要不要换由用户点那行时确认(见ChatWindow.switchConflictDevice)。
+     * <p>用户手工声明"这个地址也属于某台设备"(ChatDevices.editPeer)仍走强绑定{@link #bindDevice}——那是明确意图,不是被动发现。
+     * @return true表示绑定关系发生了变化 */
     public synchronized boolean bindDeviceIfFree(String ip, String deviceId) {
         String v = ip == null ? "" : ip.trim();
         String d = deviceId == null ? "" : deviceId.trim();
@@ -281,7 +237,7 @@ public final class Store {
         Peer p = findPeer(v);
         String active = (p == null || p.lastId == null) ? "" : p.lastId.trim();
         if (!active.isEmpty() && !active.equals(d) && !devGone(p, active)) {
-            // 地址被一台**还在线**的设备占着 → 不抢绑定，只把它记进别名表（列表里多一行）
+            // 地址被一台还在线的设备占着⇒不抢绑定,只把它记进别名表(列表里多一行)
             if (p.noteDev(d, "", System.currentTimeMillis())) {
                 save();
             }
@@ -291,14 +247,10 @@ public final class Store {
     }
 
     /**
-     * 把一个组键上挂的本机状态搬到另一个组键（新地址连上后被并进已有设备时调用）。
-     *
-     * 场景：用户手工加过一个地址 X（当时它自成一组，组键 = X），之后 X 连上来、对端自报的
-     * deviceId 是本机早就认识的设备 A —— 绑定表把 X 并进 A。若不做这一步，用户给 X 写过的
-     * 备注、X 记的「当前地址」都会留在旧组键 X 上取不出来（表现：备注没了）。
-     *
-     * **目标组已有值时不覆盖**（A 的备注优先于 X 的备注），只补空缺。
-     */
+     * 把一个组键上挂的本机状态搬到另一个组键(新地址连上后被并进已有设备时调用)。
+     * 场景:用户手工加过一个地址X(当时它自成一组,组键=X),之后X连上来、对端自报的deviceId是本机早就认识的设备A——绑定表把X并进A。
+     * 若不做这一步,用户给X写过的备注、X记的"当前地址"都会留在旧组键X上取不出来(表现:备注没了)。
+     * 目标组已有值时不覆盖(A的备注优先于X的备注),只补空缺 */
     private void migrateGroupState(String oldKey, String newKey) {
         if (oldKey == null || newKey == null || oldKey.isEmpty() || newKey.isEmpty()
                 || oldKey.equals(newKey)) {
@@ -320,7 +272,7 @@ public final class Store {
         } else {
             groupCurIp.remove(oldKey);
         }
-        // 画面旋转角（按设备记，与安卓端 rotRemote/rotLocal 同口径）
+        // 画面旋转角(按设备记,与安卓端rotRemote/rotLocal同口径)
         if (!rotRemote.containsKey(newKey)) {
             String oldRot = rotRemote.remove(oldKey);
             if (oldRot != null && !oldRot.isEmpty()) {
@@ -417,10 +369,8 @@ public final class Store {
     }
 
     /**
-     * 升级播种：config 里从没有过 trustedPeers 这份名单时，把**已有聊天记录**的设备
-     * 直接按「连接过+有往来」补齐 —— 否则老对端升级后第一次后台重连就被自己挡掉
-     * （安卓端 2026-09-15 踩过的坑，这里同规则预防）。
-     */
+     * 升级播种:config里从没有过trustedPeers这份名单时,把已有聊天记录的设备直接按"连接过+有往来"补齐——否则老对端升级后第一次后台重连就被自己挡掉
+     * (安卓端踩过的坑,这里同规则预防) */
     private void seedTrustedFromHistory() {
         try {
             if (!Files.isDirectory(historyDir)) {
@@ -480,16 +430,9 @@ public final class Store {
 
     /**
      * 该设备组当前使用的地址。
-     *
-     * <p>⚠️ 记忆里的地址必须**确实还属于这台设备**（`convKeyOf(c) == key`）才认，否则一律忽略。
-     * 2026-10-05 修：旧版本只判「这个地址还在设备列表里」——设备换过 IP（或重装后换了 deviceId）
-     * 之后，`groupCurIp` 里那条旧记忆会被另一台设备继承，于是**这台设备的行显示的是别人的地址**，
-     * 点下去连的是别人的地址 → 一直 `Connect timed out`，用户看到的就是「打不开」
-     *（实测数据：android-xxxxxxxx 真实在 192.168.1.210，却显示成 192.168.1.13）。
-     *
-     * <p>回退顺序：记住的地址（确属本设备）→ lastIp（确属本设备）→ 组内**最近出现过**的地址
-     *（设备换 IP 后，最可能还活着的就是最后见到它的那个）。
-     */
+     * <p>⚠️记忆里的地址必须确实还属于这台设备(`convKeyOf(c) == key`)才认,否则一律忽略。
+     * 旧检查只判"这个地址还在设备列表里"——设备换过IP(或重装后换了deviceId)之后,`groupCurIp`里那条旧记忆会被另一台设备继承,于是这台设备的行显示的是别人的地址,点下去连的是别人的地址⇒一直Connect timed out,用户看到的就是"打不开"(实测:android-xxxxxxxx真实在192.168.1.210,却显示成192.168.1.13)。
+     * <p>回退顺序:记住的地址(确属本设备)⇒lastIp(确属本设备)⇒组内最近出现过的地址(设备换IP后,最可能还活着的就是最后见到它的那个) */
     public synchronized String curIpOf(String key) {
         String k = key == null ? "" : key.trim();
         if (k.isEmpty()) {
@@ -529,10 +472,8 @@ public final class Store {
     }
 
     /**
-     * 该设备上一次手动设置的**画面旋转角**（0/90/180/270；没记过 = 0）。
-     *
-     * @param key 组键（对端 deviceId；未知设备回退 IP）—— 与安卓端同一口径
-     */
+     * 该设备上一次手动设置的画面旋转角(0/90/180/270;没记过=0)。
+     * @param key 组键(对端deviceId;未知设备回退IP)——与安卓端同一口径 */
     public synchronized int rotRemoteOf(String key) {
         String k = key == null ? "" : key.trim();
         String v = k.isEmpty() ? null : rotRemote.get(k);
@@ -569,22 +510,13 @@ public final class Store {
         public final List<String> ips = new ArrayList<String>();
         public String curIp = "";
         public long lastSeenAt = 0L;
-        /**
-         * 是否是「同 IP 多设备」里的**别名行**（2026-10-05）：这个 IP 当前的活动设备是别人，
-         * 本行只是同一地址上出现过的另一台设备。点击时先弹 IP 冲突确认框，不直接连。
-         */
+        /** 是否是"同IP多设备"里的别名行:这个IP当前的活动设备是别人,本行只是同一地址上出现过的另一台设备。点击时先弹IP冲突确认框,不直接连 */
         public boolean alt = false;
-        /**
-         * 去重后的列表显示名（同名设备自动加 `-2`/`-3`，见 {@link #dedupeNames}）。
-         * 为空 = 用 remark/name/curIp 的常规回退；非空 = 强制用它（不动用户写的备注）。
-         */
+        /** 去重后的列表显示名(同名设备自动加-2/-3,见{@link #dedupeNames});
+         *  为空=用remark/name/curIp的常规回退;非空=强制用它(不动用户写的备注) */
         public String shownName = "";
-        /**
-         * 该设备**共用**的地址（2026-10-05）：这些地址当前的活动设备是别人，本行只是
-         * 「这台设备也在这个地址上出现过」。**只做提示** —— 不进 [ips]、不参与连接目标与
-         * 地址切换菜单，也不算「本设备的地址」；想真正切过去要走 IP 冲突确认流程
-         *（见 ChatWindow.switchConflictDevice）。
-         */
+        /** 该设备共用的地址:这些地址当前的活动设备是别人,本行只是"这台设备也在这个地址上出现过"。
+         *  只做提示——不进[ips]、不参与连接目标与地址切换菜单,也不算"本设备的地址";想真正切过去要走IP冲突确认流程(见ChatWindow.switchConflictDevice) */
         public final List<String> guestIps = new ArrayList<String>();
 
         /** 列表/顶栏显示名：去重名 > 备注 > 广播名 > 当前地址 */
@@ -608,11 +540,8 @@ public final class Store {
     }
 
     /**
-     * 同名去重：列表里第 2/3… 台同名设备显示成 `名字-2`、`名字-3`。
-     *
-     * <p>只写 {@link Group#shownName}，不动 remark（用户备注）/ name（广播名）——
-     * 备注修改、地址切换、气泡归属文案都读原始字段，不会被后缀污染。
-     */
+     * 同名去重:列表里第2/3…台同名设备显示成`名字-2`、`名字-3`。
+     * <p>只写{@link Group#shownName},不动remark(用户备注)/name(广播名)——备注修改、地址切换、气泡归属文案都读原始字段,不会被后缀污染 */
     private static void dedupeNames(List<Group> gs) {
         Map<String, Integer> used = new LinkedHashMap<String, Integer>();
         for (Group g : gs) {
@@ -679,15 +608,12 @@ public final class Store {
                 g.curIp = g.ips.get(0);
             }
         }
-        // ===== 同 IP 多设备（2026-10-05）：把每个地址上「非活动设备」的身份也列出来 =====
-        // 硬约束：**一台设备只能出一行**。行键 = 设备身份；重复行键会让界面直接出问题
-        //（安卓 LazyColumn 的 key 重复会抛异常，PC 列表会出现同一台设备两行、名字还被去重器加后缀）。
-        //   · 这台设备在别的地址上已经是活动设备（**已有主行**）→ 它在这个地址上当「客人」的部分
-        //     只记进那一行的 guestIps（纯提示，不参与连接 / 地址切换）；
-        //   · 这台设备在所有地址上都是客人（一个地址都没占到）→ 才单独开一条别名行，
-        //     点击时走 IP 冲突确认框（ChatWindow.switchConflictDevice）。
-        // 于是：主行键 = 活动设备身份（未识别身份时是原始 IP），别名行键 = 一个地址都没占到的
-        // 设备身份 —— 两类键**天然不可能重合**，唯一性由构造保证。
+        // ===== 同IP多设备:把每个地址上"非活动设备"的身份也列出来 =====
+        // 硬约束:一台设备只能出一行。行键=设备身份;重复行键会让界面直接出问题
+        //(安卓LazyColumn的key重复会抛异常,PC列表会出现同一台设备两行、名字还被去重器加后缀)。
+        //   · 这台设备在别的地址上已经是活动设备(已有主行)⇒它在这个地址上当"客人"的部分只记进那一行的guestIps(纯提示,不参与连接/地址切换);
+        //   · 这台设备在所有地址上都是客人(一个地址都没占到)⇒才单独开一条别名行,点击时走IP冲突确认框(ChatWindow.switchConflictDevice)。
+        // 于是:主行键=活动设备身份(未识别身份时是原始IP),别名行键=一个地址都没占到的设备身份——两类键天然不可能重合,唯一性由构造保证
         LinkedHashMap<String, Group> owned = new LinkedHashMap<String, Group>();
         for (Group g : out) {
             owned.put(g.key, g);
@@ -706,15 +632,14 @@ public final class Store {
                 if (ignoredDevs.containsKey(d.id)) {
                     continue;
                 }
-                // 太久没露面的别名（多半是换/重装前的旧身份）不再显示；它一旦再广播/握手，
-                // 记录立刻变新鲜，这行会自己回来（见 DEV_ALIAS_SHOW_MS）
+                // 太久没露面的别名(多半是换/重装前的旧身份)不再显示;它一旦再广播/握手,记录立刻变新鲜,这行会自己回来(见DEV_ALIAS_SHOW_MS)
                 if (devStaleForAlias(d.seenAt, DEV_ALIAS_SHOW_MS)) {
                     continue;
                 }
                 Group owner = owned.get(d.id);
                 if (owner != null) {
-                    // 已经有主行 → 只补一条「共用地址」提示，绝不开第二行
-                    //（自己 ips 里已有的地址不算「共用」—— 那是配置里绑定与 peer.lastId 不一致时的兜底）
+                    // 已经有主行⇒只补一条"共用地址"提示,绝不开第二行
+                    //(自己ips里已有的地址不算"共用"——那是配置里绑定与peer.lastId不一致时的兜底)
                     if (!owner.ips.contains(p.ip) && !owner.guestIps.contains(p.ip)) {
                         owner.guestIps.add(p.ip);
                     }
@@ -733,7 +658,7 @@ public final class Store {
                     g.remark = r == null ? "" : r;
                     alts.put(d.id, g);
                 } else if (d.seenAt > g.lastSeenAt) {
-                    // 这台「纯客人」设备出现在多个地址上：最近那个当主地址，旧的降为「共用地址」
+                    // 这台"纯客人"设备出现在多个地址上:最近那个当主地址,旧的降为"共用地址"
                     if (!p.ip.equals(g.curIp)) {
                         if (!g.guestIps.contains(g.curIp)) {
                             g.guestIps.add(g.curIp);
@@ -767,7 +692,7 @@ public final class Store {
         return null;
     }
 
-    /** 对端 IP → 安全的文件名（IP 本身很干净，这里只是防御性处理） */
+    /** 对端IP→安全的文件名(IP本身很干净,这里只是防御性处理) */
     private static String safeKey(String peerIp) {
         String v = peerIp == null ? "" : peerIp.trim();
         if (v.isEmpty()) {
@@ -780,7 +705,7 @@ public final class Store {
         String ip = peerIp == null ? "" : peerIp.trim();
         String k = convKeyOf(ip);
         Path dest = historyDir.resolve(safeKey(k.isEmpty() ? ip : k) + ".jsonl");
-        // 组键 ≠ IP（这台设备的身份已确认）→ 把旧版按 IP 存的历史并进组文件（一次性）
+        // 组键≠IP(这台设备的身份已确认)⇒把旧版按IP存的历史并进组文件(一次性)
         if (!k.isEmpty() && !k.equals(ip)) {
             mergeLegacyHistory(ip, dest);
         }
@@ -788,11 +713,8 @@ public final class Store {
     }
 
     /**
-     * 把 `history/<ip>.jsonl` 并入 `history/<deviceId>.jsonl`。
-     *
-     * 只有写成功才删旧文件：写失败时旧文件留着，读历史仍能读到内容，
-     * 不会出现「聊天记录凭空消失」。
-     */
+     * 把`history/<ip>.jsonl`并入`history/<deviceId>.jsonl`。
+     * 只有写成功才删旧文件:写失败时旧文件留着,读历史仍能读到内容,不会出现"聊天记录凭空消失" */
     private void mergeLegacyHistory(String ip, Path dest) {
         if (ip == null || ip.isEmpty()) {
             return;
@@ -866,8 +788,7 @@ public final class Store {
             deviceName = Json.str(m, "deviceName", deviceName);
             tcpPort = Json.integer(m, "tcpPort", tcpPort);
             udpPort = Json.integer(m, "udpPort", udpPort);
-            // v2.1 端口迁移（8765/8766 → 28765/28766）：旧配置里若仍是旧默认值，
-            // 视为「未自定义」，跟随新默认 —— 否则新代码会拿着旧端口继续撞 MIUI scene-daemon
+            // v2.1端口迁移(8765/8766→28765/28766):旧配置里若仍是旧默认值,视为"未自定义",跟随新默认——否则新代码会拿着旧端口继续撞MIUI scene-daemon
             if (tcpPort == 8765) {
                 tcpPort = Protocol.DEFAULT_TCP_PORT;
             }
@@ -878,8 +799,7 @@ public final class Store {
             allowConnectOut = Json.bool(m, "allowConnectOut", allowConnectOut);
             saveDir = Json.str(m, "saveDir", saveDir).trim();
             lastIp = Json.str(m, "lastIp", lastIp).trim();
-            // 设备身份与分组（老配置没有这几个 key → 留空，行为与改造前一致：
-            // 组键回退成 IP，一个地址一台设备）
+            // 设备身份与分组(老配置没有这几个key⇒留空,行为与改造前一致:组键回退成IP,一个地址一台设备)
             readStringMap(m, "bindings", bindings);
             readStringMap(m, "ignoredDevs", ignoredDevs);
             readStringMap(m, "deviceRemarks", deviceRemarks);
@@ -893,8 +813,8 @@ public final class Store {
                     }
                 }
             }
-            // 已知设备名单：没有这个 key = 从旧版升级 → 按聊天记录播种一次
-            //（落盘推迟到 load 尾部：中途 save 会把还没加载完的字段以默认值写回去）
+            // 已知设备名单:没有这个key=从旧版升级⇒按聊天记录播种一次
+            //(落盘推迟到load尾部:中途save会把还没加载完的字段以默认值写回去)
             boolean trustedSeeded = false;
             Object trusted = m.get("trustedPeers");
             if (trusted instanceof Map) {
@@ -912,16 +832,15 @@ public final class Store {
                 seedTrustedFromHistory();
                 trustedSeeded = !trustedPeers.isEmpty();
             }
-            // 视频配置：老 config.json 没有这几个 key → 取默认值（videoEnabled=true，
-            // 即默认允许接收视频；真正能否收到视频还要看对端是否支持，见 Link 能力协商）
+            // 视频配置:老config.json没有这几个key⇒取默认值(videoEnabled=true,即默认允许接收视频;真正能否收到视频还要看对端是否支持,见Link能力协商)
             videoEnabled = Json.bool(m, "videoEnabled", videoEnabled);
             videoMaxLevel = Json.integer(m, "videoMaxLevel", videoMaxLevel);
             ffmpegPath = Json.str(m, "ffmpegPath", ffmpegPath).trim();
             ffmpegHwaccel = Json.str(m, "ffmpegHwaccel", ffmpegHwaccel).trim();
             uiScale = parseUiScale(m.get("uiScale"));
             darkTheme = Json.bool(m, "darkTheme", darkTheme);
-            // ⚠ 老 config.json 里存的是旧上限（本机 %APPDATA%\PhonePcTransfer\config.json 现在是 2）
-            //    → 读档照样是 2，超清(3)会被夹回高清；由设置页那一排钮改（V-9）。
+            // ⚠老config.json里存的是旧上限(本机%APPDATA%\PhonePcTransfer\config.json现在是2)
+            //    ⇒读档照样是2,超清(3)会被夹回高清;由设置页那一排钮改(V-9)
             videoMaxLevel = clampVideoMaxLevel(videoMaxLevel);
 
             peerList.clear();
@@ -950,13 +869,10 @@ public final class Store {
                     }
                 }
             }
-            // ⚠️ 播种必须**在 peerList 填好之后**（2026-09-21 修）：
-            //    它遍历 peerList 取 lastId 填 ckeys，之前写在读 peers 数组**前面** ——
-            //    那时 peerList 还是空的（上面刚 clear 过），于是 ckeys 永远是空的，
-            //    convKeyOf() 把所有地址都退回「组键 = IP」：
-            //      · 同一台设备的多个地址被拆成好几台（设备列表一台设备出现多行）；
-            //      · config 里的 bindings 表形同废纸（bindDevice 见绑定没变就 early-return，
-            //        连 ckeys 都不会补）。
+            // ⚠️播种必须在peerList填好之后:
+            //    它遍历peerList取lastId填ckeys,之前写在读peers数组前面——那时peerList还是空的(上面刚clear过),于是ckeys永远是空的,
+            //    convKeyOf()把所有地址都退回"组键=IP":同一台设备的多个地址被拆成好几台(设备列表一台设备出现多行);
+            //    config里的bindings表形同废纸(bindDevice见绑定没变就early-return,连ckeys都不会补)
             seedGroupKeys();
             if (trustedSeeded) {
                 save();
@@ -967,10 +883,8 @@ public final class Store {
     }
 
     /**
-     * 从 peer.lastId 播种「ip → deviceId」缓存。
-     * 老配置里没有 bindings 表，但发现/握手早就把对端 id 写进了 peer.lastId ——
-     * 不播种的话升级后所有组键都会退回 IP，多地址设备会被拆成好几台。
-     */
+     * 从peer.lastId播种"ip→deviceId"缓存。
+     * 老配置里没有bindings表,但发现/握手早就把对端id写进了peer.lastId——不播种的话升级后所有组键都会退回IP,多地址设备会被拆成好几台 */
     private void seedGroupKeys() {
         for (Peer p : peerList) {
             if (p.ip == null || p.ip.isEmpty()) {
@@ -1015,7 +929,7 @@ public final class Store {
         m.put("videoMaxLevel", Integer.valueOf(videoMaxLevel));
         m.put("ffmpegPath", ffmpegPath == null ? "" : ffmpegPath);
         m.put("ffmpegHwaccel", ffmpegHwaccel == null ? "" : ffmpegHwaccel);
-        // uiScale：&le;0 = 跟随系统（写成 "system" 便于人工阅读），数字 = 钉定渲染缩放
+        // uiScale:≤0=跟随系统(写成"system"便于人工阅读),数字=钉定渲染缩放
         if (uiScale <= 0) {
             m.put("uiScale", "system");
         } else {
@@ -1141,7 +1055,7 @@ public final class Store {
         return Math.min(lv, VIDEO_MAX_LEVEL);
     }
 
-    // ==================== 主题（2026-09-27） ====================
+    // ==================== 主题 ====================
 
     /** 当前是否深色主题（启动时由 PcMain 应用到 Ui） */
     public synchronized boolean darkTheme() {
@@ -1157,7 +1071,7 @@ public final class Store {
         save();
     }
 
-    // ==================== UI 缩放钉定（2026-09-27） ====================
+    // ==================== UI 缩放钉定 ====================
 
     /** 当前钉定缩放（&le;0 = 跟随系统）；仅供日志/诊断读 */
     public synchronized double uiScale() {
@@ -1165,11 +1079,8 @@ public final class Store {
     }
 
     /**
-     * 启动最早期读 uiScale（只做文件 IO，供 {@code PcMain.main} 在任何 AWT 初始化之前调用；
-     * 此时 Log 可能还没 init，绝不能在这里打日志）。
-     *
-     * @return &gt;0 = 钉定的渲染缩放；0 = 跟随系统缩放
-     */
+     * 启动最早期读uiScale(只做文件IO,供{@code PcMain.main}在任何AWT初始化之前调用;此时Log可能还没init,绝不能在这里打日志)。
+     * @return >0=钉定的渲染缩放;0=跟随系统缩放 */
     public static double readUiScaleOverride(Path cfg) {
         try {
             if (!Files.exists(cfg)) {
@@ -1185,12 +1096,9 @@ public final class Store {
     }
 
     /**
-     * 解析 uiScale 配置值：数字 = 钉定缩放（越界钳回默认）；0 / "system" = 跟随系统；非法 = 默认。
-     *
-     * <p>一次性迁移（2026-09-29）：旧钉定值 1.25 一律替换为 1.0 —— 当天默认值由 1.25 改为 1.0，
-     * 老 config.json 里的 1.25 属历史遗留（与旧默认同值，无法区分「用户手设 1.25」），
-     * 统一按新默认处理；load() 后下次 save() 会把 1.0 写回配置，迁移即完成。
-     */
+     * 解析uiScale配置值:数字=钉定缩放(越界钳回默认);0/"system"=跟随系统;非法=默认。
+     * <p>一次性迁移:旧钉定值1.25一律替换为1.0——老config.json里的1.25属历史遗留(与旧默认同值,无法区分"用户手设1.25"),统一按新默认处理;
+     * load()后下次save()会把1.0写回配置,迁移即完成 */
     static double parseUiScale(Object v) {
         if (v == null) {
             return DEFAULT_UI_SCALE;
@@ -1252,10 +1160,7 @@ public final class Store {
 
     /**
      * 当前生效的接收目录。
-     *
-     * 自定义目录不存在会自动创建；不可写（比如选了只读盘/U 盘拔了）时**回落到默认目录**，
-     * 而不是让手机传过来的文件直接丢失。调用方拿到的永远是一个可写目录。
-     */
+     * 自定义目录不存在会自动创建;不可写(比如选了只读盘/U盘拔了)时回落到默认目录,而不是让手机传过来的文件直接丢失。调用方拿到的永远是一个可写目录 */
     public Path receivedDir() {
         String d = saveDir();
         if (!d.isEmpty()) {
@@ -1300,12 +1205,10 @@ public final class Store {
 
     /**
      * 新增或更新一台设备。
-     *
-     * @param remark   null = 不改备注；非 null（可含空串）= 覆盖
-     * @param lastId   广播发现的 id；空串 = 不覆盖
-     * @param lastName 广播发现的名字；空串 = 不覆盖
-     * @return true 表示列表发生了变化
-     */
+     * @param remark   null=不改备注;非null(可含空串)=覆盖
+     * @param lastId   广播发现的id;空串=不覆盖
+     * @param lastName 广播发现的名字;空串=不覆盖
+     * @return true表示列表发生了变化 */
     public synchronized boolean upsertPeer(String ip, String remark, String lastId,
                                           String lastName, long seenAt) {
         if (ip == null) {
@@ -1341,26 +1244,20 @@ public final class Store {
             changed = true;
         }
         String active = exist.lastId == null ? "" : exist.lastId.trim();
-        // 别名表同时记**活动设备自己**：它「是否已经离开」只能看它**自己**最近一次
-        // 广播/握手的时间，不能拿 peer.lastSeenAt —— 那会被同 IP 另一台设备的广播一直刷新，
-        // 于是旧设备明明关机了也永远判不出「已离开」，新设备永远只能当别名。
+        // 别名表同时记活动设备自己:它"是否已经离开"只能看它自己最近一次广播/握手的时间,不能拿peer.lastSeenAt——那会被同IP另一台设备的广播一直刷新,
+        // 于是旧设备明明关机了也永远判不出"已离开",新设备永远只能当别名
         if (!did.isEmpty() && exist.noteDev(did, dn, seenAt)) {
             changed = true;
         }
         if (!did.isEmpty() && !did.equals(active)) {
-            // ===== 同 IP 多设备（2026-10-05）=====
-            // 这个地址上已经有**另一台**设备当活动设备了。旧行为是直接把 lastId 抢过来 ——
-            // 两台设备的广播每 2s 交替到达，于是组键来回漂移、备注/当前地址被 migrateGroupState
-            // 反复搬运并每次落盘（用户看到的「切换不过去 + 卡」）。现在改成：
-            //   · 原活动设备**还在**（30s 内有过广播/握手）→ 后来者只登记成别名，
-            //     绝不改 lastId / bindings / ckeys、不搬组状态（= 「后面直接跳过」）；
-            //   · 原活动设备**已离开**（≥30s 没动静，通常是 IP 被路由重新分配）→ 允许接管，
-            //     否则这个地址会永远钉在已经关机的那台设备上。
+            // ===== 同IP多设备 =====
+            // 这个地址上已经有另一台设备当活动设备了。旧行为是直接把lastId抢过来——两台设备的广播每2s交替到达,于是组键来回漂移、备注/当前地址被migrateGroupState反复搬运并每次落盘(用户看到的"切换不过去+卡")。现在改成:
+            //   · 原活动设备还在(30s内有过广播/握手)⇒后来者只登记成别名,绝不改lastId/bindings/ckeys、不搬组状态(="后面直接跳过");
+            //   · 原活动设备已离开(≥30s没动静,通常是IP被路由重新分配)⇒允许接管,否则这个地址会永远钉在已经关机的那台设备上
             if (active.isEmpty() || devGone(exist, active)) {
                 String oldKey = convKeyOf(v);
-                // 升级兼容：老配置 / 还没进别名表的旧活动设备补一条，否则接管后它就从列表里消失了。
-                // 但只在它**最近还出现过**时才补（见 DEV_ALIAS_KEEP_MS）：几天没动静的旧身份
-                // 多半是换/重装前的 deviceId，补进去只会留一条永远点不开、还删不干净的幽灵行。
+                // 升级兼容:老配置/还没进别名表的旧活动设备补一条,否则接管后它就从列表里消失了。
+                // 但只在它最近还出现过时才补(见DEV_ALIAS_KEEP_MS):几天没动静的旧身份多半是换/重装前的deviceId,补进去只会留一条永远点不开、还删不干净的幽灵行
                 if (!active.isEmpty() && exist.dev(active) == null
                         && !devStaleForAlias(exist.lastSeenAt, DEV_ALIAS_KEEP_MS)) {
                     exist.noteDev(active, exist.lastName, exist.lastSeenAt);
@@ -1379,16 +1276,14 @@ public final class Store {
                 changed = true;
             }
         }
-        // 广播名只跟着**活动设备**走：否则两台同 IP 设备的广播会把这个显示名来回改
+        // 广播名只跟着活动设备走:否则两台同IP设备的广播会把这个显示名来回改
         if (!dn.isEmpty() && (did.isEmpty() || did.equals(exist.lastId))
                 && !dn.equals(exist.lastName)) {
             exist.lastName = dn;
             changed = true;
         }
-        // ⚠️ lastSeenAt 每次收到广播都会变大，**不计入「列表有变化」**：
-        // 对端每 2s 广播一次，若算作变化，状态栏就会每 2s 刷一条
-        // 「发现设备 X，已加入设备列表」，看起来像在反复重新发现设备（与手机端同源问题）。
-        // 拆开：在线时间静默落盘，返回值只表示「用户可见的结构有变化」。
+        // ⚠️lastSeenAt每次收到广播都会变大,不计入"列表有变化":对端每2s广播一次,若算作变化,状态栏就会每2s刷一条"发现设备X,已加入设备列表",看起来像在反复重新发现设备(与手机端同源问题)。
+        // 拆开:在线时间静默落盘,返回值只表示"用户可见的结构有变化"
         boolean touched = false;
         if (seenAt > exist.lastSeenAt) {
             exist.lastSeenAt = seenAt;
@@ -1400,18 +1295,15 @@ public final class Store {
         return changed;
     }
 
-    // ==================== 同 IP 多设备：活动设备 / 别名切换（2026-10-05） ====================
+    // ==================== 同 IP 多设备：活动设备 / 别名切换 ====================
 
     /** 「活动设备」多久没动静就算离开了（广播/握手周期是 2s，30s 足够判定关机 / 换网） */
     private static final long DEV_TAKEOVER_MS = 30_000L;
 
     /**
-     * 接管时「被顶下去的旧活动设备」还值不值得留一条别名行。
-     *
-     * <p>它已经超过这个时限没出现过（多半是换/重装前的旧 deviceId，永远不会再来）时**不记**——
-     * 记了就是一条永远点不开、还删不干净的幽灵行（2026-10-05 用户实测）。
-     * 10 分钟足够覆盖「A 网络抖了一下、B 抢到地址、A 待会回来」这种真需要能切回去的场景。
-     */
+     * 接管时"被顶下去的旧活动设备"还值不值得留一条别名行。
+     * <p>它已经超过这个时限没出现过(多半是换/重装前的旧deviceId,永远不会再来)时不记——记了就是一条永远点不开、还删不干净的幽灵行。
+     * 10分钟足够覆盖"A网络抖了一下、B抢到地址、A待会回来"这种真需要能切回去的场景 */
     private static final long DEV_ALIAS_KEEP_MS = 10 * 60_000L;
 
     /** 旧活动设备是否已经超过 limitMs 没出现（不值得再留 / 再显示别名行） */
@@ -1420,21 +1312,14 @@ public final class Store {
     }
 
     /**
-     * 别名行的**显示**时限：太久没露过面的「同一 IP 上的另一台设备」不再列出来。
-     *
-     * <p>为什么必须有（2026-10-05 用户实测）：同一台手机换/重装后 deviceId 变了，旧身份永远不会
-     * 再广播，但它可能在别名表里躺着 —— 列表上就多一条「永远点不开的幽灵行」，点它还会弹
-     * 「是否断开当前设备并切过去」（切过去只会把好好的地址抢给一个不存在的身份）。
-     * 真正在场的设备每 2s 广播一次 / 握手一次，记录一直是新鲜的，所以这行不会误藏。
-     */
+     * 别名行的显示时限:太久没露过面的"同一IP上的另一台设备"不再列出来。
+     * <p>为什么必须有:同一台手机换/重装后deviceId变了,旧身份永远不会再广播,但它可能在别名表里躺着——列表上就多一条"永远点不开的幽灵行",点它还会弹"是否断开当前设备并切过去"(切过去只会把好好的地址抢给一个不存在的身份)。
+     * 真正在场的设备每2s广播一次/握手一次,记录一直是新鲜的,所以这行不会误藏 */
     private static final long DEV_ALIAS_SHOW_MS = 60 * 60_000L;
 
     /**
      * 该地址上的活动设备是否已经离开。
-     *
-     * <p>只看**它自己**最近一次广播/握手的时间（别名表里那条），不看 peer.lastSeenAt ——
-     * 后者会被同 IP 另一台设备的广播一直刷新，会让「旧设备已关机」永远判不出来。
-     */
+     * <p>只看它自己最近一次广播/握手的时间(别名表里那条),不看peer.lastSeenAt——后者会被同IP另一台设备的广播一直刷新,会让"旧设备已关机"永远判不出来 */
     private static boolean devGone(Peer p, String activeId) {
         if (p == null) {
             return true;
@@ -1451,15 +1336,10 @@ public final class Store {
     }
 
     /**
-     * 忘掉「这台设备在这个地址上出现过」的别名记录（别名行右键「删除（不再显示这台设备）」）。
-     *
-     * <p>注意必须**同时记进 {@link #ignoredDevs}**：别名行来自对方广播/握手时自报的 id，
-     * 只删记录的话对方下一次广播（2s 后）就又把它加回来 —— 用户看到的是「怎么删都删不掉」。
-     * 用户手工在「＋设备」里再加同一个地址、或这台设备**真的占到某个地址**时，忽略标记自动解除
-     *（见 {@link #unignoreDev}）。
-     *
-     * @return true 表示设备列表/别名表发生了变化
-     */
+     * 忘掉"这台设备在这个地址上出现过"的别名记录(别名行右键"删除(不再显示这台设备)")。
+     * <p>注意必须同时记进{@link #ignoredDevs}:别名行来自对方广播/握手时自报的id,只删记录的话对方下一次广播(2s后)就又把它加回来——用户看到的是"怎么删都删不掉"。
+     * 用户手工在"＋设备"里再加同一个地址、或这台设备真的占到某个地址时,忽略标记自动解除(见{@link #unignoreDev})。
+     * @return true表示设备列表/别名表发生了变化 */
     public synchronized boolean forgetDev(String devId) {
         String d = devId == null ? "" : devId.trim();
         if (d.isEmpty()) {
@@ -1490,16 +1370,10 @@ public final class Store {
     }
 
     /**
-     * 把某个地址的**活动设备**切换成另一台（同 IP 多设备冲突：用户确认「断开之前的连接」后调用）。
-     *
-     * <p>为什么要显式切换：同一个 IP 在任一瞬间只能对应一台设备（`convKeyOf(ip)` 是热路径，
-     * 只能给单值答案）。列表里的「别名行」点击时弹冲突确认框，用户点「是」之后就走这里：
-     * 旧活动设备降级为别名（随时能再切回来）、新设备升为活动设备，并把挂在旧组键上的本机
-     * 状态（备注 / 当前地址 / 旋转角 / 已知设备标记）搬到新组键上 —— 否则用户写完的备注、
-     * 选过的地址会留在旧设备那边取不出来。
-     *
-     * @return true 表示切换成功（地址或身份不合法时返回 false）
-     */
+     * 把某个地址的活动设备切换成另一台(同IP多设备冲突:用户确认"断开之前的连接"后调用)。
+     * <p>为什么要显式切换:同一个IP在任一瞬间只能对应一台设备(`convKeyOf(ip)`是热路径,只能给单值答案)。
+     * 列表里的"别名行"点击时弹冲突确认框,用户点"是"之后就走这里:旧活动设备降级为别名(随时能再切回来)、新设备升为活动设备,并把挂在旧组键上的本机状态(备注/当前地址/旋转角/已知设备标记)搬到新组键上——否则用户写完的备注、选过的地址会留在旧设备那边取不出来。
+     * @return true表示切换成功(地址或身份不合法时返回false) */
     public synchronized boolean promoteDev(String ip, String devId) {
         String v = ip == null ? "" : ip.trim();
         String d = devId == null ? "" : devId.trim();
@@ -1512,7 +1386,7 @@ public final class Store {
         }
         String old = convKeyOf(v);
         if (d.equals(old)) {
-            // 已经是活动设备：补一条它自己的活跃记录即可
+            // 已经是活动设备:补一条它自己的活跃记录即可
             if (p.dev(d) == null) {
                 p.noteDev(d, p.lastName, System.currentTimeMillis());
             }
@@ -1520,7 +1394,7 @@ public final class Store {
             save();
             return true;
         }
-        // 升级兼容：旧活动设备还没进别名表时补一条，否则切换后它就从列表里消失了
+        // 升级兼容:旧活动设备还没进别名表时补一条,否则切换后它就从列表里消失了
         if (old != null && !old.isEmpty() && !old.equals(v) && p.dev(old) == null) {
             p.noteDev(old, p.lastName, p.lastSeenAt);
         }
@@ -1531,7 +1405,7 @@ public final class Store {
         bindings.put(v, d);
         ckeys.put(v, d);
         migrateGroupState(old, d);
-        // 这台地址从现在起属于新设备（顶栏地址菜单 / 下次启动自动连接都读它）
+        // 这台地址从现在起属于新设备(顶栏地址菜单/下次启动自动连接都读它)
         groupCurIp.put(d, v);
         unignoreDev(d);
         save();
@@ -1558,7 +1432,7 @@ public final class Store {
             } else {
                 cur.ip = target;
                 cur.remark = remark == null ? "" : remark.trim();
-                // 身份绑定跟着走：否则改完 IP 后组键会退回新 IP，聊天记录断成两份
+                // 身份绑定跟着走:否则改完IP后组键会退回新IP,聊天记录断成两份
                 String b = bindings.remove(oldIp);
                 if (b != null && !b.isEmpty()) {
                     bindings.put(target, b);
@@ -1573,17 +1447,13 @@ public final class Store {
     }
 
     /**
-     * 从设备列表删掉一个地址，并**一并解除它的身份绑定**。
-     *
-     * 为什么必须解绑：绑定表是「ip → deviceId」的权威答案，[convKeyOf] 先查它。若只删设备行
-     * 而留着绑定，用户之后手动把同一个地址加回来时，它**立刻又回到老那台设备的组里**
-     * （只有等该地址自己广播/握手带上**另一个** id 才会被覆盖）——
-     * 表现就是「明明加的是新设备，却并进了别人的聊天记录」。删地址 = 本端不再认为它属于那台设备。
-     */
+     * 从设备列表删掉一个地址,并一并解除它的身份绑定。
+     * 为什么必须解绑:绑定表是"ip→deviceId"的权威答案,[convKeyOf]先查它。若只删设备行而留着绑定,用户之后手动把同一个地址加回来时,它立刻又回到老那台设备的组里
+     * (只有等该地址自己广播/握手带上另一个id才会被覆盖)——表现就是"明明加的是新设备,却并进了别人的聊天记录"。删地址=本端不再认为它属于那台设备 */
     public synchronized boolean removePeer(String ip) {
         Peer p = findPeer(ip);
         String v = ip == null ? "" : ip.trim();
-        // 组键必须在解绑**之前**取：解绑后 convKeyOf 会退回 IP，就找不到这台设备的标记了
+        // 组键必须在解绑之前取:解绑后convKeyOf会退回IP,就找不到这台设备的标记了
         String key = v.isEmpty() ? "" : convKeyOf(v);
         boolean unbound = false;
         if (!v.isEmpty()) {
@@ -1628,26 +1498,20 @@ public final class Store {
         return out;
     }
 
-    /** @return true 表示新增成功（重复返回 false） */
+    /** @return true表示新增成功(重复返回false) */
     /**
      * 手工添加一个地址。
-     *
-     * 时间戳写「现在」：手工填的地址从未被广播/握手续过号（lastSeenAt 会停在 0），
-     * 若写 0，[pruneStaleIps] 会把它当成「很旧」当场清掉 —— 用户刚加完、下次启动就没了。
-     */
+     * 时间戳写"现在":手工填的地址从未被广播/握手续过号(lastSeenAt会停在0),若写0,[pruneStaleIps]会把它当成"很旧"当场清掉——用户刚加完、下次启动就没了 */
     public synchronized boolean addPeerIp(String ip) {
         return upsertPeer(ip, null, null, null, System.currentTimeMillis());
     }
 
     /**
-     * 启动时清理「长期没用过的地址」（与 Android 端 Prefs.pruneStaleIps 同构）。
-     *
-     *  - 只清理**超过 keepMin 条地址的设备组**：只有两条（或更少）的组整体跳过；
-     *  - 组内 lastSeenAt 早于 now - maxAgeDays 天的地址删掉；
-     *  - **保底留最近使用的 keepMin 条**，外加组内当前使用的那个地址永不删 ——
-     *    避免「很久没连过的设备被清成空列表」。
-     *
-     * 删除走 [removePeer]（连带解除 ip → deviceId 绑定），不留指向已删地址的绑定。
+     * 启动时清理"长期没用过的地址"(与Android端Prefs.pruneStaleIps同构)。
+     * - 只清理超过keepMin条地址的设备组:只有两条(或更少)的组整体跳过;
+     * - 组内lastSeenAt早于now-maxAgeDays天的地址删掉;
+     * - 保底留最近使用的keepMin条,外加组内当前使用的那个地址永不删——避免"很久没连过的设备被清成空列表"。
+     * 删除走[removePeer](连带解除ip→deviceId绑定),不留指向已删地址的绑定
      *
      * @return 实际删掉的地址条数
      */
@@ -1704,23 +1568,16 @@ public final class Store {
     // ==================== 历史（按对端设备分文件） ====================
 
     /**
-     * 历史封顶（plan/15，2026-09-29）：单文件大小阈值（字节）。
-     *
-     * <p>进度帧会对同一条消息多次落盘，不封顶则文件只增不减，
-     * hasMid / removeFromHistory / loadPendingRaw（全文件读入内存再写回）会越来越慢。
-     * 超阈值即触发 {@link #capHistoryFile}：读 → 按 mid 合并 → 按 ts 留最近 2000 条 → 重写。
-     */
+     * 历史封顶:单文件大小阈值(字节)。
+     * <p>进度帧会对同一条消息多次落盘,不封顶则文件只增不减,hasMid/removeFromHistory/loadPendingRaw(全文件读入内存再写回)会越来越慢。
+     * 超阈值即触发{@link #capHistoryFile}:读⇒按mid合并⇒按ts留最近2000条⇒重写 */
     static final long HISTORY_MAX_BYTES = 8L * 1024 * 1024;
     /** 封顶后保留条数：按 ts 留最近 N 条（对齐 Android 端封顶思路；PC UI 窗口 200 条，留足余量） */
     static final int HISTORY_KEEP_ROWS = 2000;
 
     /**
-     * 追加一条历史到「该消息所属设备」的文件里。
-     *
-     * <p>追加后检查文件大小（plan/15）：单文件超 {@link #HISTORY_MAX_BYTES} 立即
-     * {@link #capHistoryFile} —— 读全部行、按 mid 合并（后行胜出）、按 ts 留最近
-     * {@link #HISTORY_KEEP_ROWS} 条后整体重写。
-     */
+     * 追加一条历史到"该消息所属设备"的文件里。
+     * <p>追加后检查文件大小:单文件超{@link #HISTORY_MAX_BYTES}立即{@link #capHistoryFile}——读全部行、按mid合并(后行胜出)、按ts留最近{@link #HISTORY_KEEP_ROWS}条后整体重写 */
     public void appendHistory(String peerIp, Map<String, Object> record) {
         synchronized (histLock) {
             Path f = historyFile(peerIp);
@@ -1738,19 +1595,12 @@ public final class Store {
     }
 
     /**
-     * 封顶单个历史文件（plan/15）：读全部行 → 解析（坏行丢弃）→ 按 mid 合并
-     * （后行胜出，与 {@link #loadHistory} 同口径；无 mid 的行按独立条目保留）
-     * → 按 ts 留最近 {@link #HISTORY_KEEP_ROWS} 条 → 序列化并按 **UTF-8 字节**计长，
-     * 仍超 {@link #HISTORY_MAX_BYTES} 则从最旧继续丢（至少留 1 条）→ 按 ts 升序整体重写。
-     *
-     * <p>为什么按 ts 而不是行序：hsync 补齐的旧消息追加在文件尾部但 ts 旧，行序不可当时间序。
-     * 合并后每个 mid 只有一行，行序不再影响 loadHistory 的合并结果；按 ts 升序落盘还让
-     * loadHistory 大文件分支的「尾部 2MB」截尾读到更可能是最新消息。
-     *
-     * <p>坏行丢弃是安全的：loadHistory 本来就跳过解析失败的行（永不显示）。
-     *
-     * @return 是否实际重写了文件
-     */
+     * 封顶单个历史文件:读全部行⇒解析(坏行丢弃)⇒按mid合并(后行胜出,与{@link #loadHistory}同口径;无mid的行按独立条目保留)
+     * ⇒按ts留最近{@link #HISTORY_KEEP_ROWS}条⇒序列化并按UTF-8字节计长,仍超{@link #HISTORY_MAX_BYTES}则从最旧继续丢(至少留1条)⇒按ts升序整体重写。
+     * <p>为什么按ts而不是行序:hsync补齐的旧消息追加在文件尾部但ts旧,行序不可当时间序。
+     * 合并后每个mid只有一行,行序不再影响loadHistory的合并结果;按ts升序落盘还让loadHistory大文件分支的"尾部2MB"截尾读到更可能是最新消息。
+     * <p>坏行丢弃是安全的:loadHistory本来就跳过解析失败的行(永不显示)。
+     * @return 是否实际重写了文件 */
     private boolean capHistoryFile(Path f) {
         try {
             java.util.LinkedHashMap<String, Map<String, Object>> byMid =
@@ -1805,11 +1655,8 @@ public final class Store {
     }
 
     /**
-     * 启动全扫封顶（plan/15）：遍历 history/*.jsonl，对超 {@link #HISTORY_MAX_BYTES}
-     * 的文件执行 {@link #capHistoryFile}。
-     *
-     * @return 实际重写的文件数
-     */
+     * 启动全扫封顶:遍历history/*.jsonl,对超{@link #HISTORY_MAX_BYTES}的文件执行{@link #capHistoryFile}。
+     * @return 实际重写的文件数 */
     public int capHistoryFiles() {
         int n = 0;
         synchronized (histLock) {
@@ -1837,12 +1684,8 @@ public final class Store {
     }
 
     /**
-     * 清理孤儿缩略图缓存（plan/15）：删掉 thumb_cache/ 下 mid 已不在任何设备历史、
-     * 也不在待发队列里的缓存文件。
-     *
-     * <p>正常删消息会随消息一起清缓存（ChatWindow），但对端在本机离线期间删消息时
-     * 缓存会留下 —— 启动时扫一遍兜住。缓存文件可再生，不是用户数据。
-     *
+     * 清理孤儿缩略图缓存:删掉thumb_cache/下mid已不在任何设备历史、也不在待发队列里的缓存文件。
+     * <p>正常删消息会随消息一起清缓存(ChatWindow),但对端在本机离线期间删消息时缓存会留下——启动时扫一遍兜住。缓存文件可再生,不是用户数据。
      * @return 删除的文件数
      */
     public int pruneThumbCache() {
@@ -1911,9 +1754,8 @@ public final class Store {
     }
 
     /**
-     * 统一消息 id 查重（2026-09-16）：该设备的历史里是否已有这条 mid。
-     * hsync 补齐与重复投递的判定**只认 mid**，与气泡、待发队列共用同一判据。
-     */
+     * 统一消息id查重:该设备的历史里是否已有这条mid。
+     * hsync补齐与重复投递的判定只认mid,与气泡、待发队列共用同一判据 */
     public boolean hasMid(String peerIp, String mid) {
         if (mid == null || mid.isEmpty()) {
             return false;
@@ -1944,18 +1786,12 @@ public final class Store {
     }
 
     /**
-     * 该 mid 是否已作为**收到的文件**完整落盘过（2026-10-01 重复投递判据）。
-     * 返回当初的落盘路径；空串 = 没收到过 / 记录不是成功态 / 文件已被用户删掉。
-     *
-     * <p>与 {@link #hasMid} 的区别：那个只认 mid、不分状态，历史里一条 SENDING 进度行
-     * 或 FAILED 行也会命中 —— 拿它当「已存过」的判据会把该重传的文件永久跳过。
-     * 这里要求 {@code dir=PEER + kind=FILE + isDir=false + status=OK}。
-     *
-     * <p>同一 mid 有多行（进度行 + 终态行）时按**后行胜出**，与 {@link #loadHistory}
-     * / {@link #capHistoryFile} 同口径：先收成功、后来重传失败的设备，判据应跟最后一次。
-     *
-     * <p>文件必须仍在磁盘上：用户把收到的文件删了就该允许他让对端重发一次。
-     */
+     * 该mid是否已作为收到的文件完整落盘过(重复投递判据)。
+     * 返回当初的落盘路径;空串=没收到过/记录不是成功态/文件已被用户删掉。
+     * <p>与{@link #hasMid}的区别:那个只认mid、不分状态,历史里一条SENDING进度行或FAILED行也会命中——拿它当"已存过"的判据会把该重传的文件永久跳过。
+     * 这里要求{@code dir=PEER + kind=FILE + isDir=false + status=OK}。
+     * <p>同一mid有多行(进度行+终态行)时按后行胜出,与{@link #loadHistory}/{@link #capHistoryFile}同口径:先收成功、后来重传失败的设备,判据应跟最后一次。
+     * <p>文件必须仍在磁盘上:用户把收到的文件删了就该允许他让对端重发一次 */
     public String savedFileOf(String peerIp, String mid) {
         if (peerIp == null || peerIp.isEmpty() || mid == null || mid.isEmpty()) {
             return "";
@@ -2000,12 +1836,9 @@ public final class Store {
     }
 
     /**
-     * 按 mid 删除一条历史（用于「取消发送的文件」——取消后重载聊天记录也不应再出现）。
-     * 只动该设备自己的文件：读出全部、滤掉该 mid、再整体写回。
-     *
-     * <p>批量场景（清空会话）请用 {@link #removeFromHistory(String, java.util.Collection)}，
-     * 那个只做一次全文件往返。
-     */
+     * 按mid删除一条历史(用于"取消发送的文件"——取消后重载聊天记录也不应再出现)。
+     * 只动该设备自己的文件:读出全部、滤掉该mid、再整体写回。
+     * <p>批量场景(清空会话)请用{@link #removeFromHistory(String, java.util.Collection)},那个只做一次全文件往返 */
     public void removeFromHistory(String peerIp, String mid) {
         if (mid == null || mid.isEmpty()) {
             return;
@@ -2040,14 +1873,10 @@ public final class Store {
     }
 
     /**
-     * 按 mid 批量删除历史（「清空当前会话」逐条删除用）：**一次读、一次写**。
-     *
-     * <p>为什么不循环调 {@link #removeFromHistory(String, String)}：那个版本每删一条就把整个
-     * 历史文件读一遍写一遍，清 N 条就是 N 次全文件往返（O(N²)）—— 会话一长（几百上千条）
-     * 会明显卡顿。这里合并成一趟过滤，语义完全一致。
-     *
-     * @return 实际删掉的行数
-     */
+     * 按mid批量删除历史("清空当前会话"逐条删除用):一次读、一次写。
+     * <p>为什么不循环调{@link #removeFromHistory(String, String)}:那个版本每删一条就把整个历史文件读一遍写一遍,清N条就是N次全文件往返(O(N²))——会话一长(几百上千条)会明显卡顿。
+     * 这里合并成一趟过滤,语义完全一致。
+     * @return 实际删掉的行数 */
     public int removeFromHistory(String peerIp, java.util.Collection<String> mids) {
         if (mids == null || mids.isEmpty()) {
             return 0;
@@ -2098,13 +1927,9 @@ public final class Store {
     }
 
     /**
-     * 按 mid 删除一条历史，**在所有设备的历史文件里找**。
-     *
-     * 取消文件发送的通知里只带 mid、不带归属设备（协议里也不需要），而这里的历史是
-     * 按对端分文件的，所以直接扫一遍目录最省事：mid 是全局唯一随机串，命中即该条。
-     *
-     * @return 被删掉该 mid 的文件数（0 = 本来就没有）
-     */
+     * 按mid删除一条历史,在所有设备的历史文件里找。
+     * 取消文件发送的通知里只带mid、不带归属设备(协议里也不需要),而这里的历史是按对端分文件的,所以直接扫一遍目录最省事:mid是全局唯一随机串,命中即该条。
+     * @return 被删掉该mid的文件数(0=本来就没有) */
     public int removeFromHistoryEverywhere(String mid) {
         if (mid == null || mid.isEmpty()) {
             return 0;
@@ -2158,12 +1983,9 @@ public final class Store {
     }
 
     /**
-     * 读取**指定设备**最近 max 条历史（文件过大时只读尾部 2MB）。
-     *
-     * **按 mid 合并去重（后行胜出）**：同一条消息可能有多行（file_meta 落一次、
-     * 终态 updated 再补一次）—— 加载时合成一条，后行的非空字段覆盖前行。
-     * 这同时治愈旧版本留下的重复行（v1 对端 file_done 会再 emit 一次 added）。
-     */
+     * 读取指定设备最近max条历史(文件过大时只读尾部2MB)。
+     * 按mid合并去重(后行胜出):同一条消息可能有多行(file_meta落一次、终态updated再补一次)——加载时合成一条,后行的非空字段覆盖前行。
+     * 这同时治愈旧版本留下的重复行(v1对端file_done会再emit一次added) */
     public List<Map<String, Object>> loadHistory(String peerIp, int max) {
         List<Map<String, Object>> out = new ArrayList<Map<String, Object>>();
         synchronized (histLock) {
@@ -2210,10 +2032,8 @@ public final class Store {
     }
 
     /**
-     * 历史行合并：后行的非空值覆盖前行（进度/状态/路径以最新的为准，其余保留）。
-     * mid/dir/kind 是身份字段不覆盖 —— 裸状态帧（只有 mid+status）的 kind 默认 TEXT，
-     * 若覆盖会把文件消息读成文本气泡。
-     */
+     * 历史行合并:后行的非空值覆盖前行(进度/状态/路径以最新的为准,其余保留)。
+     * mid/dir/kind是身份字段不覆盖——裸状态帧(只有mid+status)的kind默认TEXT,若覆盖会把文件消息读成文本气泡 */
     private static Map<String, Object> mergeRow(Map<String, Object> old, Map<String, Object> neu) {
         for (Map.Entry<String, Object> e : neu.entrySet()) {
             String k = e.getKey();
@@ -2227,8 +2047,8 @@ public final class Store {
             if (v instanceof String && ((String) v).isEmpty()) {
                 continue;
             }
-            // fileSize/fileSize=0 / progress=-1 都是「未知/未赋值」，不得覆盖已有有效值
-            //（裸状态帧里 fileSize 默认 0，会让文件气泡显示成 0B）
+            // fileSize/fileSize=0/progress=-1都是"未知/未赋值",不得覆盖已有有效值
+            //(裸状态帧里fileSize默认0,会让文件气泡显示成0B)
             if (("fileSize".equals(k) || "dirCount".equals(k)) && v instanceof Number
                     && ((Number) v).longValue() <= 0L) {
                 continue;
@@ -2270,11 +2090,9 @@ public final class Store {
     }
 
     /**
-     * 批量移除待发条目（「清空当前会话」用）：一趟过滤 + 一次落盘。
-     * 与逐条调 {@link #removePending(String)} 语义相同，但避免 N 次全文件重写。
-     *
-     * @return 实际移除的条数
-     */
+     * 批量移除待发条目("清空当前会话"用):一趟过滤+一次落盘。
+     * 与逐条调{@link #removePending(String)}语义相同,但避免N次全文件重写。
+     * @return 实际移除的条数 */
     public synchronized int removePending(java.util.Collection<String> mids) {
         if (mids == null || mids.isEmpty()) {
             return 0;
@@ -2307,16 +2125,11 @@ public final class Store {
     }
 
     /**
-     * 清空与某台设备的全部聊天/传输记录：历史文件整删 + 待发队列里属于该设备的条目清掉。
-     * **只动记录，不动已传输落盘的实际文件**。
-     *
-     * <p>⚠ **不要用它实现「清空当前会话」**（2026-09-21 起）：它只删本机历史，对端那几条还在，
-     * 对端一上线就会被 hsync 整段补回来。界面上的清空走
-     * {@link ChatWindow#clearCurrentConversation()} —— 逐条 mid 删除 + `msg_del` 通知对端。
-     * 这个方法仅留给「确实要整文件丢弃」的场景（当前 UI 已无调用点）。
-     *
-     * @return 清掉的记录数（历史文件算 1 + 待发条数），供 UI 提示；历史本来就没有时也把待发清掉
-     */
+     * 清空与某台设备的全部聊天/传输记录:历史文件整删+待发队列里属于该设备的条目清掉。只动记录,不动已传输落盘的实际文件。
+     * <p>⚠不要用它实现"清空当前会话":它只删本机历史,对端那几条还在,对端一上线就会被hsync整段补回来。
+     * 界面上的清空走{@link ChatWindow#clearCurrentConversation()}——逐条mid删除+`msg_del`通知对端。
+     * 这个方法仅留给"确实要整文件丢弃"的场景(当前UI已无调用点)。
+     * @return 清掉的记录数(历史文件算1+待发条数),供UI提示;历史本来没有时也把待发清掉 */
     public int clearConversation(String peerIp) {
         if (peerIp == null || peerIp.isEmpty()) {
             return 0;
@@ -2359,12 +2172,8 @@ public final class Store {
 
     /**
      * 查某条待发消息是发给哪台设备的。
-     *
-     * 用于「取消发送」：取消通知里只有 mid，但要告诉对端撤哪个气泡、以及本端该从
-     * 哪台设备的会话里摘掉，所以得回到队列里翻一眼这条 mid 的 `peer`。
-     *
-     * @return 目的设备 IP；查不到返回空串
-     */
+     * 用于"取消发送":取消通知里只有mid,但要告诉对端撤哪个气泡、以及本端该从哪台设备的会话里摘掉,所以得回到队列里翻一眼这条mid的`peer`。
+     * @return 目的设备IP;查不到返回空串 */
     public synchronized String pendingPeerIp(String mid) {
         if (mid == null || mid.isEmpty()) {
             return "";
@@ -2432,10 +2241,8 @@ public final class Store {
 
     // ==================== 断点续传：半成品注册表 ====================
 
-    /**
-     * 正在接收/未接收完的文件登记（mid → path/name/size/received），持久化到 partials.json。
-     * 发送端断线重连后发 file_query，接收端凭它找到半成品继续追加，而不是推倒重来。
-     */
+    /** 正在接收/未接收完的文件登记(mid→path/name/size/received),持久化到partials.json;
+     *  发送端断线重连后发file_query,接收端凭它找到半成品继续追加,而不是推倒重来 */
     public synchronized void putPartial(String mid, String path, String name, long size, long received) {
         if (mid == null || mid.isEmpty() || path == null || path.isEmpty()) {
             return;
@@ -2477,10 +2284,8 @@ public final class Store {
     }
 
     /**
-     * 清理孤儿半成品：发送端取消时取消帧丢失、或接收端重启后 mid 对不上，
-     * 这类条目永远不会被 file_query 命中。启动时清掉「超过 maxAgeMs 未更新」的条目
-     * （连同半成品文件一起删）；无 ts 的旧版条目一并视为过期。
-     */
+     * 清理孤儿半成品:发送端取消时取消帧丢失、或接收端重启后mid对不上,这类条目永远不会被file_query命中。
+     * 启动时清掉"超过maxAgeMs未更新"的条目(连同半成品文件一起删);无ts的旧版条目一并视为过期 */
     public synchronized void purgeStalePartials(long maxAgeMs) {
         try {
             Map<String, Object> all = loadPartials();
@@ -2543,21 +2348,10 @@ public final class Store {
     }
 
     /**
-     * 数据根目录（2026-09-21 改版）——
-     * **`%APPDATA%\PhonePcTransfer`**（Windows；其它平台回退 `~/.phonepctransfer`）。
-     *
-     * <p>为什么从「程序目录」搬到这里：以前数据就写在程序旁边（源码运行 = `pc/`，
-     * MSI 安装版 = 安装根目录 `%LOCALAPPDATA%\手机电脑互传\`）。而 MSI 升级是
-     * **卸旧装新**（jpackage 的 MajorUpgrade），安装目录连同 `config.json` / `history/` /
-     * 待发队列一起被删干净 —— 升一次级设备列表与聊天记录就没了。放用户数据目录后，
-     * 升级 / 重装 / 卸载都不碰它（卸载想清数据得用户自己删目录）。
-     *
-     * <p>覆盖方式（自检、多实例并存）：`-Dphonepctransfer.home=<dir>` 或环境变量
-     * `PHONEPCTRANSFER_HOME`；给了就**不做**旧数据搬迁，完全按指定目录来。
-     *
-     * <p>首次运行会把老位置的数据**搬一份过来**（见 {@link #migrateLegacyData}）：
-     * 老配置 + 设备列表 + 全部聊天历史，都是复制不是移动，老目录原样留着。
-     */
+     * 数据根目录——%APPDATA%\PhonePcTransfer(Windows;其它平台回退~/.phonepctransfer)。
+     * <p>为什么放这里:MSI升级是卸旧装新(jpackage的MajorUpgrade),写在程序旁边的数据(config/history/待发队列)会随安装目录被删干净;用户数据目录升级/重装/卸载都不碰它(卸载想清数据得用户自己删目录)。
+     * <p>覆盖方式(自检、多实例并存):-Dphonepctransfer.home=<dir>或环境变量PHONEPCTRANSFER_HOME;给了就**不做**旧数据搬迁,完全按指定目录来。
+     * <p>首次运行会把老位置的数据搬一份过来(见{@link #migrateLegacyData}):老配置+设备列表+全部聊天历史,复制不移动,老目录原样留着 */
     public static Path defaultRoot() {
         Path root = explicitRoot();
         if (root != null) {
@@ -2597,22 +2391,13 @@ public final class Store {
     private static final String MIGRATED_FLAG = ".migrated-into-appdata";
 
     /**
-     * 把「程序目录时代」的数据搬进新数据目录（**只做一次**，且只复制不删除）。
-     *
-     * <p>旧位置候选：当前工作目录（源码运行 = `pc/`；MSI 安装版 = 安装根目录，实测就是
-     * `%LOCALAPPDATA%\手机电脑互传\`）、`<cwd>/pc`、`%LOCALAPPDATA%\手机电脑互传`、`~/手机电脑互传`。
-     *
-     * <p>搬迁规则（以**最近用过**的那份配置为底，其余只补空缺）：
-     * <ol>
-     *   <li>配置：选 `peers[].lastSeenAt` 最大的那份当底（保留本机 deviceId / 端口 / 保存位置等设置），
-     *       其余旧配置的**设备列表、绑定表、备注、组当前地址、旋转角**按「补空缺」并进来；</li>
-     *   <li>历史：逐个旧目录的 `history/*.jsonl` 拷进来；目标已有同名文件时**按 mid 去重后追补**缺的行
-     *       （不覆盖已有行，也不丢另一台机器上聊过的那几条）；</li>
-     *   <li>待发队列 `pending.jsonl` 同样按 mid 去重合并；`partials.json`（断点续传进度）仅当目标没有时拷一份。</li>
-     * </ol>
-     *
-     * <p>失败一律只记日志、不影响启动 —— 数据搬迁不该拦着用户用软件。
-     */
+     * 把"程序目录时代"的数据搬进新数据目录(只做一次,只复制不删除)。
+     * <p>旧位置候选:当前工作目录(源码运行=pc/;MSI安装版=安装根目录)、<cwd>/pc、%LOCALAPPDATA%\手机电脑互传、~/手机电脑互传。
+     * <p>搬迁规则(以最近用过的那份配置为底,其余只补空缺):
+     * ①配置:选peers[].lastSeenAt最大的那份当底(保留本机deviceId/端口/保存位置等),其余旧配置的设备列表、绑定表、备注、组当前地址、旋转角按"补空缺"并进来;
+     * ②历史:逐个旧目录的history/*.jsonl拷进来;目标已有同名文件时按mid去重后追补缺的行(不覆盖已有行,也不丢另一台机器上聊过的那几条);
+     * ③待发队列pending.jsonl同样按mid去重合并;partials.json(断点续传进度)仅当目标没有时拷一份。
+     * <p>失败一律只记日志、不影响启动——数据搬迁不该拦着用户用软件 */
     private static void migrateLegacyData(Path root) {
         try {
             Path flag = root.resolve(MIGRATED_FLAG);
@@ -2647,8 +2432,8 @@ public final class Store {
                     + (best <= 0 ? "未知" : new java.text.SimpleDateFormat("MM-dd HH:mm").format(new java.util.Date(best)))
                     + "），新数据目录 " + root);
 
-            // ② 其余旧配置的设备/绑定/备注等「补空缺」并进新配置（复用 Store 自己的读写，
-            //    不手搓 JSON：load() 认结构、save() 落盘，改一处两边都对）
+            // ②其余旧配置的设备/绑定/备注等"补空缺"并进新配置(复用Store自己的读写,
+            //    不手搓JSON:load()认结构、save()落盘,改一处两边都对)
             if (legacy.size() > 1) {
                 Store tmp = new Store(root);
                 tmp.load();
@@ -2660,7 +2445,7 @@ public final class Store {
                 tmp.save();
             }
 
-            // ③ 历史 / 待发 / 续传进度
+            // ③历史/待发/续传进度
             int files = 0;
             for (Path p : legacy) {
                 files += copyHistoryDir(p.resolve("history"), root.resolve("history"));
@@ -2679,7 +2464,7 @@ public final class Store {
         }
     }
 
-    /** 旧数据目录候选（按「最可能」排序）：cwd → cwd/pc → %LOCALAPPDATA%\手机电脑互传 → ~/手机电脑互传 */
+    /** 旧数据目录候选(按"最可能"排序):cwd→cwd/pc→%LOCALAPPDATA%\手机电脑互传→~/手机电脑互传 */
     private static List<Path> legacyRoots() {
         java.util.LinkedHashSet<Path> out = new java.util.LinkedHashSet<Path>();
         Path cwd = Paths.get("").toAbsolutePath();
@@ -2693,7 +2478,7 @@ public final class Store {
         return new ArrayList<Path>(out);
     }
 
-    /** 一份 config.json 里 peers 的最大 lastSeenAt（读不动就返回 0） */
+    /** 一份config.json里peers的最大lastSeenAt(读不动就返回0) */
     private static long configLastSeen(Path cfg) {
         try {
             Map<String, Object> m = Json.parseObject(
@@ -2715,9 +2500,7 @@ public final class Store {
     }
 
     /**
-     * 把另一份旧配置里「本机还缺」的设备与状态并进来（**只补空缺，不覆盖**）：
-     * 设备列表按 IP、绑定表按 IP、备注/组当前地址/旋转角按组键。
-     */
+     * 把另一份旧配置里"本机还缺"的设备与状态并进来(只补空缺,不覆盖):设备列表按IP、绑定表按IP、备注/组当前地址/旋转角按组键 */
     private void mergeConfigFrom(Path cfg) {
         try {
             Map<String, Object> m = Json.parseObject(
@@ -2745,9 +2528,8 @@ public final class Store {
             mergeStringMap(m, "deviceRemarks", deviceRemarks);
             mergeStringMap(m, "groupCurIp", groupCurIp);
             mergeStringMap(m, "rotRemote", rotRemote);
-            // 标量设置也「只补空缺」：底那份为空（用户没设过）而另一份设过 → 用设过的那份。
-            // 典型：安装版没改过保存目录（saveDir=""），源码版设过 D:\Downloads —— 不能让用户
-            // 升一次级就把接收位置丢了。底那份有值的一律不动（那是用户在那台机器上的选择）。
+            // 标量设置也只补空缺:底那份为空(用户没设过)而另一份设过⇒用设过的那份。
+            // 典型:安装版没改过保存目录(saveDir=""),源码版设过D:\Downloads——不能让用户升一次级就把接收位置丢了。底那份有值的一律不动(那是用户在那台机器上的选择)
             if (saveDir().isEmpty()) {
                 String v = Json.str(m, "saveDir", "").trim();
                 if (!v.isEmpty()) {
@@ -2790,7 +2572,7 @@ public final class Store {
         }
     }
 
-    /** 把一个旧 history 目录里的 *.jsonl 拷进新目录；同名文件按 mid 去重追补。返回新拷的份数 */
+    /** 把一个旧history目录里的*.jsonl拷进新目录;同名文件按mid去重追补。返回新拷的份数 */
     private static int copyHistoryDir(Path from, Path to) {
         if (!Files.isDirectory(from)) {
             return 0;
@@ -2812,7 +2594,7 @@ public final class Store {
         return copied;
     }
 
-    /** 行分隔 JSON 合并：目标里没有的 mid 才追加（避免同一台设备的记录两边各半、合并后重复） */
+    /** 行分隔JSON合并:目标里没有的mid才追加(避免同一台设备的记录两边各半、合并后重复) */
     private static void mergeJsonl(Path src, Path dest) {
         if (!Files.isRegularFile(src)) {
             return;

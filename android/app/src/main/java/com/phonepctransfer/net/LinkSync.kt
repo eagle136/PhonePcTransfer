@@ -38,9 +38,7 @@ import java.util.concurrent.locks.ReentrantLock
 
 import com.phonepctransfer.net.Link.Session
 
-// ======================================================================
-// 待发队列与 hsync 历史同步（v2.7 拆分自 Link.kt）。全部为 Link 的扩展函数。
-// ======================================================================
+// 待发队列与 hsync 历史同步(拆分自 Link.kt);全部为 Link 扩展函数
 
 internal fun Link.resendPendingFile(uri: Uri, p: MsgItem) {
         val s = sessionByGroup(p.peerIp)
@@ -73,10 +71,8 @@ internal fun Link.queuePending(item: MsgItem) {
     }
 
     /**
-     * 补发待发队列。
-     *
-     * @param onlyIp 非空时只补发**目的设备是它**的条目 —— 别的设备的条目留在队列里，
-     *   等它们自己连上再发。这样"补发"也不会把 A 的内容发到 B。
+     * 补发待发队列。onlyIp 非空 = 只补发目的设备是它的条目(别的设备条目留在队列,
+     * 等它们自己连上再发,「补发」也不会把 A 的内容发到 B)
      */
 internal fun Link.flushPendingNow(onlyIp: String?) {
         val st = store ?: return
@@ -122,9 +118,8 @@ internal fun Link.flushPendingNow(onlyIp: String?) {
                         st.removePending(p.mid)
                         continue
                     }
-                    // 已完整送达过的条目当场出队（2026-10-01 重复投递根源修）：
-                    // 补发与对端 hsync_pull 点名要同一条时，两条都会往同一条串行队列塞任务，
-                    // 前一个跑完 inFlight 就空了 → 同一条文件被发两遍。判据见 [isFileDelivered]。
+                    // 已完整送达过的条目当场出队(重复投递根源修):
+                    // 补发与对端 hsync_pull 点名要同一条时,两条都往同一条串行队列塞任务,前一个跑完 inFlight 就空了 → 同一条文件被发两遍(判据见 [isFileDelivered])
                     if (isFileDelivered(p.mid, p.peerIp)) {
                         st.removePending(p.mid)
                         log("待发条目 ${p.fileName} 此前已完整送达，直接出队")
@@ -132,16 +127,12 @@ internal fun Link.flushPendingNow(onlyIp: String?) {
                     }
                     if (sessionForPending(p.peerIp) == null) continue
                     val uri = runCatching { Uri.parse(p.filePath) }.getOrNull() ?: continue
-                    // v2.7：**补发与手动发送走同一道数据流量闸门** —— 重连后自动补发同样
-                    // 「每次使用都提醒一次」，绝不因为用户没盯着屏幕就偷偷花流量。
-                    // 确认会阻塞等本机用户点、还要等对端 data_ans（最长 90s），而本方法的调用点里
-                    // 有 io{}（pp-send 单线程）——在那里阻塞会把整个发送队列卡死 → 整条补发甩到专用线程。
-                    // 条目仍留在待发队列，直到发送成功（doSendFile/doSendFolder 内部移除）；
-                    // 若同 mid 已在途（补发撞上在途传输），inFlight 守卫会让本次直接返回。
+                    // 补发与手动发送走同一道数据流量闸门(重连后自动补发同样「每次使用都提醒一次」,绝不偷偷花流量);
+                    // 确认会阻塞等本机用户点、还要等对端 data_ans(最长 90s),而调用点在 pp-send 单线程 io{}——在那里阻塞会把整个发送队列卡死 → 整条补发甩到专用线程;
+                    // 条目仍留在待发队列直到发送成功(doSendFile/doSendFolder 内部移除);若同 mid 已在途,inFlight 守卫会让本次直接返回
                     sent++
-                    // 与用户手动发送共用**同一条串行队列**（2026-09-21 排队发送）：
-                    // 补发不会与在途传输并行，仍然一次只传一个文件 —— 老写法各起一条线程，
-                    // 一次握手就能同时开几十条补发流，正是"几十个文件一起发就乱"的来源之一。
+                    // 与用户手动发送共用同一条串行队列:补发不会与在途传输并行,仍然一次只传一个文件
+                    //（老写法各起一条线程,一次握手就能同时开几十条补发流,正是"几十个文件一起发就乱"的来源）
                     enqueueFileSend("补发 ${p.fileName}") { resendPendingFile(uri, p) }
                 }
             }
@@ -151,25 +142,18 @@ internal fun Link.flushPendingNow(onlyIp: String?) {
         }
     }
 
-    // ==================== 历史同步（hsync，v2.3）====================
+    // ==================== 历史同步（hsync）====================
 
     /**
-     * 以**统一消息 id（mid）为唯一判据**的双端聊天内容对齐：
-     *
-     *   握手(hs=1) → 双方各发 hsync_mids（本机持有的该对端 mid 清单）
-     *             → 各自算差集 → hsync_pull 请求缺失项
-     *             → 对端补发：文本走 hsync_msg（方向按对端视角翻转）；
-     *               文件沿用 file_meta/chunks/file_done 管线按**原 mid** 重发
-     *             → 接收端按 mid 查重落库（历史/待发/气泡三处共用同一判据）
-     *
-     * 这样无论消息是「发了没送到」还是「一端清空/重装丢了」，下次连上自动补齐；
-     * 重放/重发也不会产生重复气泡。只在双方 hello 广播 hs=1 时启用（老端不认识这些帧，
-     * 走 default 只记日志，天然兼容）。
+     * 以**统一消息 id（mid）为唯一判据**的双端聊天内容对齐:
+     * 握手(hs=1)→双方各发 hsync_mids(本机持有的该对端 mid 清单)→各自算差集→hsync_pull 请求缺失项
+     * →对端补发(文本走 hsync_msg,文件沿用 file 管线按原 mid 重发)→接收端按 mid 查重落库(历史/待发/气泡三处共用同一判据)。
+     * 无论消息「发了没送到」还是「一端清空/重装丢了」,下次连上自动补齐;重放/重发也不会产生重复气泡。只在双方 hello 广播 hs=1 时启用(老端不认识这些帧,天然兼容)
      */
 internal fun Link.startHsync(s: Session) {
         if (!s.handshaked || s.closed) return
         val st = store ?: return
-        // v2.4 收窄：hsync 只对账「文本 + 图片」——非图片文件与文件夹**绝不**跨端补齐
+        // hsync 只对账「文本 + 图片」——非图片文件与文件夹**绝不**跨端补齐
         //（未完成的传输由待发队列 + 断点续传兜底，与消息状态无关）
         val mids = st.loadHistory(s.remoteIp, Link.HSYNC_SCAN)
             .filter { hsyncSyncable(it) && it.mid.isNotEmpty() }
@@ -261,15 +245,13 @@ internal fun Link.onHsyncMsg(s: Session, j: JSONObject) {
     }
 
     /**
-     * 按原 mid 重发一条历史文件消息（hsync 补齐用）。
-     * 沿用 doSendFile 管线：断点续传、sha256 校验、待发兜底全部复用；
-     * 接收端凭 file_meta 里的原 mid 生成气泡 —— 内容与 mid 双双对齐。
+     * 按原 mid 重发一条历史文件消息(hsync 补齐用):沿用 doSendFile 管线(断点续传、sha256 校验、待发兜底全部复用);
+     * 接收端凭 file_meta 里的原 mid 生成气泡——内容与 mid 双双对齐
      */
 internal fun Link.resendHistoryFile(s: Session, m: MsgItem): Boolean {
         if (inFlight.contains(m.mid)) return false
-        // 本次进程已经把它完整送达过 → 不再重发（2026-10-01 重复投递根源修）。
-        // 对端的「缺失清单」是在它自己的握手时刻算的，很可能早于我们刚跑完的那次补发；
-        // 真丢了（重装/清历史）的情况极少，且手机进程重启后台账即清，下次握手照常补齐。
+        // 本次进程已经把它完整送达过 → 不再重发(重复投递根源修);
+        // 对端的「缺失清单」是在它自己的握手时刻算的,很可能早于我们刚跑完的那次补发;真丢了(重装/清历史)极少,且手机进程重启后台账即清,下次握手照常补齐
         if (isFileDelivered(m.mid, s.remoteIp)) {
             log("历史补齐 ${m.fileName} 本机已完整送达，跳过重发")
             return false
@@ -294,8 +276,8 @@ internal fun Link.resendHistoryFile(s: Session, m: MsgItem): Boolean {
             return false
         }
         runCatching { probe.close() }
-        // 与其它文件发送共用同一条串行队列（2026-09-21）：hsync 补图也不许与在途传输并行。
-        // 入队即返回 true（= 已受理）—— 真正的失败在队列线程里记日志并清掉待发兜底。
+        // 与其它文件发送共用同一条串行队列:hsync 补图也不许与在途传输并行。
+        // 入队即返回 true(= 已受理)—— 真正的失败在队列线程里记日志并清掉待发兜底。
         enqueueFileSend("历史补齐 ${m.fileName}") {
             try {
                 // 不入待发兜底之前的 emit：气泡本端本来就有（历史里那条），进度更新按 mid 合并
@@ -309,8 +291,8 @@ internal fun Link.resendHistoryFile(s: Session, m: MsgItem): Boolean {
     }
 
     /**
-     * 一条历史消息是否参与 hsync 对账/补齐：**只有文本和图片**（v2.4 收窄）。
-     * 文件与文件夹绝不跨端补齐 —— 未完成的传输走待发队列 + 断点续传，已完成的与消息状态无关。
+     * 一条历史消息是否参与 hsync 对账/补齐:**只有文本和图片**。
+     * 文件与文件夹绝不跨端补齐——未完成的传输走待发队列 + 断点续传,已完成的与消息状态无关
      */
 internal fun Link.hsyncSyncable(m: MsgItem): Boolean =
         when {
@@ -321,8 +303,8 @@ internal fun Link.hsyncSyncable(m: MsgItem): Boolean =
         }
 
     /**
-     * 对端删除了若干文本/图片：本端把界面气泡、历史、待发三处一起移除。
-     * 只处理本地，**不再回传** msg_del —— 无回环。对未知 mid 幂等（nothing to do）。
+     * 对端删除了若干文本/图片:本端把界面气泡、历史、待发三处一起移除;
+     * 只处理本地,**不再回传** msg_del(无回环),对未知 mid 幂等
      */
 internal fun Link.onRemoteMsgDel(s: Session, j: JSONObject) {
         val st = store ?: return

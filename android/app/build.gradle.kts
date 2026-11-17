@@ -15,14 +15,22 @@ val keystoreProps = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 
+// storeFile 两种写法都要认：CI 相对 signing/ 写（ci-release.jks），
+// 本地工作区那份 keystore.properties 是相对工作区根写的（signing/gps-signing.jks）。
+fun keystoreFile(): File {
+    val rel = keystoreProps.getProperty("storeFile") ?: "gps-signing.jks"
+    val byDir = signingDir.resolve(rel)
+    if (byDir.exists()) return byDir
+    return rootProject.file("../..").resolve(rel)
+}
+
 android {
     signingConfigs {
         create("projectKey") {
-            storeFile = signingDir.resolve(keystoreProps.getProperty("storeFile") ?: "gps-signing.jks")
+            storeFile = keystoreFile()
             storePassword = keystoreProps.getProperty("storePassword")
             keyAlias = keystoreProps.getProperty("keyAlias")
             keyPassword = keystoreProps.getProperty("keyPassword")
-            keyPassword = keystoreProps["keyPassword"] as String?
         }
     }
     namespace = "com.phonepctransfer"
@@ -34,13 +42,13 @@ android {
         applicationId = "com.phonepctransfer"
         minSdk = 28
         targetSdk = 37
-        // versionCode 走「major*10000 + minor*100 + patch」＝ 10100，保证严格递增
+        // versionCode 走「major*10000 + minor*100 + patch」＝ 10200，保证严格递增
         // （同签名覆盖安装认 versionCode，必须 ≥ 已装版本）。
-        // 2026-10-01 收尾定版：对外 1.1，内部仍为 10100（= 1.1 口径，两者对应）。
-        // CI 通过 -PppVersionName=1.1.<run> -PppVersionCode=10100+<run> 注入，
+        // 2026-11-17 升版：对外 1.2，内部 10200（= 1.2 口径，两者对应；上一版是 1.1/10100）。
+        // CI 通过 -PppVersionName=1.2.<run> -PppVersionCode=10200+<run> 注入，
         // 保证每次 Release 的 versionCode 单调递增。
-        versionCode = (project.findProperty("ppVersionCode") as String?)?.toInt() ?: 10100
-        versionName = (project.findProperty("ppVersionName") as String?) ?: "1.1"
+        versionCode = (project.findProperty("ppVersionCode") as String?)?.toInt() ?: 10200
+        versionName = (project.findProperty("ppVersionName") as String?) ?: "1.2"
 
         // 只保留中英文资源
         resourceConfigurations.addAll(listOf("zh", "zh-rCN", "zh-rTW", "en"))

@@ -36,19 +36,13 @@ import com.phonepctransfer.AppCore
 import com.phonepctransfer.data.PeerGroup
 
 /**
- * 从系统「分享」进来后的目标设备选择框。
- *
- * 流程：别的应用点分享 → 选中本应用 → 这里选一台设备 → 定向连接该设备并立刻开始传输
- *（选完即在前台看着进度走）。候选就是左侧设备列表里的那几台，已连接的那台默认选中。
- *
- * 状态放在 [AppCore.pendingShare]，所以应用冷启动 / 已在后台被 singleTask 唤起两条路径
- * 都能落到同一个弹窗上。
+ * 从系统「分享」进来后的目标设备选择框：别的应用点分享 → 选中本应用 → 这里选一台设备 → 定向连接该设备并立刻开始传输（选完即在前台看着进度走）。
+ * 候选就是左侧设备列表里的那几台，已连接的那台默认选中；状态放在 [AppCore.pendingShare]，冷启动 / 已在后台被 singleTask 唤起两条路径都能落到同一个弹窗。
  */
 @Composable
 fun ShareTargetDialog() {
     val payload = AppCore.pendingShare ?: return
-    // 选目标按**设备**（组）而不是按地址：同一台机器有多个地址时只列一条，
-    // 实际走它当前使用的那个地址（见 AppCore.shareTo）
+    // 选目标按设备（组）而不是按地址：同一台机器有多个地址时只列一条，实际走它当前使用的那个地址（见 AppCore.shareTo）
     val peers = AppCore.peerGroups
 
     var picked by remember(payload) {
@@ -104,9 +98,7 @@ fun ShareTargetDialog() {
 
                 if (!AppCore.lanInfo.available) {
                     Spacer(Modifier.size(6.dp))
-                    // 「⚠」→ 矢量 [Glyph.WARN]（2026-09-19 去 emoji）。Row 默认顶对齐：
-                    // 这段文字会折成好几行，图标留在**第一行**左侧才像「警告标记」，
-                    // 垂直居中会让它飘在整段文字的中间。
+                    // 「⚠」→ 矢量 [Glyph.WARN]（去 emoji）。Row 默认顶对齐：这段文字会折成好几行，图标留在第一行左侧才像「警告标记」（垂直居中会飘在整段文字中间）。
                     Row {
                         GlyphIcon(
                             Glyph.WARN,

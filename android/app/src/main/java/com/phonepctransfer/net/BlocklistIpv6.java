@@ -12,7 +12,7 @@ public final class BlocklistIpv6 {
     public static final String SOURCE_FILE = "highrisk_ipv6_blocklist.txt";
     /** 数据指纹：按「前缀长度/起始值」规范序逐行 sha256，与源文件行序无关 */
     public static final String DATA_SHA256 = "b57ece2543d97de95836e26729d2a9d60f17a1d281ba9b3ecbb59b7593b1945a";
-    /** 生成时间（本文件由 tools/ipdata/GenBlocklist.java 产出，勿手工编辑） */
+    /** 生成时间 */
     public static final String GENERATED_AT = "2026-10-01 02:54:11";
 
     private static final int[] PLEN = {29, 30, 31, 32, 40, 46, 47, 48};
@@ -2245,12 +2245,7 @@ public final class BlocklistIpv6 {
 
     private BlocklistIpv6() { }
 
-    /**
-     * 对端地址是否命中高风险清单。
-     *
-     * 一律返回 false 的情形（宁漏不误伤）：纯 IPv4、IPv4 映射地址（::ffff:x.x.x.x）、
-     * 回环 ::1、未指定 ::、fe80::/10 链路本地、fc00::/7 ULA、解析不了的字符串。
-     */
+    /** 对端地址是否命中高风险清单（宁漏不误伤:纯IPv4/映射地址/回环/未指定/链路本地/ULA/解析不了都返false） */
     public static boolean isHighRisk(String addr) {
         long[] v = parse(addr);
         if (v == null) {

@@ -117,9 +117,9 @@ final class LinkNames {
 
     /**
      * **原子**创建不重名文件（返回已创建好的空文件），自动追加 " (1)"、" (2)" 序号。
-     * 旧写法「exists 检查→返回路径→调用方创建」存在 TOCTOU 竞态窗口：两台设备同时传
-     * 同名文件时可能拿到同一路径，两个 FileOutputStream 交错写把文件写坏。
-     * 现在用 Files.createFile 的原子性：谁先创建成功谁用，失败者自动换下一个名字。
+     * 「exists 检查→返回路径→调用方创建」存在 TOCTOU 竞态窗口:两台设备同时传
+     * 同名文件时可能拿到同一路径,两个 FileOutputStream 交错写把文件写坏;
+     * 用 Files.createFile 的原子性:谁先创建成功谁用,失败者自动换下一个名字。
      * 保存目录可以由用户改成「下载」这类已有大量文件的目录，直接覆盖会毁掉旧文件。
      */
     static File createUniqueFile(File dir, String name) throws java.io.IOException {

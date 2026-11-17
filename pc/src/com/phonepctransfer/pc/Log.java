@@ -17,10 +17,10 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * 简单文件日志（同时输出到控制台，便于 javaw 场景下排查）。
  *
- * **异步化（任务单 1.6）**：调用线程只做「new 一条 Entry + 入有界队列」，
+ * **异步化**：调用线程只做「new 一条 Entry + 入有界队列」，
  * 时间戳格式化、System.out、磁盘追加写全在 pp-log-writer 线程上成批做。
- * 旧写法每行都在**调用线程**上做一次文件追加写，还带一把全局锁 —— 通话时缺帧类
- * 日志最高 ~33 行/s，磁盘一抖就把播放线程一起拖住（方案 §2.4㉒：日志自己是抖动源）。
+ * 逐行在**调用线程**上同步做文件追加写还带一把全局锁的话 —— 通话时缺帧类
+ * 日志最高 ~33 行/s，磁盘一抖就把播放线程一起拖住（日志自己是抖动源）。
  *
  * 队列满（磁盘卡住）时丢**新行并计数**，writer 在下一批最前面标出被丢的条数；
  * 丢日志只影响观测，绝不影响通话与传输。JVM 退出前尽力排空（shutdown hook，2s 上限）。
@@ -161,7 +161,7 @@ public final class Log {
         String nl = System.lineSeparator();
         StringBuilder sb = new StringBuilder(64 * (batch.size() + 1));
         if (lost > 0L) {
-            // 汇总必须带上被丢条数（任务单 1.6 自查项），不许只留最后一条
+            // 汇总必须带上被丢条数，不许只留最后一条
             sb.append("[log] 队列已满，丢弃 ").append(lost).append(" 行").append(nl);
         }
         for (int i = 0; i < batch.size(); i++) {

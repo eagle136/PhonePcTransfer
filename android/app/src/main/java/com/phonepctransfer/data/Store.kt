@@ -7,12 +7,7 @@ import org.json.JSONObject
 import java.io.File
 import java.nio.charset.StandardCharsets
 
-/**
- * 消息历史 + 待发队列的本地持久化（JSONL 追加写）。
- *  - `history/<对端IP>.jsonl` 每个设备一个文件，最近 500 条 —— 聊天记录按设备隔离，
- *    A→B 的内容不会出现在 C 的记录里（与 PC 端同构）
- *  - `pending.jsonl` 未送达的主动发送项（每条自带 peer），重连或手动同步时**按设备**补发
- */
+/** 消息历史 + 待发队列本地持久化（JSONL 追加写）：历史按设备分文件（最近 500 条），pending.jsonl 重连/手动同步时按设备补发 */
 class Store(ctx: Context) {
 
     /** 清理半成品文件时要走 ContentResolver，留着应用上下文 */
@@ -29,10 +24,7 @@ class Store(ctx: Context) {
         migrateLegacyHistory(ctx)
     }
 
-    /**
-     * 老版本把所有设备的历史混写在 `filesDir/history.jsonl` 里，无法反推每条属于谁。
-     * 不猜归属，直接改名归档（`history.legacy-<时间戳>.jsonl`），避免它污染按设备分文件的读取。
-     */
+    /** 旧版混合历史无法反推归属：改名归档，不污染按设备分文件的读取 */
     private fun migrateLegacyHistory(ctx: Context) {
         runCatching {
             val old = File(ctx.filesDir, "history.jsonl")
@@ -55,14 +47,7 @@ class Store(ctx: Context) {
         return if (v.isEmpty()) "_unknown" else v
     }
 
-    /**
-     * 「消息归属地址 → 会话组键」解析器，由 AppCore 注入（= Prefs.convKeyOf）。
-     *
-     * 为什么要解耦成回调：历史文件必须与**设备**对齐而不是与 IP 对齐 ——
-     * 同一台设备换网卡/换 WiFi 后 IP 变了，聊天记录不该跟着断成两份
-     * （2026-09-16 用户定调：多 IP 同设备自动成组）。
-     * Store 本身不认识 Prefs，所以由上层注入；未注入时按 IP 处理（= 改造前行为）。
-     */
+    /** 「消息归属地址 → 会话组键」解析器，由 AppCore 注入（历史跟设备走不跟 IP 走；未注入时回退按 IP = 改造前行为） */
     @Volatile
     var keyResolver: ((String) -> String)? = null
 
@@ -81,19 +66,12 @@ class Store(ctx: Context) {
         val ip = peerIp.trim()
         val k = keyOf(ip)
         val f = File(histDir, safeKey(if (k.isEmpty()) ip else k) + ".jsonl")
-        // 组键 ≠ IP 说明这台设备的身份已经确认 → 把旧版按 IP 存的历史并进组文件。
-        // lazy 做（第一次真正读写这个设备时才动），失败保留旧文件、下次仍可读。
+        // 组键 ≠ IP 说明身份已确认 → 把旧版按 IP 存的历史 lazy 并进组文件（失败保留旧文件，下次仍可读）
         if (k.isNotEmpty() && k != ip) mergeLegacyHistory(ip, f)
         return f
     }
 
-    /**
-     * 把 `history/<ip>.jsonl` 并入 `history/<设备id>.jsonl`（一次性）。
-     *
-     * 合并策略：整读整写（两个文件都只有最近若干行，成本可忽略）。
-     * 只有写成功才删旧文件 —— 写失败时旧文件留着，[loadHistory] 仍能读到内容，
-     * 不会出现「记录凭空消失」。
-     */
+    /** 把 `history/<ip>.jsonl` 并入 `history/<设备id>.jsonl`（一次性；整读整写，只有写成功才删旧文件） */
     private fun mergeLegacyHistory(ip: String, dest: File) {
         if (ip.isEmpty()) return
         val legacy = File(histDir, safeKey(ip) + ".jsonl")
@@ -131,13 +109,7 @@ class Store(ctx: Context) {
         }
     }
 
-    /**
-     * 读取**指定设备**最近 max 条历史。
-     *
-     * **按 mid 合并去重（后行胜出）**：同一条消息可能因「file_meta 时落一次、
-     * file_done 终态再补一次」在文件里有多行 —— 加载时合成一条，空字段用前行补齐。
-     * 这同时治愈早期版本留下的重复行（重复 mid 进 LazyColumn 会直接崩）。
-     */
+    /** 读取指定设备最近 max 条历史；按 mid 合并去重（后行胜出，兼治早期版本重复行） */
     fun loadHistory(peerIp: String, max: Int = 500): List<MsgItem> {
         synchronized(lock) {
             val f = historyFile(peerIp)
@@ -162,10 +134,7 @@ class Store(ctx: Context) {
         }
     }
 
-    /**
-     * 统一消息 id 查重（2026-09-16）：该设备的历史里是否已有这条 mid。
-     * hsync 补齐与重复投递的判定**只认 mid**，与气泡、待发队列共用同一判据。
-     */
+    /** 该设备历史里是否已有此 mid（hsync 补齐/重复投递判据，与气泡、待发队列共用） */
     fun hasMid(peerIp: String, mid: String): Boolean {
         if (mid.isEmpty()) return false
         synchronized(lock) {
@@ -215,12 +184,7 @@ class Store(ctx: Context) {
         synchronized(lock) { runCatching { historyFile(peerIp).delete() } }
     }
 
-    /**
-     * 历史文件的组键清单（文件名去掉 `.jsonl`）。
-     *
-     * 「清空全部」用它兜住**不在设备名单里的孤立历史**（设备被删过、或换过 deviceId）——
-     * 那些记录没有任何候选地址能反查出来，只能按文件键去清。
-     */
+    /** 历史文件的组键清单（文件名去 .jsonl）；「清空全部」用它兜住不在设备名单里的孤立历史 */
     fun historyKeys(): List<String> =
         synchronized(lock) {
             runCatching {
@@ -231,14 +195,7 @@ class Store(ctx: Context) {
             }.getOrDefault(emptyList())
         }
 
-    /**
-     * 按 mid 批量删除**某一台设备**的历史（「清空会话」逐条删除用）：**一趟读、一趟写**。
-     *
-     * 为什么不循环调 [removeFromHistory]：那样每条都要把整个历史文件读一遍写一遍
-     * （N 条就是 N 次全文件重写，条数一多就是 O(N²) 的磁盘往返）。
-     * 这里只动**这台设备自己的文件**（按组键解析 → 同一台设备其它地址的往来也在同一份里），
-     * 不会波及别的设备。
-     */
+    /** 按 mid 批量删某设备的历史（「清空会话」用）：一趟读、一趟写，只动该设备自己的文件 */
     fun removeFromHistory(peerIp: String, mids: Collection<String>) {
         if (mids.isEmpty()) return
         synchronized(lock) {
@@ -264,12 +221,7 @@ class Store(ctx: Context) {
         }
     }
 
-    /**
-     * 按 mid 删除一条历史，**在所有设备的历史文件里找**。
-     *
-     * 取消文件的通知里只带 mid（协议里也不需要带归属），而历史是按设备分文件的，
-     * 所以直接扫一遍目录最省事：mid 是全局唯一随机串，命中即该条。
-     */
+    /** 按 mid 删一条（取消帧只带 mid）：直接扫全部设备历史文件，mid 全局唯一即命中 */
     fun removeFromHistory(mid: String) {
         if (mid.isEmpty()) return
         synchronized(lock) {
@@ -301,25 +253,7 @@ class Store(ctx: Context) {
 
     // ==================== 待发队列 ====================
 
-    /**
-     * 待发队列**变化通知**（AppCore 侧据此重算 `pendingCount`：聊天区底部
-     * 「待发送 N 条，连接后自动补发」横幅 + 前台通知副标题都读它）。
-     *
-     * 为什么必须有这条通道（2026-10-05 修，用户报「对方上线自动续传后界面不刷新，
-     * 切一下会话才变」）：待发条目的增删有一半发生在**链路层**，那条路径上没有任何
-     * `Listener.onMessageUpdated` ——
-     *  - 补发/续传跑完后，条目是由对端的 `ack` 帧驱动才出队的（`LinkSend.onSendAck`
-     *    → `store.removePending`），而出队那一刻界面收不到任何消息级回调；
-     *  - 同理 `flushPendingNow` 里「已送达 / 对端不在线」两种直接出队。
-     * AppCore 原先只在「消息新增 / 状态更新 / 消息移除」时重算 pendingCount，而
-     * **文件发送的终态帧（OK）比出队更早**，那一刻条目还在队列里 → 数字停在旧值上
-     * 再也回不去，只有换一次会话（[AppCore.reloadConversation] 会重算）才消失。
-     *
-     * 触发点只有 [writePending] 一处 —— 四条增删路径（addPending /
-     * removePending(mid) / removePending(mids) / clearPending）全部汇聚到它，
-     * 不漏也不重复。回调可能在任意线程（Store 的调用方包括 pp-send / pp-file-send），
-     * **回调里必须自己切线程**（AppCore 用 `ui{}`）。
-     */
+    /** 待发队列变化通知（AppCore 据此重算 pendingCount）；四条增删路径全部汇聚在 writePending，不漏不重复；回调可能在任意线程，执行方须自己切线程（ui{}） */
     @Volatile
     var onPendingChanged: (() -> Unit)? = null
 
@@ -339,10 +273,7 @@ class Store(ctx: Context) {
         }
     }
 
-    /**
-     * 按 mid 批量删待发（「清空会话」用）：**一趟读、一趟写**。
-     * 只删命中项 —— 别的设备没发出去的条目一条都不能少。
-     */
+    /** 按 mid 批量删待发（「清空会话」用）：一趟读、一趟写，只动命中项 */
     fun removePending(mids: Collection<String>) {
         if (mids.isEmpty()) return
         synchronized(lock) {
@@ -376,19 +307,13 @@ class Store(ctx: Context) {
                 StandardCharsets.UTF_8
             )
         }.onFailure { Log.w(TAG, "写待发队列失败: ${it.message}") }
-        // 待发队列变了 → 通知界面重算条数（见 [onPendingChanged]）。
-        // 放在 runCatching 之外：盘写失败也要通知（内存语义已变，界面按真实读盘结果重算）。
-        // ⚠ 调用方可能正持有 [lock]（addPending/removePending 都在 synchronized 块内）：
-        //   AppCore 的回调只是 `ui{...}`（主线程时同步执行 = 同线程可重入锁，不会死锁）。
+        // 队列变了 → 通知界面重算条数（盘写失败也要通知；调用方可能正持有 [lock]，回调只 ui{} 不递归，不死锁）
         runCatching { onPendingChanged?.invoke() }
     }
 
     // ==================== 断点续传：半成品注册表 ====================
 
-    /**
-     * 正在接收/未接收完的文件登记（mid → uri/name/size/received），持久化到 partials.json。
-     * 发送端断线重连后发 file_query，接收端凭它找到半成品继续追加，而不是推倒重来。
-     */
+    /** 登记正在接收/未收完的文件（mid → uri/name/size/received，持久化到 partials.json）；对端重连后凭它 file_query 续传 */
     fun putPartial(mid: String, uri: String, name: String, size: Long, received: Long) {
         if (mid.isEmpty() || uri.isEmpty()) return
         synchronized(lock) {
@@ -410,14 +335,9 @@ class Store(ctx: Context) {
         }
     }
 
-    /**
-     * 清理孤儿半成品：发送端取消时取消帧丢失、或接收端重启后 mid 对不上，
-     * 这类条目永远不会被 file_query 命中。启动时清掉「超过 maxAgeMs 未更新」的条目
-     * （连同半成品文件一起删）；无 ts 的旧版条目一并视为过期。
-     */
+    /** 清理孤儿半成品（取消帧丢失/重启后 mid 对不上，永不被 file_query 命中）：删「超过 maxAgeMs 未更新」条目连同文件 */
     fun purgeStalePartials(maxAgeMs: Long) {
-        // 会话中也会调用（断链/发送队列空闲，plan 07）：与 putPartial/removePartial 抢同一份
-        // partials.json，必须同锁，否则 purge 的整表回写会丢掉并发写入的新条目
+        // 会话中也会调用（断链/发送队列空闲）：与 putPartial/removePartial 抢同一份 partials.json，必须同锁
         synchronized(lock) {
             runCatching {
                 val cur = loadPartials()
@@ -464,15 +384,9 @@ class Store(ctx: Context) {
         }.onFailure { Log.w(TAG, "写半成品注册表失败: ${it.message}") }
     }
 
-    // ==================== 送达台账（同 mid 不重发，要扛进程重启） ====================
+    // ==================== 送达台账（同 mid 不重发，扛进程重启） ====================
 
-    /**
-     * 「这个 mid 已完整送达那台设备」的持久化台账，键 = `mid@设备组键`。
-     *
-     * 为什么必须落盘：只放内存的话，手机重启 / 进程被速冻杀掉就归零，下一次握手
-     * 待发队列和 hsync 补齐又会把同一个 mid 推一遍 —— 对端只能再存一份 `(1)`。
-     * 内存镜像 [delivered] 是为读写不碰磁盘，文件只是它的备份。
-     */
+    /** 「此 mid 已完整送达那台设备」台账（键 = mid@设备组键）：落盘扛进程重启，内存镜像 [delivered] 读写不碰盘 */
     private val delivered = LinkedHashMap<String, Long>()
     private var deliveredLoaded = false
 
@@ -529,13 +443,7 @@ class Store(ctx: Context) {
 
     // ==================== 接收侧查重 ====================
 
-    /**
-     * 本端是否已把这个 mid 存成过一条完整的收讫文件（与 PC 端 `savedFileOf` 同口径）。
-     *
-     * 只认「对端发来 + FILE + 非目录 + 状态 OK」，且留着 filePath 或 localUri。
-     * **文件还在不在、字节数对不对由调用方量** —— Store 不判断磁盘状态，
-     * 这样用户删掉收到的文件后同 mid 仍能正常重收。
-     */
+    /** 本端是否已把这个 mid 存成过完整收讫文件（与 PC 端 savedFileOf 同口径）；只认「对端发来 + FILE + 非目录 + OK」且留有 filePath/localUri；磁盘状态由调用方判 */
     fun savedFileOf(peerIp: String, mid: String): MsgItem? {
         if (mid.isEmpty()) return null
         synchronized(lock) {

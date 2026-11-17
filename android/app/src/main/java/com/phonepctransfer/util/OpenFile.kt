@@ -22,26 +22,12 @@ private const val TAG = "OpenFile"
 
 /**
  * 用**用户当场选的**程序打开聊天里收到的文件（非图片），并让本应用**记住**「这类文件用哪个程序」。
- *
- * 两条分支（[openOrAsk]）：
- *  - 本应用已记住这个 MIME → 用**显式组件** intent 直接启动那个程序（不再弹列表）；
- *  - 没记住 → 弹系统「打开方式」列表，并在列表带上回调，把用户这次点选的程序记下来。
- *
- * 为什么不用裸 `startActivity(ACTION_VIEW)`：裸启动会命中**系统**里已设的默认程序、不再询问，
- * 用户既改不了也没机会换别的程序；`Intent.createChooser` 则无论有没有默认程序都会弹列表
- * （官方 intents-filters 文档明确：即使之前已为该 intent 设过默认应用，选择器仍会显示）。
- * 记忆也不写回系统的默认应用表 —— 只在设置页「重置」即可全部清掉，仅本应用有效。
- *  - 完全没有能处理的程序 → 捕获 ActivityNotFoundException，toast 提示，不崩溃。
- *
- * **切勿用 `resolveActivity()` 预判能否打开**：Android 11+ 的包可见性过滤会让未声明
- * `<queries>` 的应用把它判成 null（哪怕系统里装着能打开的 App），从而误判为「没有程序」
- * 而放弃启动 —— 表现就是「点了文件一点反应都没有」。`startActivity` 本身不受该过滤限制，
- * 列表由系统解析进程（ChooserActivity）生成，同样不受本应用可见性限制，交回系统最可靠。
- * 命中记忆走的是显式组件 intent，也不受可见性限制，所以整套方案不需要加 `<queries>`。
- *
- * @param uriStr 文件地址：优先传 `MsgItem.localUri`（可被再次读取的地址），没有再用 filePath。
- *   其值要么是 content://（MediaStore 落盘，可直接授权外部应用读取），
- *   要么是绝对路径（API<29 或 MediaStore 失败回退），后者必须经 FileProvider 暴露。
+ * 两条分支（[openOrAsk]）：已记住该 MIME → 用**显式组件** intent 直接启动（不弹列表）；没记住 → 弹系统「打开方式」列表并记下用户点选的程序。
+ * 用 `Intent.createChooser` 而非裸 `startActivity(ACTION_VIEW)`（后者会命中系统默认程序、不再询问）；
+ * 记忆只在本应用内有效（设置页可重置），不写回系统默认应用表。
+ * **切勿用 `resolveActivity()` 预判**：Android 11+ 包可见性过滤会让未声明 `<queries>` 的应用误判为「没有程序」；`startActivity` 与 ChooserActivity 生成的列表都不受该限制，所以整套方案不需要 `<queries>`。
+ * 没有能处理的程序 → 捕获 ActivityNotFoundException，toast 提示。
+ * @param uriStr 文件地址：优先 `MsgItem.localUri`，没有再用 filePath。content://（MediaStore 落盘）可直接授权外部应用读取；绝对路径（API<29 或回退）必须经 FileProvider 暴露。
  * @param fileName 仅用于推断 MIME 类型。
  */
 fun openReceivedFile(ctx: Context, uriStr: String, fileName: String) {
@@ -61,11 +47,8 @@ fun openReceivedFile(ctx: Context, uriStr: String, fileName: String) {
     }
 
     // APK：与其它文件同一套（记住→直用，没记住→弹列表并记住）。
-    // Android 8+ 要求**发起安装的应用**先开「允许安装应用」
-    // 开关，未开启时系统安装器要么直接闪退要么报错（且各 ROM 表现不同）。
-    // 流程：已开启 → 弹选择安装程序；未开启 → 引导跳系统设置开一次（每应用一次性，之后不再提示）。
-    // `.apk.1 / .apk.2` 是**旧版本**遗留在下载目录里的名字（那时靠 MediaStore 去重，
-    // 它把数字追加在扩展名后面）；现在落盘自己算唯一名（`xx (1).apk`），但旧文件仍要能装。
+    // Android 8+ 要求**发起安装的应用**先开「允许安装应用」：已开启 → 弹选择安装程序；未开启 → 引导跳系统设置开一次（每应用一次性，之后不再提示）。
+    // `.apk.1 / .apk.2` 是历史遗留在下载目录里的名字（那时靠 MediaStore 去重，把数字追加在扩展名后面）；现在落盘自己算唯一名（`xx (1).apk`），但旧文件仍要能装。
     if (Regex("\\.apk(\\.\\d+)?$", RegexOption.IGNORE_CASE).containsMatchIn(fileName)) {
         openApk(ctx, uri)
         return
@@ -132,10 +115,8 @@ private fun startInstall(ctx: Context, uri: Uri) {
 }
 
 /**
- * 本应用记住过这个 MIME → 直接用显式组件启动那个程序；没记住 → 弹系统「打开方式」列表并记住点选。
- *
- * 显式组件 intent 不查 intent filter、也不受 Android 11+ 包可见性限制，所以命中记忆这条
- * 不需要 `<queries>`。启动失败（那个应用被卸载/停用）就把这条忘掉，退回弹列表重选。
+ * 本应用记住过这个 MIME → 直接用显式组件启动那个程序（显式组件 intent 不查 intent filter、也不受 Android 11+ 包可见性限制，这条不需要 `<queries>`）；
+ * 没记住 → 弹系统「打开方式」列表并记住点选。启动失败（那个应用被卸载/停用）就把这条忘掉，退回弹列表重选。
  */
 private fun openOrAsk(ctx: Context, target: Intent, mime: String, title: String) {
     val saved = AppCore.prefs.openerOf(mime)
@@ -148,10 +129,8 @@ private fun openOrAsk(ctx: Context, target: Intent, mime: String, title: String)
 }
 
 /**
- * 弹系统「打开方式」列表，并带上 `EXTRA_CHOSEN_COMPONENT_INTENT_SENDER` 回调：用户点选后，
- * 选择器把选中的组件用 `Intent.EXTRA_CHOSEN_COMPONENT` 填进这个 PendingIntent 再广播出去
- * （由 [OpenChoiceReceiver] 记账），**启动动作仍由选择器自己做** —— 所以我们只记，
- * 绝不再自己 start 一次（否则双开）。
+ * 弹系统「打开方式」列表，并带上 `EXTRA_CHOSEN_COMPONENT_INTENT_SENDER` 回调：用户点选后，选择器把选中的组件用 `Intent.EXTRA_CHOSEN_COMPONENT` 填进这个 PendingIntent 再广播出去
+ *（由 [OpenChoiceReceiver] 记账），**启动动作仍由选择器自己做**——所以我们只记，绝不再自己 start 一次（否则双开）。
  */
 private fun startActivityViaChooser(ctx: Context, target: Intent, mime: String, title: String) {
     val callback = Intent(ctx, OpenChoiceReceiver::class.java)
@@ -181,8 +160,7 @@ private fun startActivityViaChooser(ctx: Context, target: Intent, mime: String, 
 
 /**
  * 选择器的点选回调：把「这类文件 → 这个程序」记进**本应用自己的**偏好（不写系统的默认应用表，
- * 所以设置页一个「重置」就能全部清掉，且不影响系统里任何其它应用）。
- * 回调 intent 是显式指向本类的，`exported=false` 也收得到。
+ * 所以设置页一个「重置」就能全部清掉，且不影响系统里任何其它应用）；回调 intent 是显式指向本类的，`exported=false` 也收得到。
  */
 class OpenChoiceReceiver : BroadcastReceiver() {
 

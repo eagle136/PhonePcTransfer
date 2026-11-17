@@ -11,20 +11,13 @@ import com.phonepctransfer.util.CallClock
 import com.phonepctransfer.util.SegMeter
 
 /**
- * 视频通话会话编排（计划 §5）。
- *
+ * 视频通话会话编排。
  * 发送半：`Camera2 → GL 转正（GlRotatePipe）→ encoderSurface → MediaCodec → io{ AvTransport.sendVideo }`
- * （2026-09-22 二期起**发出的数据方向就是正的**，`video_cfg.rot` 恒发 0）
- * 接收半：`onVideoFrame(只入队) → MediaCodec → Surface(TextureView)`
+ *（发出的数据方向就是正的，`video_cfg.rot` 恒发 0）；接收半：`onVideoFrame(只入队) → MediaCodec → Surface(TextureView)`。
  * 自适应：`QualityController`（降档激进 / 升档四重闸门），接收侧每 2s 回 `video_fb`。
- *
- * ⚠ 线程红线（本项目已踩过两次，务必对照 §8）：
- *  - **网络读线程**只做入队（[onRemoteFrame]），解码器创建/相机打开全在各自线程；
- *  - 发视频帧一律走媒体模块 [AvTransport.sendVideo]（任务单 2.1：底下是五档里的哪一档由模块内部
- *    决定，本类不知道也不据此分支；2.1 落 INBAND ⇒ 底下仍是 `Link.sendVideoTo`，帧格式一字未变，
- *    内部不碰 UI 线程）；
- *  - 相机/编码器初始化在 `startSending` 的调用线程（CallManager 已放到 pp-call-audio 之外的
- *    独立线程路径）—— 不在读线程、不在主线程做重活。
+ * ⚠ 线程红线：**网络读线程**只做入队（[onRemoteFrame]），解码器创建/相机打开在各自线程；
+ * 发视频帧一律走 [AvTransport.sendVideo]（底下五档哪一档由模块内部决定，本类不知道）；
+ * 相机/编码器初始化在 `startSending` 的调用线程，不在读线程、不在主线程做重活。
  */
 class VideoCall(
     private val ctx: Context,
@@ -51,7 +44,7 @@ class VideoCall(
     private var sendPeerIp = ""
 
     /**
-     * 媒体传输模块（任务单 2.1：发送只走它，五档里的哪一档由模块内部决定）。
+     * 媒体传输模块：发送只走它，五档里的哪一档由模块内部决定。
      * 由 voice/CallManager 在建媒体会话时注入；未注入时**不发**（返回 -1 计入质量统计，
      * 不会绕过模块自己找 socket）。
      */
@@ -72,18 +65,14 @@ class VideoCall(
     private var glPipe: GlRotatePipe? = null
 
     /**
-     * 本地预览的 `SurfaceTexture`。
-     *
-     * 分辨率变化的切档后必须重设 `setDefaultBufferSize`（缓冲区尺寸 = 渲染侧算等比的依据，
+     * 本地预览的 `SurfaceTexture`：分辨率变化的切档后必须重设 `setDefaultBufferSize`（缓冲区尺寸 = 渲染侧算等比的依据，
      * 见 [attachLocalPreview]），所以要留着引用。只换码率的切档（L2↔L3 同为 1080P）不涉及。
      */
     private var previewSt: SurfaceTexture? = null
 
     /**
-     * 切档执行线程（**串行**）。
-     *
-     * ⚠ 切档必须在**独立线程**做，不能就地做：`QualityController.onChange` 是在
-     * `VideoEncoder` 的输出线程（`pp-video-enc`）回调里触发的，在那里 `stop()` 编码器
+     * 切档执行线程（**串行**）：
+     * ⚠ 切档必须在**独立线程**做，不能就地做——`QualityController.onChange` 是在 `VideoEncoder` 的输出线程（`pp-video-enc`）回调里触发的，在那里 `stop()` 编码器
      * 等于「自己 join 自己」→ `join(300)` 超时后 release 掉还在跑的 codec（崩/花）。
      */
     private var switchExec: java.util.concurrent.ExecutorService? = null
@@ -118,12 +107,9 @@ class VideoCall(
     val sending: Boolean get() = running
 
     /**
-     * 本端编码尺寸（本地小窗做等比留边用）。
-     *
-     * ⚠ 预览 SurfaceTexture 的缓冲区尺寸是 [pinPreviewSize] 用 `setDefaultBufferSize`
-     * 钉的值，**且会吸附到本机相机真正支持的流尺寸**（2026-09-16：854x480 两台机都
-     * 不支持 → 480P 黑屏的教训）—— 所以渲染侧等比计算的依据是下面这两个 getter
-     * （吸附后的实际值），不是档位的编码尺寸。
+     * 本端编码尺寸（本地小窗做等比留边用）：
+     * ⚠ 预览 SurfaceTexture 的缓冲区尺寸是 [pinPreviewSize] 用 `setDefaultBufferSize` 钉的值，**且会吸附到本机相机真正支持的流尺寸**（854x480 两台机都不支持 → 480P 黑屏）——
+     * 所以渲染侧等比计算的依据是下面这两个 getter（吸附后的实际值），不是档位的编码尺寸。
      */
     val localVideoW: Int get() = if (previewW > 0) previewW else VideoLevel.encodeWidth(activeLevel)
 
@@ -182,21 +168,17 @@ class VideoCall(
         private set
 
     /**
-     * 对端当前用的是**前置**摄像头吗（来自 `video_cfg.cam`，2026-09-19 加）。
-     *
-     * 接收端据此决定「对方画面」的默认显示角：对端前置 → 默认多转 180°
-     * （用户口径「相当于点了两次旋转按钮」）。老对端不带 `cam` → 恒为 false（后置），
-     * 行为与改造前完全一致。切摄像头时对端会重发 cfg，这里随手更新。
+     * 对端当前用的是**前置**摄像头吗（来自 `video_cfg.cam`）。
+     * 接收端据此决定「对方画面」的默认显示角：对端前置 → 默认多转 180°（相当于点了两次旋转按钮）；
+     * 老对端不带 `cam` → 恒为 false（后置），行为与之前完全一致。切摄像头时对端会重发 cfg，这里随手更新。
      */
     @Volatile
     var remoteCamFront: Boolean = false
         private set
 
     /**
-     * 远端画面缓冲区尺寸（0 = 尚未收到 `video_cfg`）。
-     *
-     * UI 渲染侧做**等比留边**要用它（§16.6）：`TextureView` 默认把 `SurfaceTexture`
-     * 缓冲区**各向异性拉伸铺满**整个 View，不知道真实宽高比就一定会被压扁。
+     * 远端画面缓冲区尺寸（0 = 尚未收到 `video_cfg`）：
+     * UI 渲染侧做**等比留边**要用它——`TextureView` 默认把 `SurfaceTexture` 缓冲区**各向异性拉伸铺满**整个 View，不知道真实宽高比就一定会被压扁。
      * 解码器的输出缓冲区尺寸就来自这份编码参数，所以这里是权威值。
      */
     val remoteVideoW: Int get() = remoteW
@@ -207,10 +189,8 @@ class VideoCall(
     private var fbThread: Thread? = null
 
     /**
-     * 发送端 1s 心跳：周期重发 `video_cfg`（含 rot + cam）。
-     *
-     * 为什么要有：切摄像头时那份「即时 cfg」是单发的 —— 万一对端没收到/晚到，
-     * 它就会一直按旧朝向选旋转配置（用户症状：调正后又倒立）。1s 重发保证
+     * 发送端 1s 心跳：周期重发 `video_cfg`（含 rot + cam）：
+     * 切摄像头时那份「即时 cfg」是单发的——万一对端没收到/晚到，它就会一直按旧朝向选旋转配置（调正后又倒立）。1s 重发保证
      * 对端的 rot/cam **最终一致**；收到的值没变时对端什么都不做，零副作用。
      */
     private var cfgThread: Thread? = null
@@ -219,9 +199,8 @@ class VideoCall(
     private var fbFrames = 0
 
     /**
-     * 已收到的视频字节数（只由网络读线程累加，与 [fbFrames] 同一条路）。
-     * 供反馈环算**实收码率**（video_fb.kbps，任务单 1.4）：与 PC 端同口径
-     * = 2s 窗口内收到的视频字节 × 8 / 2000（kbps），不含音频/文件字节。
+     * 已收到的视频字节数（只由网络读线程累加，与 [fbFrames] 同一条路）：
+     * 供反馈环算**实收码率**（video_fb.kbps）：与 PC 端同口径 = 2s 窗口内收到的视频字节 × 8 / 2000（kbps），不含音频/文件字节。
      */
     @Volatile
     private var fbBytes = 0L
@@ -237,9 +216,8 @@ class VideoCall(
     // ==================== 发送：启动 / 停止 ====================
 
     /**
-     * 启动视频发送（Android 端专用；PC 端 cam=false 不会有这个路径）。
-     *
-     * @return false = 无法发视频（无硬编 / 对端不支持 / 相机打开失败）→ 调用方应降级为纯语音
+     * 启动视频发送（Android 端专用；PC 端 cam=false 不会有这个路径）：
+     * false = 无法发视频（无硬编 / 对端不支持 / 相机打开失败）→ 调用方应降级为纯语音。
      */
     fun startSending(peerIp: String, level: VideoLevel): Boolean {
         stopSending()
@@ -281,13 +259,10 @@ class VideoCall(
         running = true
         sendEnabled = true
 
-        // GL 转正中间层（二期）：相机帧经 ST 矩阵处理 + 等比 fit 后喂编码器。
-        //
-        // ⚠ 2026-09-22 实测定案：相机 ST 的 UV 矩阵是**转置矩阵**（u'=1-v, v'=1-u）
-        //   —— 系统已把 sensor 横向缓冲转成**竖立**方向。所以：
+        // GL 转正中间层：相机帧经 ST 矩阵处理 + 等比 fit 后喂编码器。
+        // ⚠ 相机 ST 的 UV 矩阵是**转置矩阵**（u'=1-v, v'=1-u）—— 系统已把 sensor 横向缓冲转成**竖立**方向。所以：
         //   ① 编码输出尺寸必须与内容方向一致（竖持 = 交换，见 outDim）；
-        //   ② 摆正角在 GL 内按 `A − base` 算（A 由 ST 矩阵的**符号**区分前后置）——
-        //      竖持恒得 0（实测：后置本来就正；原公式给前置 180 → 对端看到**倒立**）；
+        //   ② 摆正角在 GL 内按 `A − base` 算（A 由 ST 矩阵的**符号**区分前后置）—— 竖持恒得 0（原公式给前置 180 → 对端看到**倒立**）；
         //   ③ GL 内再套一层等比 fit 兜底：就算分辨/朝向估错，也只是留黑边，永不变形。
         val gl = GlRotatePipe(onLog, onError)
         gl.frontCam = capture.isFront
@@ -330,14 +305,11 @@ class VideoCall(
 
     /**
      * 当前持握下的**编码输出尺寸**（GL viewport 尺寸）。
-     *
-     * ⚠ 2026-09-22 实测定案（这是“预览窗/远端画面被压扁”的真因）：
-     * 相机 `SurfaceTexture.getTransformMatrix()` 给的是**转置矩阵**
-     * （实测值 `[0,-1,0,0, -1,0,0,0, 0,0,1,0, 1,1,0,1]` 即 `u'=1-v, v'=1-u`），
+     * ⚠ 相机 `SurfaceTexture.getTransformMatrix()` 给的是**转置矩阵**
+     *（实测值 `[0,-1,0,0, -1,0,0,0, 0,0,1,0, 1,1,0,1]` 即 `u'=1-v, v'=1-u`），
      * 也就是**系统已把 sensor 横向缓冲转成竖立方向**。若仍按档位的 1920x1080 横框编码，
-     * 竖立内容被塞进 16:9 横框 → **发出的流本身就压扁 3.16 倍**（接收端“看着正常”
+     * 竖立内容被塞进 16:9 横框 → **发出的流本身就压扁 3.16 倍**（接收端"看着正常"
      * 只是它的 View 恰好是竖长条、各向异性铺满又把这份压扁反向抵消了——纯属巧合）。
-     *
      * 判据：`rotationDegrees()` 的 90/270（后置竖持 90 / 前置竖持 270）= 竖持 → 交换。
      */
     private fun outDim(level: VideoLevel): Pair<Int, Int> =
@@ -345,8 +317,7 @@ class VideoCall(
         else level.width to level.height
 
     /**
-     * 采集角变化（会话就绪 / 握姿翻转 / 切摄），跑在 `pp-video-cam` 线程。
-     *
+     * 采集角变化（会话就绪 / 握姿翻转 / 切摄），跑在 `pp-video-cam` 线程：
      * 绝大多数情况只是角度变 → 推给 GL + 重发 cfg，**零中断**；
      * 只有竖↔横翻转会改变编码输出尺寸（内容方向变了）→ 走重建。
      */
@@ -359,8 +330,7 @@ class VideoCall(
     }
 
     /**
-     * 握姿竖↔横翻转 → 编码输出尺寸必须跟着换（内容方向变了）。
-     *
+     * 握姿竖↔横翻转 → 编码输出尺寸必须跟着换（内容方向变了）：
      * 复用切档那条重建路径（重建编码器 + 换 GL 输出 + 重建相机会话，中断 ~200-400ms），
      * 在 `pp-video-switch` 线程串行执行；进线程后**重新判一次**尺寸，避免两个回调
      * （会话就绪 + 旋转）并发触发时重复重建。
@@ -388,18 +358,14 @@ class VideoCall(
         }.onFailure { onError("握姿切换任务提交失败：${it.message}") }
     }
     /**
-     * 相机会话就绪后补发一次 `video_cfg`。
-     *
-     * 原因：`startSending` 里发第一份 cfg 时相机还没开，`capture.rotationDegrees()`
+     * 相机会话就绪后补发一次 `video_cfg`：`startSending` 里发第一份 cfg 时相机还没开，`capture.rotationDegrees()`
      * 可能拿不到真实值（取默认 0）。会话就绪后旋转角才确定，需要**补发一次**让对端
      * 把画面转正；此时分辨率/码率都没变，接收端只会更新 rot，**不重建解码器**。
      */
     private fun sendCfgNow() {
         if (!running) return
         // 发送的宽高是**编码输出尺寸**（[encW]/[encH]，竖持时已交换），不是档位尺寸。
-        //
-        // ⚠ 2026-09-22 实测定案：GL 额外旋转**不再恒 0**。相机 ST 的 UV 矩阵是**转置矩阵**
-        //   （`u'=1-v, v'=1-u`），系统已替我们把 sensor 内容转了 90° → 所以 GL 里实际 UV 旋转
+        // ⚠ 相机 ST 的 UV 矩阵是**转置矩阵**（`u'=1-v, v'=1-u`），系统已替我们把 sensor 内容转了 90° → GL 里实际 UV 旋转
         //   = `rotationDegrees() - 90`（竖持恰好 0，横持 270，前置竖持 180）。
         //   `cfg.rot` 仍恒发 0：发送端已把数据摆正，接收端零旋转。
         val w = if (encW > 0) encW else outDim(activeLevel).first
@@ -413,8 +379,7 @@ class VideoCall(
     }
 
     /**
-     * 1s cfg 心跳线程（[startSending] 尾部启动，[stopSending] 摘除）。
-     *
+     * 1s cfg 心跳线程（[startSending] 尾部启动，[stopSending] 摘除）：
      * `sendCfgNow()` 自带 `running` 闸门且走 `io{}`，从这里调线程安全；
      * 值没变时接收端不重建解码器、不重选槽位，只是确认。
      */
@@ -470,7 +435,7 @@ class VideoCall(
         SegMeter.record(SegMeter.V_TX, t0, System.nanoTime())
         // 100ms 发送截止期统计（超阈值只记 drop，**不重发** —— TCP 上重传是自伤式拥塞）
         quality?.onFrameSent(writeMs)
-        // 问题2 的自愈入口：这一帧**因为太大而整帧没上线**（面内单帧闸门丢）⇒ 交给状态机当拥塞证据，
+        // 拥塞自愈入口：这一帧**因为太大而整帧没上线**（面内单帧闸门丢）⇒ 交给状态机当拥塞证据，
         //   由它把每帧数据量降下来。判据用帧长而不是耗时，所以两种场景都覆盖到了：
         //   · 带内档：超 128KB 的帧在 Link.sendVideoTo 被丢、返回 -1 ⇒ 这里进得来；
         //   · UDP 档：同一帧已切成 ≤1188B/片上线、返回 0 ⇒ 进不来（切片本来就解决了它，不该再降档）。
@@ -481,8 +446,7 @@ class VideoCall(
     }
 
     /**
-     * 切档入口（由 `QualityController` 在**编码器输出线程**调用）。
-     *
+     * 切档入口（由 `QualityController` 在**编码器输出线程**调用）：
      * 只做「提交任务」，实际动作在 `pp-video-switch` 串行线程执行（原因见 [switchExec]）。
      */
     private fun applyLevel(level: VideoLevel) {
@@ -496,13 +460,10 @@ class VideoCall(
     }
 
     /**
-     * 真正的切档执行（`pp-video-switch` 线程）。
-     *
-     *  - **只换码率** → `setParameters()`，零中断；
-     *  - **分辨率也变了** → 重建编码器 + 换相机 target（画面中断 ~200–400ms）。
-     *
+     * 真正的切档执行（`pp-video-switch` 线程）：
+     *  - **只换码率** → `setParameters()`，零中断；**分辨率也变了** → 重建编码器 + 换相机 target（画面中断 ~200–400ms）。
      * 顺序：先 `activeLevel` + 发 `video_cfg`（让对端尽早按新尺寸重建解码器），
-     * 再重建本端编码器 —— 对端重建与本端重建并行，中断窗口最短。
+     * 再重建本端编码器——对端重建与本端重建并行，中断窗口最短。
      */
     private fun doApplyLevel(level: VideoLevel) {
         if (!running) return
@@ -532,9 +493,7 @@ class VideoCall(
     }
 
     /**
-     * 重建编码器（分辨率切换用）。
-     *
-     * 复用同一个 `VideoCapture`：只把编码器输入 Surface 换成新的，再 `updateTargets`
+     * 重建编码器（分辨率切换用）：复用同一个 `VideoCapture`，只把编码器输入 Surface 换成新的，再 `updateTargets`
      * 让相机指过去（`captureSession` 会被重建，**相机不关闭、不重新授权**）。
      */
     private fun restartEncoder(level: VideoLevel) {
@@ -572,11 +531,9 @@ class VideoCall(
     }
 
     /**
-     * 接收侧健康反馈到达（发送侧用于升降档）。
-     *
-     * @param lat      对端排队时延 ms（真实值，[QualityController] 的 `lat>400ms` 判据从此才有数）
-     * @param dropping 对端此刻正处于丢帧期（只展示；判据改动属任务单 3，本单不动行为）
-     * @param kbps     对端 2s 窗口内的**实收码率**（任务单 1.4：不再是恒 0 的死字段）
+     * 接收侧健康反馈到达（发送侧用于升降档）：
+     * lat=对端排队时延 ms（真实值，[QualityController] 的 `lat>400ms` 判据从此才有数）；
+     * dropping=对端此刻正处于丢帧期（只展示）；kbps=对端 2s 窗口内的**实收码率**（不再是恒 0 的死字段）。
      */
     fun onRemoteFb(fps: Int, drop: Int, lat: Int, dropping: Boolean, kbps: Int) {
         quality?.onFeedback(drop, lat, kbps)
@@ -593,15 +550,13 @@ class VideoCall(
     }
 
     /**
-     * 对端请求**立刻一个 IDR**（PC 的解码进程刚换代：换尺寸或首次起进程）。
-     *
-     * 为什么必须有：换代后的收端只能从一个 IDR 起解，而编码器 GOP=1s ⇒ 画面要白等到下一个关键帧，
+     * 对端请求**立刻一个 IDR**（PC 的解码进程刚换代：换尺寸或首次起进程）：
+     * 换代后的收端只能从一个 IDR 起解，而编码器 GOP=1s ⇒ 画面要白等到下一个关键帧，
      * 用户看到的就是「接通后卡几秒」。GOP 的 1s 是档位表里的既有口径，不改它，改的是「什么时候插一个 IDR」。
-     *
      * ⚠ 网络读线程调用。resendConfig 只置一个 volatile 标志、requestKeyFrame 只有一次 setParameters，
      *   两者都不阻塞、不碰 writeLock，真正的发帧由编码器线程做（见 VideoEncoder.resendConfig）；
-     *   编码器已停（encoder=null）或本端正停发（sendEnabled=false）时直接 no-op。
-     *   API<31 或不支持 request-sync 的编码器会静默不吃这个参数，最坏退回等下一个 GOP IDR（与改前一致）。
+     *   编码器已停（encoder=null）或本端正停发（sendEnabled=false）时直接 no-op；
+     *   API<31 或不支持 request-sync 的编码器会静默不吃这个参数，最坏退回等下一个 GOP IDR（与之前一致）。
      */
     fun onRemoteKeyRequest() {
         val e = encoder ?: return
@@ -627,8 +582,7 @@ class VideoCall(
         if (changed) {
             onLog("远端编码参数：$codec ${w}x$h@$fps ${br}k rot=${rot}° 摄像头=${if (front) "前置" else "后置"}")
             // ⚠ 缓存只在**重建成功**后写入：失败（Surface 未就绪 / 并发冲突）时缓存保持旧值，
-            //   下一条 1s 心跳 cfg 会再试一次 → **自愈，不必重拨**。
-            //   （2026-09-22 实测：a16 曾因解码器创建失败黑屏整场，重拨才恢复。）
+            //   下一条 1s 心跳 cfg 会再试一次 → **自愈，不必重拨**（a16 曾因解码器创建失败黑屏整场，重拨才恢复）。
             if (decoder.prepare(VideoCodecs.mime(codec), w, h)) {
                 remoteCodec = codec
                 remoteW = w
@@ -648,9 +602,7 @@ class VideoCall(
     }
 
     /**
-     * 网络读线程回调：**只入队**。
-     *
-     * `seq` 单调性去重是廉价保险（防御未来传输方式变更导致的重复帧）。
+     * 网络读线程回调：**只入队**（`seq` 单调性去重是廉价保险，防御未来传输方式变更导致的重复帧）。
      */
     fun onRemoteFrame(peerIp: String, seq: Int, ts: Long, flag: Int, data: ByteArray, len: Int) {
         val t0 = System.nanoTime()
@@ -673,8 +625,8 @@ class VideoCall(
     /** UI 挂上远端 Surface 时调用 */
     fun attachRemoteSurface(surface: Surface) {
         decoder.attachSurface(surface)
-        // 只在**本场已收到过 cfg**（remoteW/H 非 0）时才建；否则交给随后的 onRemoteCfg ——
-        // 用上一场残留的尺寸建解码器会与实际流不符 → 黑屏（2026-09-22 a16 实测）。
+        // 只在**本场已收到过 cfg**（remoteW/H 非 0）时才建；否则交给随后的 onRemoteCfg——
+        // 用上一场残留的尺寸建解码器会与实际流不符 → 黑屏。
         if (remoteCodec.isNotEmpty() && remoteW > 0 && remoteH > 0) {
             decoder.prepareIfNeeded(VideoCodecs.mime(remoteCodec), remoteW, remoteH)
         }
@@ -683,14 +635,12 @@ class VideoCall(
 
     /**
      * UI 挂上本地预览 TextureView 时调用（迟到的预览会让相机重建一次会话，编码不中断）。
-     *
-     * **缓冲区尺寸在这里钉死**（2026-09-15 加，配合等比留边）：
+     * **缓冲区尺寸在这里钉死**（配合等比留边）：
      *  - Camera2 对 `SurfaceTexture` 目标取的是它的 `getDefaultBufferSize()`，而 `TextureView`
      *    默认填的是**控件尺寸**（本地小窗只有 104x150dp ≈ 286x412px，是任何相机都不可能输出的
      *    尺寸，能否建会话全看 HAL 心情）；
      *  - 渲染侧 `videoFitMatrix` 又必须按**真实缓冲区宽高比**算等比缩放。
-     *
-     * 2026-09-16 起经 [pinPreviewSize] **吸附到本机相机支持的流尺寸**再钉 —— 档位编码
+     * 经 [pinPreviewSize] **吸附到本机相机支持的流尺寸**再钉——档位编码
      * 尺寸不一定在相机的 StreamConfigurationMap 里（854x480 两台实测机都没有 → 黑屏）。
      * 必须在把 Surface 交给 Camera2 **之前**调用（`updateTargets` 会重建 captureSession）。
      */
@@ -721,7 +671,6 @@ class VideoCall(
 
     /**
      * 切换前后摄：复用同一 GL 输入 ST，码流不中断；切完重发 cfg（rot=0 + 新朝向）。
-     *
      * `capture.switchCamera()` 内部同步读新摄像头 characteristics → `rotationDegrees()`
      * 已是新真值 → `sendCfgNow()` 会把 GL 旋转角同步过去，数据保持正立。
      */
@@ -769,9 +718,9 @@ class VideoCall(
                 val dropPct = if (total <= 0) 0 else (dDropped * 100 / total)
                 val fps = dFrames / 2
                 val lat = decoder.lastQueueDelayMs
-                // lat 是真实排队时延；「正在丢帧」由独立的 dropping 字段说（任务单 1.3，与 PC 同名）
+                // lat 是真实排队时延；「正在丢帧」由独立的 dropping 字段说（与 PC 同名）
                 val dropping = decoder.dropping
-                // 实收码率（任务单 1.4）：窗口 2s、只算视频字节、×8/2000 = kbps —— 与 PC 端同公式
+                // 实收码率：窗口 2s、只算视频字节、×8/2000 = kbps——与 PC 端同公式
                 val kbps = (dBytes * 8 / 2000).toInt()
                 link.sendVideoFb(peer, fps, dropPct, lat, dropping, kbps)
                 if (dFrames > 0 || dDropped > 0) {
@@ -808,7 +757,7 @@ class VideoCall(
         fbThread = null
         cfgThread = null
         // ⚠ 换场清零：远端编码参数**绝不跨通话沿用**。
-        //   不清零的后果（2026-09-22 a16 实测）：新通话 UI 挂远端 Surface 时，
+        //   不清零的后果：新通话 UI 挂远端 Surface 时，
         //   attachRemoteSurface 会拿**上一场**的分辨率建解码器，与本场真实流不符 →
         //   对端画面黑屏（且 480P↔720P 换档时才必现，重拨偶尔蒙对）。
         remoteCodec = ""
@@ -819,7 +768,7 @@ class VideoCall(
         remoteCamFront = false
     }
 
-    // 2026-09-22 用户要求：顶部不再显示「转 90°」这类角度文案（发送端已把数据摆正，
+    // 用户要求：顶部不再显示「转 90°」这类角度文案（发送端已把数据摆正，
     // 这个数字对用户没意义）。角度仍照常算、照常发 cfg，只是不往外露。
     fun summary(): String =
         if (sending) {

@@ -58,25 +58,9 @@ import com.phonepctransfer.AppCore
 import com.phonepctransfer.data.PeerGroup
 
 /**
- * 左侧设备列表（可收起）。
- *  - **单击**某项 → 切为「当前对话设备」；没连才发起**一次**连接（失败不重试，再点一次即可）
- *  - **长按**某项 → 编辑备注 / IP（或删除）
- *
- * 展开/收起由聊天区手势与顶栏那枚「加长三横」负责（右滑开、左滑关、点聊天空白关），
- * 本面板内部**不放**收起箭头。展开/收起带**自驱动画**（不受系统动画时长影响，见
- * [com.phonepctransfer.ui.ChatScreen] 里的 SidePanel）。
- *
- * 顶部一行（2026-09-19 用户定调）：**原来那一行「清空 + 设置」已整体删除** ——
- *  - 「清空」：入口彻底移除（用户要求）；清空记录改到设置页里做
- *    （设置 → 清空 → 「清空聊天记录」/「清空待发」）
- *  - 「设置」：搬到**列表底部**固定一行（占自己的高度，不覆盖列表内容），
- *    原设置页（端口、剪贴板、后台保活、保存位置、已知设备名单、日志）保持独立成页
- *
- * 多设备是**独立长连接**：连着的多台会同时亮绿点，互不影响 ——
- * 一台抖动/断开不会波及别的设备，也不会打断你和另一台的对话。
- *
- * 局域网发现：**启动时主动扫一轮**（仅本机在 192.168.* 时生效），之后只被动接收对端广播，
- * 谁广播就把谁写进列表。结果文案显示在本机地址块下方（发现 N 台设备 / 无新设备 / 发现设备 XXX）。
+ * 左侧设备列表(可收起):单击某项→切为「当前对话设备」(没连才发起一次连接,失败不重试再点一次即可);长按某项→编辑备注/IP(或删除)。
+ * 展开/收起由聊天区手势与顶栏「加长三横」负责;本面板内部不放收起箭头,动画自驱动(见 ChatScreen 的 SidePanel);「设置」固定在列表底部一行,清空记录在设置页里做。
+ * 多设备是独立长连接(连着的多台同时亮绿点、互不影响);局域网发现:启动时主动扫一轮,之后被动接收对端广播,谁广播就把谁写进列表,结果文案显示在本机地址块下方。
  */
 @Composable
 fun DeviceListPanel(
@@ -92,24 +76,19 @@ fun DeviceListPanel(
         modifier = modifier.fillMaxHeight(),
         color = MaterialTheme.colorScheme.surfaceVariant
     ) {
-        // 状态栏内边距加在**面板自己的 Surface 内部**：面板底色一直铺到屏幕最顶边，
-        // 通知栏那一条与左侧栏同色（`surfaceVariant`），内容被顶下来不压时间/电量。
-        // 与外层布局的分工见 ChatScreen 根 `Row` 的注释（2026-09-16 定稿）。
+        // 状态栏内边距加在面板自己的 Surface 内部:面板底色铺到屏幕最顶边,通知栏条与左栏同色(surfaceVariant),内容被顶下来不压时间/电量(与外层布局的分工见 ChatScreen 根 `Row` 的注释)。
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .windowInsetsPadding(WindowInsets.statusBars)
         ) {
-            // 顶部那一行（「清空」+「设置」）已整体删除（2026-09-19 用户定调）：
-            // 面板内容从本机地址块开始；设置入口移到底部固定行（见本 Column 末尾）。
+            // 顶部那一行（「清空」+「设置」）已整体删除：面板内容从本机地址块开始；设置入口移到底部固定行（见本 Column 末尾）。
 
-            // 连接状态那行（「○ 未连接（点设备连接）」…）**已删除**（2026-09-15 用户要求）——
-            // 状态在顶栏第 2 行已经有，不重复；腾出来的位置放本机地址块。
+            // 连接状态那行（「○ 未连接（点设备连接）」…）已删除（状态在顶栏第 2 行已有，不重复）；腾出来的位置放本机地址块。
             LocalIpBlock()
 
-            // 局域网发现状态：启动时主动扫一轮 →「发现 N 台设备」/「无新设备」；
-            // 之后纯被动：收到对端广播就刷新为「发现设备 XXX，已加入列表」。
-            // 只有本机连了 WiFi/热点/以太网、且地址在私网段才真的扫（闸门在 AppCore.startScan）。
+            // 局域网发现状态:启动时主动扫一轮 →「发现 N 台设备」/「无新设备」,之后纯被动(收到对端广播就刷新)。
+            // 只有本机连了 WiFi/热点/以太网、且地址在私网段才真的扫(闸门在 AppCore.startScan)。
             if (AppCore.scanMessage.isNotEmpty()) {
                 Text(
                     AppCore.scanMessage,
@@ -128,8 +107,7 @@ fun DeviceListPanel(
                     .padding(horizontal = 4.dp, vertical = 2.dp),
                 horizontalArrangement = Arrangement.spacedBy(2.dp)
             ) {
-                // 可交互按钮加边框（2026-10-01 高对比口径）。与底部按钮同口径用 Box 自绘：
-                // TextButton 的 48dp 最小触摸目标会把边框盒撑得偏高，用户要求「上下压小」。
+                // 可交互按钮加边框（高对比口径）。Box 自绘（与底部按钮同口径）:TextButton 的 48dp 最小触摸目标会把边框盒撑得偏高,故「上下压小」。
                 Box(
                     modifier = Modifier
                         .height(28.dp)
@@ -175,15 +153,11 @@ fun DeviceListPanel(
                         DeviceRow(
                             group = g,
                             connected = AppCore.isGroupOnline(g),
-                            // 别名行不带「当前对话」高亮：它的 ips 就是那个 IP，
-                            // 用 contains 判会把「当前聊的是同 IP 的另一台」也点亮（2026-10-05）
+                            // 别名行不带「当前对话」高亮：它的 ips 就是那个 IP，用 contains 判会把「同 IP 的另一台」也点亮
                             current = !g.alt && g.ips.contains(AppCore.selectedPeerIp),
                             onClick = { onPick(g) },
-                            // 别名行不是一条真正的地址（只是「同一 IP 上还有另一台设备」），
-                            // 不能进编辑弹窗改地址/删地址 —— 那会误删活动设备那条地址
                             onLongClick = {
-                                // 别名行不是一条真正的地址：不能进编辑弹窗（那里会改/删那个地址，
-                                // 等于动了别人的地址），改成弹「切换 / 不再显示」小菜单
+                                // 别名行不是一条真正的地址（只是「同一 IP 上还有另一台设备」）：不能进编辑弹窗改/删地址（等于动了别人的地址），改成弹「切换 / 不再显示」小菜单
                                 if (g.alt) altMenu = g else onEdit(g)
                             }
                         )
@@ -193,21 +167,10 @@ fun DeviceListPanel(
 
             HorizontalDivider()
 
-            // 底部固定一行：「设置」+「主题」两个入口（2026-10-01 用户要求：主题按钮加在设置右边）。
-            // **固定行形态**（用户 2026-09-19 选定）：占自己的高度、**不覆盖**列表内容，
-            // 列表在它上方滚动；高度沿用 [TOP_ROW_H]（36dp），与顶栏第一行同高。
-            //
-            // 2026-09-19 二改（用户）：字号放大到 [SETTINGS_LABEL_SIZE]（17sp）；
-            // 原来「设  置」中间的两个空格在加入第二个按钮后放不下，改回「设置」
-            //（contentDescription 仍固定为规整的「设置」，自动化口径不变）。
-            //
-            // 2026-10-01（用户）：**可交互按钮加边框**；「主题」按钮文本左边是
-            // 太阳/月亮矢量图标（[Glyph.SUN]/[Glyph.MOON]），文字显示**当前状态**
-            //（浅色 → 太阳+「浅色」，深色 → 月亮+「深色」），点一下在两者间切换并持久化。
-            // 两个按钮各占一半宽（weight 1f），138dp 面板下刚好放下。
-            //
-            // 2026-09-21 四改（用户）：**整行按聊天输入框的同一口径垫高**（`navigationBars`
-            // + [sendTextLineHeight]，垫高必须加在 Surface 内部，与顶部 statusBars 同口径）。
+            // 底部固定一行：「设置」+「主题」两个入口（各占一半宽）；占自己的高度、不覆盖列表内容（列表在它上方滚动）；
+            // 高度沿用 [TOP_ROW_H]（36dp），与顶栏第一行同高。
+            // 「主题」按钮：左边是太阳/月亮矢量图标，文字显示当前状态（浅色 → 太阳+「浅色」，深色 → 月亮+「深色」），点一下切换并持久化。
+            // 整行按聊天输入框同一口径垫高（`navigationBars` + [sendTextLineHeight]，垫高加在 Surface 内部，与顶部 statusBars 同口径）。
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -232,9 +195,7 @@ fun DeviceListPanel(
                 )
             }
 
-            // 底部空白垫高：与聊天区 [BottomArea] 的收尾 `Spacer` **同一个量**
-            //（`sendTextLineHeight()` = 「发送」二字所在字体行高，见该函数的注释）——
-            // 左栏「设置」与右侧输入框因此贴在同一条基线上（2026-09-21 用户要求）。
+            // 底部空白垫高：与聊天区 [BottomArea] 收尾 `Spacer` 同一个量（`sendTextLineHeight()`，见该函数的注释），左栏「设置」与右侧输入框贴在同一条基线上。
             Spacer(Modifier.height(sendTextLineHeight()))
         }
     }
@@ -257,13 +218,9 @@ fun DeviceListPanel(
 }
 
 /**
- * 「同 IP 的另一台设备」别名行的长按菜单（2026-10-05）。
- *
- * 别名行不是一条真正的地址（只是「同一个 IP 上还有另一台设备」），所以不能走编辑弹窗
- *（那里会改/删那个地址，等于动了别人的地址）。只给两个动作：
- *  - **切换到该设备**：走 IP 冲突确认流程（见 [AppCore.confirmConflictSwitch]）；
- *  - **不再显示**：忘记这条记录并记进忽略表 —— 否则对方每 2s 广播一次，2 秒后它又回来
- *    （同一台手机换/重装后留下的旧 deviceId 残行就是这么清掉的）。
+ * 「同 IP 的另一台设备」别名行的长按菜单:别名行不是一条真正的地址,不能走编辑弹窗(那里会改/删那个地址)。
+ * 只给两个动作:**切换到该设备**走 IP 冲突确认流程(见 [AppCore.confirmConflictSwitch]);
+ * **不再显示**忘记这条记录并记进忽略表——否则对方每 2s 广播一次,2 秒后它又回来(同一台手机换/重装后留下的旧 deviceId 残行就是这么清掉的)。
  */
 @Composable
 private fun AltDeviceDialog(
@@ -297,23 +254,14 @@ private fun AltDeviceDialog(
     )
 }
 
-/**
- * 底部「设  置」入口的字号：17sp。
- *
- * labelLarge 是 14sp，用户觉得小（2026-09-19）。17sp 比列表正文（labelMedium/labelSmall）
- * 明显一档，又不至于把 138dp 宽的面板撑破（「设  置」= 2 字 + 2 空格 ≈ 4 em ≈ 68dp）。
- */
+/** 底部「设  置」入口的字号:17sp(labelLarge 14sp 偏小,比列表正文明显一档,又不至于撑破 138dp 宽的面板)。 */
 private val SETTINGS_LABEL_SIZE = 17.sp
 
 /**
- * 底部固定行的入口按钮（「设置」/「主题」共用，2026-10-01）。
- *
- * 形态：等宽（weight 1f）、**30dp 高**（用户二改：边框上下压小）、带边框，
+ * 底部固定行的入口按钮（「设置」/「主题」共用）：等宽（weight 1f）、30dp 高（边框上下压小）、带边框，
  * 内容 = 左矢量图标 + 右文字（字号 [SETTINGS_LABEL_SIZE]）。
- *
- * ⚠ 不能用 `TextButton`：M3 给按钮强制 48dp 最小触摸目标，外层再压 height(36dp)
- * 时内部内容会**溢出边框**（左下角实测边框被撑缺、字被裁）。这里与「发送」按钮
- * 同口径：Box 自绘 + ripple 反馈，触摸热区虽然只有 30dp 高，但整行其余留白仍可点。
+ * ⚠ 不能用 `TextButton`：M3 给按钮强制 48dp 最小触摸目标，外层再压 height 时内部内容会溢出边框（实测边框被撑缺、字被裁）。
+ * 与「发送」按钮同口径：Box 自绘 + ripple 反馈，触摸热区虽只有 30dp 高，但整行其余留白仍可点。
  */
 @Composable
 private fun RowScope.PanelEntryButton(
@@ -359,21 +307,14 @@ private val IP_FONT_SIZE = 11.sp
 
 /**
  * 估算一行能放几个字符用的「平均字宽 / 字号」比值。
- * 严格来说 hex 字符约 0.55em，这里取 0.62 **故意偏保守** —— 宁可少显示一两个字符，
- * 也不能让最后一个字符被裁掉半截（旁边 `overflow = Ellipsis` 是最后一道兜底）。
+ * hex 字符约 0.55em，这里取 0.62 故意偏保守——宁可少显示一两个字符，也不能让最后一个字符被裁掉半截（旁边 `overflow = Ellipsis` 是最后一道兜底）。
  */
 private const val IP_CHAR_EM = 0.62f
 
 /**
- * 「本机ip：」地址块（2026-09-15 用户定调）——占据原来「○ 未连接…」那行的位置。
- *
- *  - 标题与每一行都**居中**；**每行一个地址**
- *  - 点一下 = 复制该地址并提示；复制的是**完整地址**，可直接粘进「＋设备」的 IP 框
- *  - 地址太长（IPv6）时**中间省略**：头尾都保留，网段前缀与后缀仍辨认得出；
- *    完整值就在点下去的复制结果里
- *
- * 列表内容与顺序由 AppCore.localIps（[com.phonepctransfer.util.LocalIps]）提供：
- * 局域网 v4 → 169.254 → 内网 v6 一个 → 公网 v6。
+ * 「本机ip：」地址块（占据已删除的「○ 未连接…」那行位置）：标题与每行都居中、每行一个地址；
+ * 点一下=复制该完整地址并提示（可直接粘进「＋设备」的 IP 框）；IPv6 太长时中间省略（头尾保留），完整值在点下去的复制结果里。
+ * 内容与顺序由 AppCore.localIps（[com.phonepctransfer.util.LocalIps]）提供：局域网 v4 → 169.254 → 内网 v6 一个 → 公网 v6。
  */
 @Composable
 private fun LocalIpBlock() {
@@ -398,8 +339,7 @@ private fun LocalIpBlock() {
                 maxLines = 1
             )
         } else {
-            // 注意：BoxWithConstraints 本质是 **Box**，子项是**叠放**的 —— 所以里面必须再套 Column，
-            // 否则多行地址会全部画在同一行上（实测就是一坨糊字）。这里只借它量出可用宽度。
+            // 注意：BoxWithConstraints 本质是 Box，子项是叠放的——里面必须再套 Column，否则多行地址会全部画在同一行上；这里只借它量出可用宽度。
             BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
                 val budget = ipCharBudget(maxWidth)
                 Column(
@@ -443,9 +383,7 @@ private fun ipCharBudget(width: Dp): Int {
 
 /**
  * 中间省略：保留头尾（IPv4 永远不会触发，只有 IPv6 会）。
- *
- * `internal` 而非 `private`：聊天**顶栏**的当前地址也用同一套策略（2026-09-16 三改，
- * 用户要求「IPv6 地址中间一部分不显示，不然太长了」），两处必须同一口径。
+ * `internal` 而非 `private`：聊天顶栏的当前地址也用同一套策略，两处必须同一口径。
  */
 internal fun middleShorten(s: String, max: Int): String {
     if (s.length <= max || max < 6) return s
@@ -455,10 +393,8 @@ internal fun middleShorten(s: String, max: Int): String {
 }
 
 /**
- * 设备列表的一行 = **一台设备**（不是一条地址）。
- *
- * 同一台设备（同一个 deviceId）的多个地址合成一行：副标题显示当前使用的地址，
- * 多地址时追加「N 个地址」，切换地址在聊天顶栏（或长按本行编辑）里做。
+ * 设备列表的一行 = 一台设备（不是一条地址）：同一台设备（同一个 deviceId）的多个地址合成一行，
+ * 副标题显示当前使用的地址，多地址时追加「N 个地址」，切换地址在聊天顶栏（或长按本行编辑）里做。
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -488,7 +424,7 @@ private fun DeviceRow(
                 modifier = Modifier
                     .size(8.dp)
                     .clip(CircleShape)
-                    // 深色主题下 0x2E7D32 在近黑底上几乎看不见，换亮绿（2026-10-01 高对比）
+                    // 深色主题下 0x2E7D32 在近黑底上几乎看不见，换亮绿（高对比口径）
                     .background(
                         if (connected) {
                             if (isAppDark()) Color(0xFF3CD97E) else Color(0xFF2E7D32)
@@ -504,8 +440,8 @@ private fun DeviceRow(
                 overflow = TextOverflow.Ellipsis
             )
         }
-        // 副标题：当前地址（+ 地址数量）。没有备注/广播名时它就是唯一可读信息，照常显示。
-        // 别名行（同 IP 多设备）额外标一句，否则用户只看到「同一个 IP 出现两次」会困惑；
+        // 副标题：当前地址（+ 地址数量），没有备注/广播名时它就是唯一可读信息，照常显示；
+        // 别名行（同 IP 多设备）额外标一句，否则用户只看到「同一个 IP 出现两次」；
         // 主行的「共用地址」也在这行提示（那些地址当前属于别的设备，只做提示不可切换）。
         Text(
             when {
@@ -527,14 +463,11 @@ private fun DeviceRow(
 }
 
 /**
- * 编辑**设备**弹窗（长按设备行 / 「＋设备」）。
- *
- * 字段语义（2026-09-16 设备分组）：
- *  - 备注 = 对**对方设备**的备注（同组的每个地址共用一份，仅本机可见）
- *  - 地址列表 = 该设备已知的全部地址：点一行即切为当前使用；右侧 ✕ 从本机列表移除
- *  - 添加地址 = 手动声明「这个地址也是这台设备」（连接后聊天记录/备注直接沿用）
- *
- * @param initial null = 新增一台设备（只填地址与备注）
+ * **设备**编辑弹窗（长按设备行 / 「＋设备」）。
+ * 备注 = 对对方设备的备注（同组的每个地址共用一份，仅本机可见）；
+ * 地址列表 = 该设备已知的全部地址：点一行即切为当前使用，右侧 ✕ 从本机列表移除；
+ * 添加地址 = 手动声明「这个地址也是这台设备」（连接后聊天记录/备注直接沿用）。
+ * initial null = 新增一台设备（只填地址与备注）。
  */
 @Composable
 fun PeerEditDialog(initial: PeerGroup?, onDismiss: () -> Unit) {

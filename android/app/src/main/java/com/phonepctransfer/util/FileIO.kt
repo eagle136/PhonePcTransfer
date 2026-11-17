@@ -25,12 +25,8 @@ object FileIO {
     /** 在"下载"里建的中文子目录 */
     const val DOWNLOAD_SUBDIR = "手机电脑互传"
 
-    /**
-     * @param out   写入用的输出流
-     * @param desc  给人看的落盘位置描述（如「下载/手机电脑互传/a.png」）
-     * @param uri   **可用于再次读取**的地址：MediaStore 为 content:// URI，回退时为绝对路径。
-     *              图片消息靠它加载缩略图/原图（desc 只是文案，不能直接打开）。
-     */
+    /** Sink：out=写入用的输出流；desc=给人看的落盘位置描述（只是文案，不能直接打开）；
+     * uri=**可用于再次读取**的地址（MediaStore 为 content:// URI，回退时为绝对路径），图片消息靠它加载缩略图/原图 */
     data class Sink(val out: OutputStream, val desc: String, val uri: String)
 
     /** 图片扩展名集合（与 ui/ImageViews 的 isImageName、PC 端 ChatWindow.isImageName 三处一致） */
@@ -61,9 +57,8 @@ object FileIO {
     }
 
     fun queryName(ctx: Context, uri: Uri): String {
-        // file:// 走不了 ContentResolver（query 返回 null），直接按路径取文件名。
-        // 「分享进来但当时没连上」的内容会先落到应用私有目录再发，走的就是这条分支，
-        // 不特判的话名字会变成 `1757..._IMG_1234.jpg` 这种带时间戳前缀的临时名。
+        // file:// 走不了 ContentResolver（query 返回 null），直接按路径取文件名；
+        // 「分享进来但当时没连上」的内容会先落到应用私有目录再发，走的就是这条分支，不特判的话名字会变成带时间戳前缀的临时名。
         if ("file" == uri.scheme) {
             runCatching {
                 val p = uri.path
@@ -110,13 +105,9 @@ object FileIO {
     }
 
     /**
-     * 打开一个**源文件**用于发送。
-     *
-     * - `file://`：先本地 `FileInputStream`（最快）；打不开就**回落 root** —— root 模式下路径是
-     *   `/data/media/0/...`，应用身份读不了，只能过 `su -c cat`。
-     * - 其余（`content://`，含 SAF 文档）：交给 ContentResolver。
-     * - 都拿不到 → null。上层（`LinkSend.doSendFileInner`）会把它抛成 `SourceError` 如实报失败，
-     *   **绝不返回空流**（那会把 0 字节当成功发出去）。
+     * 打开一个**源文件**用于发送：`file://` 先本地 `FileInputStream`（最快），打不开就**回落 root**（root 模式下路径是 `/data/media/0/...`，应用身份读不了，只能过 `su -c cat`）；
+     * 其余（`content://`，含 SAF 文档）交给 ContentResolver；都拿不到 → null，上层（`LinkSend.doSendFileInner`）把它抛成 `SourceError` 如实报失败，
+     * **绝不返回空流**（那会把 0 字节当成功发出去）。
      */
     fun openSource(ctx: Context, uri: Uri): InputStream? {
         if (uri.scheme == "file") {
@@ -130,12 +121,8 @@ object FileIO {
     }
 
     /**
-     * 为接收到的文件创建输出流。
-     * API 29+ 走 MediaStore Downloads（免存储权限，用户在"下载/手机电脑互传"里能看到）；
-     * 失败或 API 28 及以下退回到应用专属外部目录。
-     *
-     * @param relPath 文件夹成员时为「文件夹内相对路径」（如 `sub/a.txt`），落进同名子目录；
-     *                null/空 = 普通单文件，直接落「下载/手机电脑互传」根目录。
+     * 为接收到的文件创建输出流：API 29+ 走 MediaStore Downloads（免存储权限，用户在"下载/手机电脑互传"里能看到）；
+     * 失败或 API 28 及以下退回到应用专属外部目录。relPath：文件夹成员时为「文件夹内相对路径」（如 `sub/a.txt`）落进同名子目录；null/空 = 普通单文件，直接落「下载/手机电脑互传」根目录。
      */
     fun createSink(ctx: Context, name: String, mime: String, relPath: String? = null): Sink {
         // ⚠️ 唯一名必须自己先算好（见 uniqueFileName）：一旦交给 MediaStore 去重，
@@ -207,15 +194,11 @@ object FileIO {
     }
 
     /**
-     * 为收到的文件挑一个**实际不冲突**的落盘名：序号插在扩展名前（`a.txt` → `a (1).txt`）。
-     *
-     * 与 PC 端 `LinkNames.createUniqueFile` 同口径（两端规则必须一致）。冲突与否看**落盘位置上到底
-     * 躺没躺着一个活文件**，不看台账记没记过，三条判据：
+     * 为收到的文件挑一个**实际不冲突**的落盘名：序号插在扩展名前（`a.txt` → `a (1).txt`）；与 PC 端 `LinkNames.createUniqueFile` 同口径（两端规则必须一致）。
+     * 冲突与否看**落盘位置上到底躺没躺着一个活文件**，不看台账记没记过，三条判据：
      *   ① 本进程占过坑 → 坑里那条路径还在才算冲突；已经不在了 = 坑作废；
-     *   ② MediaStore 有同名条目 → 条目指向的文件还在才算冲突；文件被外界删了、只剩条目（幽灵条目）
-     *      且条目属于本应用 → 删掉它把名字还回来（留着的话系统自己改名，产出 `a.txt.1` 这种坏名）；
-     *   ③ 落盘目录里真有同名文件 → 冲突。
-     * 应用私有回退目录不再挡下载目录的路（两个位置互不相干）；真回退时由 [createExclusiveIn] 就地换号。
+     *   ② MediaStore 有同名条目 → 条目指向的文件还在才算冲突；文件被外界删了、只剩条目（幽灵条目）且条目属于本应用 → 删掉它把名字还回来（留着的话系统自己改名，产出 `a.txt.1` 这种坏名）；
+     *   ③ 落盘目录里真有同名文件 → 冲突。应用私有回退目录不再挡下载目录的路；真回退时由 [createExclusiveIn] 就地换号。
      */
     fun uniqueFileName(ctx: Context, name: String, relPath: String?): String {
         val base = sanitize(name)
@@ -247,15 +230,10 @@ object FileIO {
 
     /**
      * MediaStore 里的同名条目到底算不算冲突：条目指向的文件**还在**才算。
-     *
-     * 分两步走，第一步刻意维持改动前的行为与最小投影：
-     *   第一步按 `RELATIVE_PATH + DISPLAY_NAME` 查有没有同名条目（只取 `_ID`）——没有、或查询本身
-     *          失败 → 空闲（与老代码一致，不给正常路径加新的失败面）；
-     *   第二步只对「确实有同名条目」的少数情况逐条验实况：文件还在 = 冲突；`_data` 读不到、
-     *          条目不是本应用建的、或连所在目录都读不到（分区存储下 `File.exists()` 会对活文件
-     *          假阴性）= 证据不足，保守算冲突，**绝不误删还在用的条目**；
-     *          目录读得到而文件不在 = 幽灵条目（用户在系统文件管理器/root 里直接删了文件），
-     *          删掉它把名字还回来 —— 留着的话系统会自己改名，产出 `a.txt.1` 这种扩展名被顶坏的坏名。
+     * 第一步按 `RELATIVE_PATH + DISPLAY_NAME` 查有没有同名条目（只取 `_ID`）——没有、或查询本身失败 → 空闲（维持原有行为，不给正常路径加新的失败面）；
+     * 第二步只对「确实有同名条目」的少数情况逐条验实况：文件还在 = 冲突；`_data` 读不到、条目不是本应用建的、
+     * 或连所在目录都读不到（分区存储下 `File.exists()` 会对活文件假阴性）= 证据不足，保守算冲突，**绝不误删还在用的条目**；
+     * 目录读得到而文件不在 = 幽灵条目，删掉它把名字还回来——留着的话系统会自己改名，产出 `a.txt.1` 这种扩展名被顶坏的坏名。
      */
     private fun liveMediaConflict(ctx: Context, rp: String, displayName: String): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
@@ -389,10 +367,9 @@ object FileIO {
         val files = ArrayList<TreeFile>()
         val sc = ScanCtx()
         runCatching {
-            // 起点用 getDocumentId（不是 getTreeDocumentId）：SAF「选目录」拿到的树 uri 取到的是
-            // 树的根文档，而浏览器里长按选中的**子文件夹**（buildDocumentUriUsingTree 生成）取到的
-            // 就是那个子文件夹本身 —— 两种形态都能从它开始枚举（buildChildDocumentsUriUsingTree
-            // 会自己从 uri 里取 treeId，子文档 uri 照样能用）。
+            // 起点用 getDocumentId（不是 getTreeDocumentId）：SAF「选目录」拿到的树 uri 取到的是树的根文档，
+            // 而浏览器里长按选中的**子文件夹**（buildDocumentUriUsingTree 生成）取到的就是那个子文件夹本身——两种形态都能从它开始枚举
+            //（buildChildDocumentsUriUsingTree 会自己从 uri 里取 treeId，子文档 uri 照样能用）。
             val startDoc = DocumentsContract.getDocumentId(treeUri)
             walkTree(ctx, treeUri, startDoc, "", files, sc, 0)
         }.onFailure {
@@ -404,11 +381,8 @@ object FileIO {
     }
 
     /**
-     * 按 Uri 形态选枚举方式：`file://` 走本机路径（root 模式过 su，见 [listTreePath]），
-     * 其余（SAF 内容 uri，含树内子文档）走 [listTree]。
-     *
-     * 用户发送 / 气泡重试 / 待发补发三处统一走它 —— 这样「内置浏览器选出来的文件夹」与
-     * 「系统 SAF 选出来的文件夹」在链路层完全同构。
+     * 按 Uri 形态选枚举方式：`file://` 走本机路径（root 模式过 su，见 [listTreePath]），其余（SAF 内容 uri，含树内子文档）走 [listTree]；
+     * 用户发送 / 气泡重试 / 待发补发三处统一走它——「内置浏览器选出来的文件夹」与「系统 SAF 选出来的文件夹」在链路层完全同构。
      */
     fun scanTree(ctx: Context, uri: Uri): TreeScan {
         val path = if (uri.scheme == "file") uri.path else null
@@ -416,11 +390,8 @@ object FileIO {
     }
 
     /**
-     * 递归枚举**本机路径**目录（内置文件浏览器「长按文件夹发送」用）。
-     *
-     * 与 SAF 版 [listTree] 逐条对齐：同样的深度/数量上限、同样的 emptyDirs/skipped 语义 ——
-     * **枚举失败绝不冒充空目录**（这是「传文件夹漏文件」的根治手段，换个后端也不能丢）。
-     * 目录列举交给 [LocalFs]（普通 / root 两种模式都在那里分流）。
+     * 递归枚举**本机路径**目录（内置文件浏览器「长按文件夹发送」用）；与 SAF 版 [listTree] 逐条对齐：同样的深度/数量上限、同样的 emptyDirs/skipped 语义——
+     * **枚举失败绝不冒充空目录**（这是「传文件夹漏文件」的根治手段，换个后端也不能丢）；目录列举交给 [LocalFs]（普通 / root 两种模式都在那里分流）。
      */
     fun listTreePath(ctx: Context, root: String): TreeScan {
         val files = ArrayList<TreeFile>()
@@ -493,10 +464,8 @@ object FileIO {
         }
         val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDoc)
         var count = 0
-        // 是否真的读到了这个目录的内容。**枚举失败绝不能冒充「空目录」** ——
-        // 老代码在 query 抛异常时 count 保持 0，于是把一个「整棵子树都被漏掉」的目录
-        // 记成空目录：PC 端还会照着重建成一个空目录，用户看到的就是
-        // 「文件夹在、里面的文件不见了」。这是「传文件夹漏文件」最隐蔽的一条路径。
+        // 是否真的读到了这个目录的内容。**枚举失败绝不能冒充「空目录」**——
+        // 否则 PC 端会照着重建出「文件夹在、里面的文件不见了」的空目录，这是「传文件夹漏文件」最隐蔽的一条路径。
         var readOk = false
         runCatching {
             ctx.contentResolver.query(

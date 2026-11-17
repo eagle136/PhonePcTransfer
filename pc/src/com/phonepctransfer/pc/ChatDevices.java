@@ -26,7 +26,7 @@ final class ChatDevices {
     JScrollPane deviceScroll;
 
     /**
-     * 左栏顶部「本机ip：」地址块（2026-09-15 与安卓端设备列表对齐）。
+     * 左栏顶部「本机ip：」地址块（与安卓端设备列表对齐）。
      * 每行一个地址、点击复制；地址随 WiFi 开关变化，由 {@W.link #refreshLocalIps()} 重建。
      */
     private JPanel localIpPanel;
@@ -46,8 +46,7 @@ final class ChatDevices {
         head.setOpaque(false);
         head.setBorder(BorderFactory.createEmptyBorder(8, 6, 4, 6));
 
-        // 顶部一行已撤（2026-09-23 用户定调）：「设置」按钮挪到**左栏底部**，
-        // 与接收目录同行（左路径右按钮）——顶部只剩本机地址块，更干净。
+        // 顶部一行只剩本机地址块;「设置」按钮在**左栏底部**与接收目录同行(左路径右按钮)。
 
         // 本机地址块：放在按钮行下面（与安卓端设备列表里的位置一致）——
         // 目的是「在这台机器上复制这一台的 IP，去对端『＋设备』里粘贴」，所以放在最顺手的位置。
@@ -61,8 +60,7 @@ final class ChatDevices {
         acts.add(add);
         head.add(acts);
 
-        // 「单击设备 = 切到它并连接 / 右键改备注/IP · 断线后点一下重连」那两行小字已删
-        //（2026-09-21 用户定调）：设备行的工具提示里已有同样信息，左栏留白更干净。
+        // 设备行的工具提示里已有交互说明（点击切换并连接 / 右键改备注/IP · 断线后点一下重连），左栏不重复。
 
         wrap.add(head, BorderLayout.NORTH);
 
@@ -74,27 +72,21 @@ final class ChatDevices {
         // 于是"永远差一点点"地冒出横向滚动条（实测左栏底部一条灰条）。
         deviceScroll.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
         deviceScroll.getVerticalScrollBar().setUnitIncrement(12);
-        // 自定义滚动条（R4）：条宽 10，比聊天区 12 窄（Q4/Q6 定稿）
+        // 自定义滚动条：条宽 10，比聊天区 12 窄
         Ui.installScrollBar(deviceScroll, 10);
         wrap.add(deviceScroll, BorderLayout.CENTER);
 
-        // 左栏底部（2026-09-27 用户定调，两行布局）：
+        // 左栏底部（两行布局）：
         //   上行 = 接收（保存）目录路径，**居中**；太长做中间省略（头留盘符/根、尾留最后一级），
         //   完整路径始终挂在工具提示里。目录在「设置」里可改，每 5s 跟一次。
         //   下行 = 「深色/浅色」主题切换按钮 + 「设置」按钮，**整组居中**。
-        //
-        // 2026-09-28 彻底修复（用户反馈：路径右边显示不全、两按钮右边框缺失）：
-        //   1) 按钮行改用 BoxLayout X + 3 段等宽 glue：布局引擎把行的**实际**内容宽均分给
-        //      「左空隙 / 中间间距 / 右空隙」。无论实际行宽、按钮宽是多少（任意 DPI / 字体度量），
-        //      两按钮永远完整、居中、间距相等；且行最窄宽度 = 两按钮宽之和（min 尺寸保证），
-        //      任何情况下都不会裁边。（旧 FlowLayout 按固定 184px 推 hgap，实际行宽略窄时
-        //      整组溢出 1~2px，「设置」按钮右缘被裁。）
-        //   2) 上行文本的省略预算改按行**实际**内容宽计算（不再假定固定 200px），
-        //      保证文字墨迹宽恒小于行宽，末字符永不贴到面板边缘。
-        //   3) 按钮边框改「填充环」绘制（见 Ui.ModernButtonUI）：细描边在分数设备坐标
-        //      （如 Windows 125% 缩放——旧钉定值，2026-09-29 起钉 100%；「跟随系统缩放」模式下仍会出现）
-        //      四条边落点不同、视觉粗细不一（一边几乎隐形）；
-        //      填充环在任何 DPI 下四条边覆盖结构相同、粗细恒定。
+        // 布局要点（任意 DPI / 字体度量下都不裁边）：
+        //   1) 按钮行用 BoxLayout X + 3 段等宽 glue：行的**实际**内容宽均分给
+        //      「左空隙 / 中间间距 / 右空隙」，两按钮永远完整、居中、间距相等；
+        //      行最窄宽度 = 两按钮宽之和（min 尺寸保证），任何情况下不会裁边。
+        //   2) 上行文本的省略预算按行**实际**内容宽计算，文字墨迹宽恒小于行宽。
+        //   3) 按钮边框用「填充环」绘制（Ui.ModernButtonUI）：细描边在分数设备坐标下
+        //      四条边落点不同、视觉粗细不一，填充环在任何 DPI 下四条边覆盖结构相同、粗细恒定。
         infoPanel = new JPanel();
         infoPanel.setLayout(new BoxLayout(infoPanel, BoxLayout.Y_AXIS));
         infoPanel.setOpaque(false);
@@ -105,18 +97,13 @@ final class ChatDevices {
         dirLabel.setHorizontalAlignment(javax.swing.SwingConstants.CENTER);
         // BoxLayout 按 alignmentX 在行内居中；不设的话短文本会偏左
         dirLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
-        // 2026-09-28 用户附图（左栏底部路径「D:\Downloads」首字 D、末字 载 各被削掉半边）根因修复：
-        //   JLabel 的首选宽 = FontMetrics.stringWidth，是**零容差**度量；而抗锯齿 + 分数步进下的
-        //   真实墨迹比度量宽 5~13%（同源常量 INK_SAFETY=1.12，见本文件中间省略那一节），
-        //   组件绘制被裁剪到自身 bounds ⇒ 首/末字形被 label 自己的左右缘削掉。
-        //   显式放开 max 尺寸，BoxLayout Y_AXIS 就会把它拉满整行（本处是在 X 轴方向被拉伸），
-        //   文字再由上面的 CENTER 对齐在行内居中 ⇒ 墨迹永远落在 label 内部，度量误差彻底失效。
-        //   这与顶栏 stateLine / addrBtn 的修法同源（ChatWindow.buildHeader 里已有同样一行）。
-        // 为什么不能再靠「省略预算」解决：省略预算只能保证**度量**宽 < 行宽，而 label 自身宽仍等于
-        //   文字的度量宽、两侧一点余量都没有 —— 墨迹照样被 label 自己的 bounds 裁掉（附图就是这一处）。
+        // 抗锯齿真实墨迹比 FontMetrics 零容差度量宽 5~13%（同源常量 INK_SAFETY=1.12，见中间省略一节），
+        // 首选宽等于度量宽时首/末字形会被 label 自身左右缘削掉；
+        // 显式放开 max 尺寸让 BoxLayout 拉满整行、文字再 CENTER 居中 ⇒ 墨迹永远落在 label 内部。
+        // 省略预算解决不了这一处:它只保证**度量**宽 < 行宽,label 自身宽仍等于度量宽、两侧无余量。
         dirLabel.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
         infoPanel.add(dirLabel);
-        // 文案 = 点击后进入的目标模式（2026-09-27 用户定调：避免「深色/浅色」单字语义不清）；
+        // 文案 = 点击后进入的目标模式（避免「深色/浅色」单字语义不清）；
         // 保持 4 字：两按钮默认 padding(64px/个) 下，5 字 + 「设置」在 184px 行宽里 0 间距也放不下
         themeBtn = W.smallBtn(Ui.isDark() ? "切到浅色" : "切到深色", e -> toggleTheme());
         // 档位：常规 15（按钮=发送文件按钮同档）
@@ -125,8 +112,7 @@ final class ChatDevices {
         settingsBtn = W.smallBtn("设置", e -> ChatWindow.SettingsDialog.show(W.frame, W.store, W.link));
         // 档位：常规 15（按钮=发送文件按钮同档）
         settingsBtn.setFont(new Font(ChatWindow.UI_FONT, Font.PLAIN, Ui.FS_STD));
-        // 紧凑 padding：默认 margin(14) + ModernButtonUI border(18) 每侧 32px，
-        // 两个按钮 + 间距在 200px 栏宽下放不下（实测「设置」按钮被裁掉）→ 收窄到 6/10
+        // 紧凑 padding:两个按钮 + 间距在 200px 栏宽下放不下(实测「设置」按钮被裁掉)→ 收窄到 6/10
         themeBtn.setMargin(new Insets(2, 6, 2, 6));
         themeBtn.setBorder(BorderFactory.createEmptyBorder(5, 10, 5, 10));
         settingsBtn.setMargin(new Insets(2, 6, 2, 6));
@@ -162,7 +148,7 @@ final class ChatDevices {
         deviceListPanel.revalidate();
     }
 
-    /** 左栏底部按钮行左：「深色 / 浅色」主题切换按钮（2026-09-27 新增，点击即切换并持久化） */
+    /** 左栏底部按钮行左：「深色 / 浅色」主题切换按钮（点击即切换并持久化） */
     private JButton themeBtn;
 
     /**
@@ -190,7 +176,7 @@ final class ChatDevices {
     private JPanel infoPanel;
     /** 左栏底部上行：**当前接收（保存）目录路径**（单行居中、超长中间省略；设置页里可改；由 ChatWindow 的 5s 心跳跟随） */
     private final JLabel dirLabel = new JLabel(" ");
-    /** 左栏底部按钮行右：「设置」按钮（2026-09-23 从左栏顶部挪下来） */
+    /** 左栏底部按钮行右：「设置」按钮 */
     private JButton settingsBtn;
     /** 上次画出来的目录文本：没变就不重写（避免每 5s 无谓重绘/闪烁） */
     private String dirCache;
@@ -198,7 +184,7 @@ final class ChatDevices {
     /**
      * 刷新左栏底部的接收目录：**只显示路径本身**，不加任何前缀文案。
      *
-     * <p>排版（2026-09-27 用户定调）：**单行、居中**；放不下就对整条路径做
+     * <p>排版：**单行、居中**；放不下就对整条路径做
      * **中间省略**（头留盘符/根、尾留最后一级）。完整路径挂在工具提示里。
      */
     void refreshSaveDir() {
@@ -213,10 +199,7 @@ final class ChatDevices {
             dirCache = dir;
             // 路径独占整行：可用宽 = 行**实际**内容宽（面板宽 - 1px 分隔条 - 左右 padding(10+6)）
             // - 安全余量(8)；不再假定固定 200px，保证文字墨迹宽恒小于行宽、末字符不贴边。
-            // 2026-09-28 注释更正：dirLabel 现在被**拉满整行**（见 buildDevicePanel 里的
-            // setMaximumSize），文本在行内居中，不再被 BasicLabelUI 的 min/max 钉死在文字尺寸上。
-            // 省略预算仍按**行**宽算，是为了保证墨迹宽 < 行宽、两侧各留出余量（拉满后 label 宽 = 行宽，
-            // 按行宽算与按 label 宽算等价），不再是被迫为之。
+            // 省略预算按**行**宽算，保证墨迹宽 < 行宽、两侧各留余量（dirLabel 被 setMaximumSize 拉满整行，label 宽 = 行宽）。
             int rowW = (infoPanel != null && infoPanel.getWidth() > 0)
                     ? infoPanel.getWidth() - 16
                     : ChatWindow.DEVICE_PANEL_W - 17;
@@ -236,8 +219,7 @@ final class ChatDevices {
 
         // 3 个有状态输入在这里创建并传给 buildDeviceForm：下方「保存」按钮要读它们
         // Ui.field：底色/文字/边框跟主题（深色 = #1B1C1F 底 + 近白字）。
-        // 不套的话这两个框吃 LAF 默认白底，而 Ui.installLafColors 已把 TextField.foreground
-        // 换成主题的 TEXT_MAIN（深色下近白）→ 白底近白字，2026-10-04 用户反馈"字看不见"的根因。
+        // 不套的话这两个框吃 LAF 默认白底，而 TextField.foreground 已换成主题的 TEXT_MAIN（深色下近白）→ 白底近白字看不见。
         final JTextField ipField = Ui.field(new JTextField());
         // 档位：常规 15（=发送文件按钮同档）
         ipField.setFont(new Font(ChatWindow.UI_FONT, Font.PLAIN, Ui.FS_STD));
@@ -308,7 +290,7 @@ final class ChatDevices {
         d.add(btns, BorderLayout.SOUTH);
 
         // 高按内容首选（DialogChrome 的首选高已含 32px 标题栏）：地址条数多时写死 380 会把
-        // 最后的提示行裁掉（2026-09-30），保底仍是原来的观感高度
+        // 最后的提示行裁掉，保底仍是原来的观感高度
         int need = d.getContentPane().getPreferredSize().height + 8;
         d.setSize(360, Math.max((isNew ? 240 : 380) + WindowChrome.DIALOG_TITLE_H, need));
         d.setLocationRelativeTo(W.frame);
@@ -316,7 +298,7 @@ final class ChatDevices {
     }
 
     /**
-     * 添加地址前的连通性探测（2026-10-30 用户定调：ping 3s 无响应就提示并放弃本次添加）。
+     * 添加地址前的连通性探测（ping 3s 无响应就提示并放弃本次添加）。
      *
      * <p>判定 = 3s 预算内 **ICMP ping 或 应用端口 TCP** 任一通过：
      * 手机 App 没开时 ping 仍然通（地址本身没错，允许添加）；对方系统拦 ICMP 时，
@@ -354,7 +336,7 @@ final class ChatDevices {
         t.start();
     }
 
-    /** 添加设备时的探测预算（用户定调 3s） */
+    /** 添加设备时的探测预算（3s） */
     private static final int PROBE_MS = 3000;
 
     /**
@@ -445,8 +427,7 @@ final class ChatDevices {
             form.add(ipBox);
         }
 
-        // 提示文字：以前在 CSS 里写 font-size:10px —— 宋体 10px 下笔画并成墨块，看着像假粗且
-        // 字形变形（2026-09-30 用户反馈）。字号走 FS_MIN 档，颜色用 TEXT_SUB 跟主题（原来写死 #666）。
+        // 提示文字：宋体 10px 下笔画并成墨块、字形变形，字号走 FS_MIN 档，颜色用 TEXT_SUB 跟主题。
         JLabel tip = new JLabel("<html>备注留空时显示对方广播名。<br>同一设备的多个地址共用备注与聊天记录。</html>");
         tip.setFont(new Font(ChatWindow.UI_FONT, Font.PLAIN, Ui.FS_MIN));
         tip.setForeground(Ui.TEXT_SUB);
@@ -496,7 +477,7 @@ final class ChatDevices {
                 public void mouseClicked(MouseEvent e) {
                     if (SwingUtilities.isLeftMouseButton(e) && e.getClickCount() == 1) {
                         if (group.alt) {
-                            // 同 IP 多设备（2026-10-05）：先弹 IP 冲突确认框，
+                            // 同 IP 多设备：先弹 IP 冲突确认框，
                             // 确认后才断开旧连接、把该地址的身份切过来
                             W.switchConflictDevice(group);
                             return;
@@ -611,14 +592,13 @@ final class ChatDevices {
             // 文字必须显式关 AA：本方法下面直接 drawString，而 KEY_ANTIALIASING=ON 会被 Java2D
             // 拿去兜底渲染文字（实测 15px 宋体多出 545 个灰阶像素 = 发糊）。整窗重绘时上游
             // WindowChrome 已把 TEXT_AA 钉成 OFF，但局部重绘（hover/刷新行）走的是默认提示，
-            // 两条路径不一致 → 名字一会儿清楚一会儿糊（2026-09-30，口径见 Fonts 类注释）。
+            // 两条路径不一致 → 名字一会儿清楚一会儿糊（口径见 Fonts 类注释）。
             g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
                     RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
-            // 当前对话 = 淡蓝底 + 左侧色条；已连接（非当前）也淡蓝但不带色条
+            // 当前对话 = 淡蓝底 + 左侧色条；**在线状态只由绿点表示**（
+            // 已连接不再给整行加背景色；未选中的在线设备行与其他行同底色）
             if (current) {
                 g2.setColor(Ui.ROW_CURRENT);
-            } else if (connected) {
-                g2.setColor(Ui.ROW_CONNECTED);
             } else {
                 g2.setColor(Ui.SURFACE);
             }
@@ -668,7 +648,7 @@ final class ChatDevices {
     // ==================== 左栏：本机地址（点击复制） ====================
 
     /** 地址行字体：等宽，IPv6 的 8 组对齐好认（Windows 自带 Consolas；缺了会回退默认字体）。
-     *  字号 13 = S2 映射（旧 11 @125% → 100% 下 13，2026-09-29）；= Ui.FS_MIN，刻意不跟档位联动 */
+     *  字号 13 = Ui.FS_MIN，刻意不跟档位联动 */
     private static final Font IP_FONT = new Font("Consolas", Font.PLAIN, 13);
     // IP 文字色不再烤成 static final Color（主题切换后老 label 会停在旧色）——
     // 一律用 Ui.IP_TEXT / Ui.IP_CAPTION 现取；已建 label 的旧色由 Ui.applyDark 的重着色遍历替换。
@@ -789,7 +769,7 @@ final class ChatDevices {
      * <p>FontMetrics.stringWidth 按**整数字符步进**累加，而实际渲染（抗锯齿 + 分数步进）比它宽
      * 5~13%（Consolas 11px 实测 25 字符串：度量 140px、渲染 147px @100%；157px @125% DPI）。
      * 所有「按度量裁字符串」的入口都必须先除以这个系数，否则省略后的头尾仍会超出容器被裁
-     * （2026-09-27 用户实测：本机 ip 块 IPv6 两端被裁、顶栏「● 已连接」尾字被裁）。
+     * （本机 ip 块 IPv6 两端被裁、顶栏「● 已连接」尾字被裁）。
      */
     static final double INK_SAFETY = 1.12;
 

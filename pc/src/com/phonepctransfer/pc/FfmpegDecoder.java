@@ -13,47 +13,31 @@ import java.util.List;
 
 /**
  * PC 端视频解码器：把对端发来的 HEVC / H.264 Annex-B 访问单元（AU）解成 BGRA 像素帧。
- *
  * <h3>为什么是子进程</h3>
- * Java 自身没有任何视频解码能力；本机实测**没有**系统 HEVC 解码 MFT
- * （`C:\Windows\System32\*hevc*` 无匹配、无 HEVC 扩展包），Media Foundation 路线不可用。
- * 因此随包带一个**裁剪到只剩解码的最小化 ffmpeg.exe**（2.89 MB，静态单文件），
- * 详见 VIDEO_CALL_PLAN §3.2 / §15.2。
- *
+ * Java 无视频解码能力，本机也没有系统 HEVC 解码 MFT（Media Foundation 路线不可用），
+ * 故随包带**裁剪到只剩解码的最小化 ffmpeg.exe**（2.89 MB 静态单文件，VIDEO_CALL_PLAN §3.2 / §15.2）。
  * <h3>实测固化的命令</h3>
  * <pre>
- * ffmpeg -hide_banner -loglevel error
- *        -probesize 32 -analyzeduration 0 -flags low_delay -threads 1
- *        -f hevc -i pipe:0
- *        -f rawvideo -pix_fmt bgra -fps_mode passthrough pipe:1
+ * ffmpeg -hide_banner -loglevel error -probesize 32 -analyzeduration 0 -flags low_delay -threads 1
+ *        -f hevc -i pipe:0 -f rawvideo -pix_fmt bgra -fps_mode passthrough pipe:1
  * </pre>
  * <ul>
  *   <li>{@code -probesize 32 -analyzeduration 0}：跳过流探测，首帧 1.11 s → 0.39 s</li>
  *   <li>{@code -threads 1}：稳态积压恒 5 帧；多线程会 5↔6 帧抖动</li>
- *   <li>{@code -pix_fmt bgra}：实测字节序确认为 B,G,R,A</li>
- *   <li><b>禁用</b> {@code -fflags nobuffer} / {@code -avioflags direct}：
- *       实测让裸 HEVC 管道解码**输出 0 帧**（{@code PPS id out of range}）</li>
+ *   <li>{@code -pix_fmt bgra}：实测字节序 B,G,R,A</li>
+ *   <li><b>禁用</b> {@code -fflags nobuffer} / {@code -avioflags direct}：实测输出 0 帧（{@code PPS id out of range}）</li>
  * </ul>
- *
- * <h3>线程模型（与 VIDEO_CALL_PLAN §8 一致）</h3>
- * <pre>
- *  网络读线程 ──enqueue()──► 有界队列(24) ──► [pp-video-feed] ──stdin──► ffmpeg
- *                                                     ▲                     │
- *                                             进程生命周期只归这条线程   stdout
- *                                                                           ▼
- *                                              [pp-video-read] ── Sink.onFrame() ──► Swing
- * </pre>
+ * <h3>线程模型（VIDEO_CALL_PLAN §8）</h3>
+ * 网络读线程 → enqueue() → 有界队列(24) → [pp-video-feed] → stdin → ffmpeg → stdout → [pp-video-read] → Sink.onFrame() → Swing。
  * <ul>
  *   <li>{@link #enqueue} <b>只入队、立即返回</b>——网络读线程绝不能在这里阻塞
- *       （本项目踩过两次：读线程被堵 → 对端 35 s 判死 + 挂断抢锁死锁）。</li>
- *   <li>进程的启动/重启/销毁**只由 pp-video-feed 线程做**，因为 spawn + 探流可能耗时数百 ms。</li>
- *   <li>{@link #stop()} 立即返回，真正的 {@code destroyForcibly()} 丢后台线程 —— 不阻塞挂断路径。</li>
+ *       （踩过两次：读线程被堵 → 对端 35 s 判死 + 挂断抢锁死锁）。</li>
+ *   <li>进程启动/重启/销毁**只由 pp-video-feed 线程做**（spawn + 探流可能数百 ms）；</li>
+ *   <li>{@link #stop()} 立即返回，{@code destroyForcibly()} 丢后台线程 —— 不阻塞挂断路径。</li>
  * </ul>
- *
  * <h3>丢帧策略</h3>
- * 队列满时不逐帧丢（乱丢中间帧会让解码器输出花屏直到下一个 IDR），而是
- * <b>「丢到下一个 IDR」</b>：置 {@code dropUntilKey}，随后所有非关键帧一律丢弃，
- * 直到收到带 KEYFRAME 标志的 AU 才恢复。这也正是协议里 flag bit0 的用途。
+ * 队列满时不逐帧丢（乱丢中间帧会花屏到下一个 IDR），而是<b>「丢到下一个 IDR」</b>：
+ * 置 {@code dropUntilKey}，非关键帧一律丢弃，收到带 KEYFRAME 标志的 AU 才恢复（协议 flag bit0 的用途）。
  */
 public final class FfmpegDecoder {
 
@@ -79,12 +63,9 @@ public final class FfmpegDecoder {
 
     /**
      * 一帧 AU 的硬上限（防御性）。
-     * ⚠ 改前这里钉在 128KB，与协议 MAX_VIDEO_FRAME 同值 —— 那在带内是对的（发端本来就被
-     *   同一道闸门挡住，128KB 以上的帧不可能到这里）。任务单 3.4 起 UDP 档把一帧切成
-     *   ≤1188B/片上线、收端重组，**大 IDR 现在会真的出现**：再钉 128KB 就等于在收端把
-     *   发端刚救回来的帧重新丢掉，花屏原样复发（修复清单 1.3 / 3.1 的另一半）。
-     *   所以改为对齐协议自己的单帧硬上限 Protocol.MAX_FRAME —— 这是本仓库唯一有出处的
-     *   "一帧最大多少字节"，不新设数字。
+     * ⚠ 带内时 128KB 上限是对的(发端被同一道闸门挡住);UDP 档把一帧切成 ≤1188B/片上线、收端重组,
+     *   大 IDR 现在会真的出现:再钉 128KB 就等于在收端把发端刚救回来的帧重新丢掉,花屏原样复发。
+     *   对齐协议自己的单帧硬上限 Protocol.MAX_FRAME —— 本仓库唯一有出处的"一帧最大多少字节",不新设数字。
      * ⚠ 内存不会因此失控：队列深度仍由 MAX_QUEUE 与超限清空守着；而在最高档 2Mbps 下
      *   一秒的全部数据是 250KB，队列最坏实际占用约 24×250KB ≈ 6MB，8MB 那条只是协议层面的天花板。
      */
@@ -96,7 +77,7 @@ public final class FfmpegDecoder {
     private final String userPath;
     /**
      * 用户配置的硬件加速方式。
-     * ⚠ 2026-10-03 口径变更（用户点「解码优先硬解，硬解不行就软解」）：**空 = 自动**，
+     * **空 = 自动**(解码优先硬解，硬解不行就软解)，
      *   即先问这个 ffmpeg 支持哪些 hwaccel、按 {@link #HW_PREFERENCE} 取第一个；
      *   填了具体名字 = 只用这一个（仍带 {@link #hwAbandoned} 的软解兜底）。
      */
@@ -104,7 +85,7 @@ public final class FfmpegDecoder {
     /** 随包内置的 ffmpeg 位置（`pc/bin/ffmpeg.exe`），探测优先级最高 */
     private final String bundledPath;
 
-    // ==================== 硬解优先 / 软解兜底（2026-10-03 用户点） ====================
+    // ==================== 硬解优先 / 软解兜底 ====================
 
     /**
      * 硬解方式的尝试优先序（Windows 上 d3d11va 最通用，dxva2 是老兜底，qsv 只对 Intel 有效）。
@@ -173,8 +154,8 @@ public final class FfmpegDecoder {
     /**
      * 队列元素：一个 AU 的字节 + 两个**不同零点**的时刻。
      *
-     * · {@code recvMs} —— 本端收到并入队的时刻（墙钟）：只用于算排队时延（{@code lat}，任务单 1.3）。
-     * · {@code frameTsMs} —— 发送端的**通话相对**时间戳（对端起呼=0 的 ms，任务单 1.1）：
+     * · {@code recvMs} —— 本端收到并入队的时刻（墙钟）：只用于算排队时延（{@code lat}）。
+     * · {@code frameTsMs} —— 发送端的**通话相对**时间戳（对端起呼=0 的 ms）：
      *   帧龄、上屏间隔用它；它与 {@code recvMs} 不同零点，**禁止相减**。
      */
     private static final class PendingAu {
@@ -196,7 +177,7 @@ public final class FfmpegDecoder {
     private final ArrayDeque<PendingAu> queue = new ArrayDeque<PendingAu>();
 
     /**
-     * 「出队 → 上屏」配对环（任务单 1.2 的 vOut 段）：feed 线程在把 AU 写进 ffmpeg 前
+     * 「出队 → 上屏」配对环：feed 线程在把 AU 写进 ffmpeg 前
      * 压入出队时刻，read 线程每交付一帧弹出配对。
      *
      * 配对依据：ffmpeg 用 `-threads 1 -flags low_delay -fps_mode passthrough`，
@@ -247,14 +228,14 @@ public final class FfmpegDecoder {
      * **换代重置**计数：解码进程重建时清掉的旧尺寸 AU、以及「等新 IDR 期间」主动丢弃的帧。
      * 它们是本端流水线的必然代价，与网络好坏无关 —— 混进 drop% 就是一条自增强的假拥塞信号：
      * 换一次分辨率 ⇒ 清一次队列 ⇒ drop%≈40% ⇒ 发送侧降一档 ⇒ 又换一次分辨率 ⇒ 又清一次队列…
-     * （10-02 23:39 那一通就是这样从 1080P 一路跌到 480P 的）。
+     * （一通通话就是这样从 1080P 一路跌到 480P 的）。
      * ⚠ 计数照常留痕（汇总行与 {@link #dropping()} 都说这件事），只是不再当拥塞证据。
      */
     private final java.util.concurrent.atomic.AtomicLong resetDropped = new java.util.concurrent.atomic.AtomicLong();
 
     /**
      * 解码进程**换代**时的回调（feed 线程调用，必须非阻塞）：新进程只能从 IDR 起解，
-     * 由 CallManager 在这里向对端要一个关键帧。null = 未接（行为与改前一致）。
+     * 由 CallManager 在这里向对端要一个关键帧。null = 未接。
      */
     private volatile Runnable reseedListener;
 
@@ -269,7 +250,7 @@ public final class FfmpegDecoder {
     /** 最近一帧从「到达」到「写进 ffmpeg」的排队延迟（毫秒，**真实值**；0 = 还没喂过） */
     private volatile int lastQueueDelayMs = 0;
     /**
-     * 接收端当前是否处于「丢帧期」：队列溢出后正在丢弃到下一个 IDR（任务单 1.3）。
+     * 接收端当前是否处于「丢帧期」：队列溢出后正在丢弃到下一个 IDR。
      * 与 {@code lat} **分离上报**——旧口径把丢帧期折成 {@code lat=-1} 再在上报处夹成 0，
      * 于是「拥塞正在丢帧」这一件事在数字上完全消失（看起来 lat=0 很健康）。
      */
@@ -283,7 +264,7 @@ public final class FfmpegDecoder {
     /**
      * 取证开关：环境变量 {@code PP_VIDEO_DUMP} 指向一个已存在的目录时，把**每个原样喂进解码进程的
      * AU** 另存一份到该目录（扩展名跟着 codec 走，可直接丢给同一条 ffmpeg 命令离线复解）。
-     * 空/未设 = 一个字节都不落，行为与改前完全一致。
+     * 空/未设 = 一个字节都不落。
      *
      * <p>为什么要它：收端「灰白后卡死」有两种完全不同的根因 —— ①流本身坏（重组/切片改了 AU 字节，
      * 或参数集根本没进来），②流是好的、解码侧跟不上。前者换任何解码器都没用，后者才是性能问题。
@@ -367,7 +348,7 @@ public final class FfmpegDecoder {
     }
 
     /**
-     * 本次解码用哪个 ffmpeg（2026-10-03 硬解优先）。
+     * 本次解码用哪个 ffmpeg（硬解优先）。
      *
      * <ul>
      *   <li>{@code preferHw=false}（用户显式指了路径，或本会话已判定硬解不行）⇒ 与 {@link #probe}
@@ -501,7 +482,7 @@ public final class FfmpegDecoder {
     /**
      * 随包内置 ffmpeg 的路径（`<app>/bin/ffmpeg.exe`）。
      *
-     * <p>⚠️ 2026-09-21：**不能再用数据根目录去拼**了 —— 数据已搬到 `%APPDATA%\PhonePcTransfer`，
+     * <p>⚠️**不能再用数据根目录去拼**了 —— 数据已搬到 `%APPDATA%\PhonePcTransfer`，
      * 而 ffmpeg 一直在**程序目录**里。按「运行中 jar / classes 所在目录」找：
      * <ul>
      *   <li>安装版（jpackage）：jar 在 `&lt;install&gt;/app/` → `&lt;install&gt;/app/bin/ffmpeg.exe`
@@ -710,10 +691,10 @@ public final class FfmpegDecoder {
 
     /**
      * 收端重组**丢了半帧** ⇒ 参考链从这一刻起已断：后面每一帧都注定解不出。
-     * 实测依据（10-03 09:50 那通的字节流离线复解）：809 个交付 AU 里 172 个被 ffmpeg 判
+     * 实测依据（一通通话的字节流离线复解）：809 个交付 AU 里 172 个被 ffmpeg 判
      * `Could not find ref` + `Error constructing the frame RPS` 直接跳过，172 全部落在
      * "某个 IDR 槽缺位"的那 4 个 GOP 里（29+28+87+28），每缺一帧 IDR 就静止 ~29 帧 ≈ 0.97s
-     * —— 这就是「几秒钟卡一下」。以前只有"队列积压溢出"这一条路会认账，半帧丢失完全不认。
+     * —— 这就是「几秒钟卡一下」。
      *
      * 处置与积压同形、不新增机制：清掉队列里那些已经救不回来的帧（进**重置账**，不污染 drop%），
      * 置 {@code dropUntilKey} 让后续死链帧不再进管道，然后要一个 IDR（限频照旧
@@ -836,7 +817,7 @@ public final class FfmpegDecoder {
     }
 
     /**
-     * 是否处于丢帧期（与 {@code dropUntilKey} 同置同清，任务单 1.3）。
+     * 是否处于丢帧期（与 {@code dropUntilKey} 同置同清）。
      * 上报口径：{@code lat} 只说排队时延，「正在丢帧」由本字段单独说。
      */
     public boolean dropping() {
@@ -980,8 +961,8 @@ public final class FfmpegDecoder {
     private boolean spawn(String codec, int w, int h) {
         killProc();
         clearDeqRing();
-        // 问题2（修复清单 1.4）：换分辨率 = 换进程，而输入 queue 里残留的是**旧尺寸**的 AU。
-        // 改前这里只清配对环、没清输入队列 ⇒ 新 ffmpeg 被喂旧分辨率 AU，输出就是花屏/九宫格，
+        // 换分辨率 = 换进程，而输入 queue 里残留的是**旧尺寸**的 AU：只清配对环的话，
+        // 新 ffmpeg 被喂旧分辨率 AU，输出就是花屏/九宫格，
         // 并顺着 video_fb 的 drop% 把档位一路往下拉。
         // 一并进 dropUntilKey：新进程只能从一个 IDR 起解，尺寸凑巧对上的中途帧参考链也已断。
         synchronized (qLock) {
@@ -1114,7 +1095,7 @@ public final class FfmpegDecoder {
             readThread = r;
             r.start();
             // 新进程只能从一个 IDR 起解，而编码器 GOP=1s ⇒ 不主动要一个关键帧，画面就要白等到下一个
-            // IDR（用户看到的「接通后卡几秒」）。请求走主 TCP 既有的 video_req 帧（I16 的控制落点之一），
+            // IDR（用户看到的「接通后卡几秒」）。请求走主 TCP 既有的 video_req 帧，
             // 非阻塞：LinkCall 那边是 uiSendExec.execute。
             // ⚠ 只在**进程真的起来了**之后要帧：spawn 失败（没找到 ffmpeg / 起不来）时 feed 循环每秒
             //   重试一次，放在前面就会变成每秒一份 video_req 的周期性发包。
@@ -1186,7 +1167,7 @@ public final class FfmpegDecoder {
                 }
             }
             // 交付完成 → 弹出该帧的出队时刻记 vOut（PC 的「上屏」取回调返回；
-            // VideoWindow 用 repaintPending 合帧，EDT 真实重绘不计入，由任务单 5 的 renderGapMs 对照）
+            // VideoWindow 用 repaintPending 合帧，EDT 真实重绘不计入，由 renderGapMs 对照）
             popDeqAndRecord();
         }
     }

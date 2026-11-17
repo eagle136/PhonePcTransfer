@@ -2,22 +2,51 @@ name: release
 
 on:
   push:
-    branches: [main]
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 1.2.0）；手动触发时不会自动打 tag'
+        required: true
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-main
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
-env:
-  APP_VERSION: 1.1.${{ github.run_number }}
-
 jobs:
-  android:
+  version:
     runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.v.outputs.name }}
+      code: ${{ steps.v.outputs.code }}
+    steps:
+      - id: v
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="${{ inputs.version }}"
+          fi
+          V="${V#v}"
+          if ! [[ "$V" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::版本号必须形如 1.2.3，实际为 '$V'"
+            exit 1
+          fi
+          MAJOR=$((10#${BASH_REMATCH[1]}))
+          MINOR=$((10#${BASH_REMATCH[2]}))
+          PATCH=$((10#${BASH_REMATCH[3]}))
+          echo "name=$V" >> "$GITHUB_OUTPUT"
+          echo "code=$((MAJOR * 10000 + MINOR * 100 + PATCH))" >> "$GITHUB_OUTPUT"
+
+  android:
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      APP_VERSION: ${{ needs.version.outputs.name }}
+      APP_CODE: ${{ needs.version.outputs.code }}
     steps:
       - uses: actions/checkout@v4
 
@@ -57,7 +86,7 @@ jobs:
           chmod +x gradlew
           ./gradlew --no-daemon :app:assembleRelease \
             -PppVersionName="$APP_VERSION" \
-            -PppVersionCode=$((10100 + ${GITHUB_RUN_NUMBER}))
+            -PppVersionCode="$APP_CODE"
 
       - name: Collect APK
         run: |
@@ -72,7 +101,10 @@ jobs:
           if-no-files-found: error
 
   pc:
+    needs: version
     runs-on: windows-latest
+    env:
+      APP_VERSION: ${{ needs.version.outputs.name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -110,7 +142,7 @@ jobs:
       - name: Build MSI
         shell: bash
         env:
-          APP_VER: ${{ env.APP_VERSION }}
+          APP_VER: ${{ needs.version.outputs.name }}
         run: |
           export PP_JDK_HOME="$(cygpath -u "$JAVA_HOME")"
           bash make-msi.sh
@@ -125,9 +157,13 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [android, pc]
+    needs: [version, android, pc]
     runs-on: ubuntu-latest
+    env:
+      APP_VERSION: ${{ needs.version.outputs.name }}
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -141,6 +177,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > notes.md <<EOF
+          ## 更新日志
+
+          修复了一些问题，提高了稳定性。
+
           局域网内手机 ⇄ 电脑的文件 / 文本 / 文件夹互传，自动识别对方客户端；支持局域网视频与语音通话。
 
           | 平台 | 文件 | 说明 |
@@ -154,10 +194,15 @@ jobs:
           注意：CI 构建使用独立签名证书，与本地开发包签名不同，首次安装请先卸载旧版；之后各 Release 之间可直接覆盖升级。
           EOF
           TAG="v$APP_VERSION"
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if [ "${{ github.event_name }}" = "push" ]; then
+            gh release create "$TAG" dist/* -R "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "手机电脑互传 $APP_VERSION" \
+              --notes-file notes.md
+          elif gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
           else
-            gh release create -R "$GITHUB_REPOSITORY" "$TAG" dist/* \
+            gh release create "$TAG" dist/* -R "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "手机电脑互传 $APP_VERSION" \
               --notes-file notes.md

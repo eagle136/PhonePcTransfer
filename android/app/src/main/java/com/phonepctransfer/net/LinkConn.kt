@@ -37,11 +37,9 @@ import java.util.concurrent.locks.ReentrantLock
 
 import com.phonepctransfer.net.Link.Session
 
-// ======================================================================
-// 连接引擎（v2.7 拆分自 Link.kt）：保活重连、监听/连接循环、读循环、心跳、发送与弃会话。
-// ======================================================================
+// 连接引擎(拆分自 Link.kt):保活重连、监听/连接循环、读循环、心跳、发送与弃会话
 
-/** 保活重连节奏（2026-10-01 定稿）：断开 → 等 5s/10s/30s 各主动拨一次，仍不通转纯被动 */
+/** 保活重连节奏：断开 → 等 5s/10s/30s 各主动拨一次，仍不通转纯被动 */
 internal val KEEP_ALIVE_LADDER_MS = longArrayOf(5_000L, 10_000L, 30_000L)
 /** 最后一次拨号后等多久判定结果（TCP 连接 3s + 握手等待 2.5s，留余量） */
 internal const val KEEP_ALIVE_RESOLVE_MS = 10_000L
@@ -55,9 +53,8 @@ internal fun Link.scheduleKeepAlive(ip: String) {
     }
 
 /**
- * 保活重连状态机（单线程池 [Link.keepAliveExec]，链式一次性调度，任一时刻每台设备只有一个在途任务）：
- * 阶梯拨号（[KEEP_ALIVE_LADDER_MS]）→ 最后一拨后判定：恢复即取消；本端正在传输/通话
- * （[Link.keepAliveBusy]）→ 不降级，每 30s 继续拨并再判定；否则转纯被动。
+ * 保活重连状态机(单线程池,链式一次性调度,任一时刻每台设备只有一个在途任务):
+ * 阶梯拨号 → 最后一拨后判定:恢复即取消;本端正在传输/通话→不降级,每 30s 继续拨并再判定;否则转纯被动
  */
 internal fun Link.runKeepAliveDial(ip: String, attempt: Int) {
         if (!running) return
@@ -117,12 +114,8 @@ internal fun Link.cancelKeepAlive(ip: String) {
     // ==================== 监听 / 连接 ====================
 
 internal fun Link.acceptLoop() {
-        // 绑定重试：覆盖安装（pm install -r）后旧进程可能被保活机制短暂拉住、尚未释放
-        // TCP 端口，新进程一次 bind 失败就永久退出会让设备「谁都连不上」（2026-09-15
-        // a12 实测 EADDRINUSE 后装聋）。每 3s 重试直到成功或 Link 停止。
-        // 进一步（2026-09-15 a12 二次实测）：MIUI 的 scene-daemon 会**长期占用
-        // 127.0.0.1:8765**，通配绑定（*:8765）与 loopback 上的监听冲突，重试永远失败。
-        // 此时退回绑定本机局域网 IPv4 —— 与 127.0.0.1 的占用者不冲突，协议行为不变。
+        // 绑定重试:覆盖安装可能让旧进程短暂占住端口,每 3s 重试直到成功或停止;
+        // 通配绑定始终失败(如 127.0.0.1:端口被系统长期占用)则退回绑本机局域网 IPv4,协议行为不变
         var bound: ServerSocket? = null
         var attempt = 0
         var fallbackLogged = false
@@ -182,16 +175,8 @@ internal fun Link.localLanIpv4(): String? {
     }
 
     /**
-     * 连接工人：**只在有人点了设备（或启动自动连接）时才动一次**，失败不重试。
-     *
-     * 旧版是个 while 轮询循环（连不上就 1s→2s→5s 一直敲，还要处理 busy 退避），
-     * 多端在线时会互相刷日志、互相挤连接。现在改成"点一次、试一次"：请求由 connectTo()
-     * 投递，处理完即清空，之后线程只是睡着，不再产生任何网络行为 —— 这也是
-     *「不主动频繁发包」的一部分。
-     *
-     * 2026-09-19「一台设备多个地址」：请求是**一串**候选地址（见 [Link.groupCandidates]），
-     * 这里串行逐个试：**某个地址连上并握手成功 → 立刻停**，后面同设备的地址一律不再试；
-     * 全部失败 → 队列清空、**不再重试**，直到对端被动连过来或用户再点一次设备。
+     * 连接工人:只在有人点了设备(或启动自动连接)时才动一次,点一次试一次、失败不重试(不轮询、不频繁发包);
+     * 请求是一串同设备候选地址,串行逐个试:某个连上并握手成功→立刻停;全部失败→清空队列,等对端被动连入或用户再点
      */
 internal fun Link.connectLoop() {
         while (running) {
@@ -263,10 +248,7 @@ internal fun Link.connectLoop() {
         }
     }
 
-    /**
-     * 等这条会话完成握手（hello/ping 任一帧回来即可）。
-     * @return true = 已握手（该地址确实是我们的对端）
-     */
+    /** 等这条会话完成握手(hello/ping 任一帧);true = 该地址确实是我们对端 */
 internal fun Link.waitHandshake(s: Session, ms: Long): Boolean {
         val t0 = System.currentTimeMillis()
         while (running && System.currentTimeMillis() - t0 < ms) {
@@ -365,9 +347,7 @@ internal fun Link.readLoop(s: Session) {
     }
 
     /**
-     * 心跳循环（每 5s 一次，见 [Link.STALL_SCAN_MS]）：ping + 假连接判定 + 停滞看门狗。
-     * 停滞看门狗每 tick 顺带跑（不新开线程）：接收侧 30s 无进度 / 发送侧 30s 无新字节
-     * → 停成「已暂停」，半成品保留，重连后自动续传；另回收闲置 10 分钟的未完成目录。
+     * 心跳循环(每 5s 一次):ping + 假连接判定 + 停滞看门狗(每 tick 顺带跑:30s 无进度→停成"已暂停"、半成品保留、重连后自动续传;另回收闲置 10 分钟的未完成目录)
      */
 internal fun Link.heartbeatLoop() {
         while (running) {
@@ -405,10 +385,8 @@ internal fun Link.heartbeatLoop() {
     // ==================== 发送（失败即判死） ====================
 
     /**
-     * 统一发送入口：任何异常都视为该会话已失效——立刻关闭它、让状态按会话集合重算。
-     *
-     * 只动这一条会话：**别的设备的连接不受影响**（多设备互不干扰）。
-     * 不重连 —— 断了就是断了，用户点设备才会再连。
+     * 统一发送入口:任何异常都视为该会话已失效(立刻关闭、状态按会话集合重算);
+     * 只动这一条会话(别的设备连接不受影响),不重连(用户点设备才会再连)
      */
 internal fun Link.sendOrDrop(s: Session, j: JSONObject, what: String, quiet: Boolean = false): Boolean {
         return try {
@@ -436,10 +414,7 @@ internal fun Link.sendOrDrop(s: Session, j: JSONObject, what: String, quiet: Boo
         }
     }
 
-    /**
-     * 会话失效：关掉并从集合摘除，状态按会话集合重算。
-     * 只影响这一条会话 —— 别的设备的连接不受影响（多设备互不干扰）。
-     */
+    /** 会话失效:关闭并从集合摘除,状态按会话集合重算;只影响这一条会话 */
 internal fun Link.dropSession(s: Session) {
         s.close()
         sessions.remove(s)
@@ -448,9 +423,7 @@ internal fun Link.dropSession(s: Session) {
         refreshState()
     }
 
-// ============================================================================
-// ===== 隐性调试出口 —— 定稿（GATE-A2 / 任务 4.4）时整块删除，含 adopt 里那一行调用 =====
-// ============================================================================
+// 隐性调试出口:定稿时整块删除(含 adopt 里那一行调用)
 // 开关是编译期常量：日常与发布包恒为 false，不输出任何内容；开发期排查时改成 true。
 internal const val BLOCK_DEBUG = false
 

@@ -17,20 +17,7 @@ import android.os.Looper
 import android.util.Log
 import com.phonepctransfer.net.Link
 
-/**
- * 前台服务：让链路在应用退到后台/挂小窗时依然存活。
- *
- * 启动前置条件（targetSdk 34+ 的硬校验）：
- *  1) 定位/网络类权限已授予 —— 本服务只要 INTERNET/通知
- *  2) 应用处于 eligible state（前台/宽限期）—— 因此只由 MainActivity 在 onResume 里拉起
- * 服务内部 startForeground 全部包 runCatching 兜底。
- *
- * ⚠️ ColorOS 速冻豁免（2026-09-15 a16 实测）：
- * OplusHansManager 对退后台应用 ~6s 后 cgroup freeze + OplusNetd DestroyAllSocket，
- * dataSync 型 FGS 不能豁免（实测被冻、连接 RST）。唯一可靠豁免 = 带活跃 MediaSession
- * （STATE_PLAYING）的 mediaPlayback 型 FGS —— 音乐类应用从不被冻，照此模拟。
- * 因此本服务同时声明 dataSync|mediaPlayback 两种类型，并持有一个"播放中"的 MediaSession。
- */
+/** 前台服务：后台/小窗时保活链路；仅前台拉起（满足 startForeground 校验），持有「播放中」MediaSession 换取 ColorOS 速冻豁免 */
 class TransferService : Service() {
 
     private val main = Handler(Looper.getMainLooper())
@@ -53,10 +40,7 @@ class TransferService : Service() {
         setupMediaSession()
     }
 
-    /**
-     * 创建"正在播放"的 MediaSession —— Hans 速冻豁免的关键。
-     * 不设任何轨/不发声，只是让系统媒体面板认为有一个活跃播放。
-     */
+    /** 创建「播放中」的 MediaSession（不设轨/不发声），Hans 速冻豁免的关键 */
     private fun setupMediaSession() {
         if (mediaSession != null) return
         runCatching {
@@ -102,18 +86,7 @@ class TransferService : Service() {
         }
     }
 
-    /**
-     * 当前要申报的前台服务类型。
-     *
-     * 基线 = dataSync|mediaPlayback（ColorOS 速冻豁免所需，见类注释）。
-     * **camera 只在 CAMERA 权限已授予时才加**：
-     * Android 14 起，申报 `camera` 类型时若没有 CAMERA 权限 → startForeground 抛
-     * SecurityException → 服务起不来（本项目已知的「manifest/runtime 不一致」类事故）。
-     * 恒加 camera 会让「从不打视频的用户」也承担这个风险，故按权限条件添加。
-     *
-     * 类型始终是 manifest 的超集子集关系：manifest 声明了 dataSync|mediaPlayback|camera，
-     * runtime 只会申报其中的子集 → 不会触发「runtime 多要类型」的崩溃。
-     */
+    /** 当前申报的 FGS 类型：基线 dataSync|mediaPlayback（速冻豁免），CAMERA 权限已授予才加 camera（无权限申报会抛 SecurityException）；申报类型恒为 manifest 声明的子集 */
     private fun currentFgsType(): Int {
         var t = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
@@ -126,13 +99,7 @@ class TransferService : Service() {
         return t
     }
 
-    /**
-     * 视频通话开始时调用：把前台服务类型"升级"到含 camera。
-     *
-     * 首次 startForeground 时用户可能还没授予相机权限（那时不能申报 camera），
-     * 授权后需要重新申报一次 —— API 29+ 允许重复调用 startForeground 更新类型。
-     * 注意：**只允许扩大**，缩类型在部分 ROM 上会抛异常，因此这里不做降级。
-     */
+    /** 相机权限授予后把 FGS 类型重新申报为含 camera（API 29+ 允许重复申报更新；只允许扩大不降级） */
     private fun refreshFgsType() {
         if (!fgsStarted) return
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
@@ -149,10 +116,8 @@ class TransferService : Service() {
         if (tick != null) return
         val r = object : Runnable {
             override fun run() {
-                // WiFi 门禁已移除：服务常驻，不再因「没 WiFi」自行收摊
+                // 服务常驻（WiFi 门禁已移除），每轮刷通知；相机权限可能后授予，每轮复查并升级 FGS 类型
                 updateNotification()
-                // 相机权限可能在服务启动之后才授予（用户第一次点「视频」时才会弹框）→
-                // 每轮 tick 复查一次，授权后自动把 FGS 类型升级到含 camera。
                 refreshFgsType()
                 main.postDelayed(this, 5000)
             }
@@ -166,7 +131,7 @@ class TransferService : Service() {
         tick = null
         fgsStarted = false
         lastFgsType = 0
-        // 假媒体会话随服务销毁一起释放，避免泄漏后残留在系统媒体面板里
+        // 释放假媒体会话，免残留系统媒体面板
         runCatching { mediaSession?.release() }
         mediaSession = null
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -212,12 +177,7 @@ class TransferService : Service() {
     }
 
     private fun buildNotification(): Notification {
-        // 点通知 = 把应用切到前台。
-        // Intent 按「点桌面图标」的标准形态构造：ACTION_MAIN + CATEGORY_LAUNCHER，
-        // 并显式带上 NEW_TASK | CLEAR_TOP | SINGLE_TOP | RESET_TASK_IF_NEEDED ——
-        // 裸 Intent(context, MainActivity) 在 singleTask 下偶尔会只在最近任务里换个位置而不真的
-        // 浮到最前；带上这几个标志后行为和点图标完全一致：已有任务整体提到前台、复用原 Activity
-        // （走 onNewIntent，界面状态不丢），从未启动过才新建。
+        // 点通知 = 点桌面图标：ACTION_MAIN + LAUNCHER + NEW_TASK|CLEAR_TOP|SINGLE_TOP|RESET_TASK_IF_NEEDED，已有任务整体提到前台并复用原 Activity
         val open = Intent(this, MainActivity::class.java).apply {
             action = Intent.ACTION_MAIN
             addCategory(Intent.CATEGORY_LAUNCHER)
@@ -238,16 +198,9 @@ class TransferService : Service() {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
         }
-        // ⚠️ 故意不用 Notification.MediaStyle：MediaStyle + sessionToken 会让系统把这条通知
-        // 渲染成「媒体播放卡片」（音乐播放器同款外观，还进通知栏媒体区）。
-        // ColorOS 的 Hans 豁免看的是 FGS 类型（mediaPlayback）+ 活跃 MediaSession，
-        // 不看通知样式 —— 去掉 MediaStyle 后豁免照常生效，通知恢复普通常驻条外观。
-        // 假会话也不设 Callback / 不带播放动作处理，媒体按键仍路由给真正的音乐应用，
-        // 不影响正常音乐播放。
+        // 故意不用 MediaStyle（否则渲染成媒体播放卡片）；Hans 豁免看 FGS 类型+活跃会话而非通知样式；媒体按键仍路由给真正的音乐应用
         return b.setContentTitle(getString(R.string.app_name))
-            // 正文换成「别划掉」的提醒（2026-09-22 用户定调）：这条通知 = 前台服务本体，
-            // 划掉即失去前台服务保护，后台容易被系统清理 → 用会话来提示用户保留。
-            // 连接状态/待发条数下沉到 subText（小字），信息没丢，只是不再占正文。
+            // 正文是「别划掉」提醒（划掉即失前台服务保护），连接状态/待发条数下沉到 subText
             .setContentText(getString(R.string.notif_keep_hint))
             .setSubText(statusLine())
             .setSmallIcon(android.R.drawable.stat_sys_upload_done)

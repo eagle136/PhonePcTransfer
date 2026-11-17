@@ -7,12 +7,9 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 
 /**
- * 后台保活无障碍服务。
- *
- * 仅用于让本进程在后台更难被系统冻结 / 杀掉，从而保证文件传输与语音通话
- * 在退到后台后仍能持续运行（ColorOS/Hans 等 ROM 对普通后台进程会在数秒内冻结
- * 并掐断 socket）。本服务**不订阅任何屏幕内容、不读取剪贴板、不做选区捕获**——
- * 所有 onAccessibilityEvent 一律忽略，无任何屏幕 / 剪贴板读取逻辑。
+ * 后台保活无障碍服务：仅用于让本进程在后台更难被系统冻结/杀掉，保证文件传输与语音通话在退到后台后仍能持续运行
+ *（ColorOS/Hans 等 ROM 对普通后台进程会在数秒内冻结并掐断 socket）。
+ * 不订阅任何屏幕内容、不读取剪贴板、不做选区捕获——所有 onAccessibilityEvent 一律忽略。
  */
 class ClipCaptureService : AccessibilityService() {
 

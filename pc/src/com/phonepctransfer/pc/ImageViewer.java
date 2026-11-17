@@ -78,7 +78,7 @@ public final class ImageViewer {
 
             // 关闭按钮用「×」(U+00D7)：雅黑有字形；「✕」(U+2715) 无字形会渲染成「口」
             close = new JButton("×");
-            // 2026-09-29（「全部统一」配套）：自设深灰底白字「×」保持 FLAT（不套 Modern 灰卡）
+            // 自设深灰底白字「×」保持 FLAT（不套 Modern 灰卡）
             Ui.flat(close);
             // 档位：常规 15（=发送文件按钮同档）
             close.setFont(new Font(Fonts.FAMILY, Font.PLAIN, Ui.FS_STD));
@@ -91,9 +91,8 @@ public final class ImageViewer {
             close.setToolTipText("关闭（ESC）");
             close.addActionListener(e -> dispose());
 
-            // 布局交给 doLayout：窗口首次显示和每次尺寸变化都会走这里。
-            // 旧实现只在构造期 + componentResized 里摆放 —— setBounds 先于
-            // 监听器注册，首次显示不触发 resize，图片面板永远 0×0 → 白屏。
+            // 布局交给 doLayout：窗口首次显示和每次尺寸变化都会走这里
+            //（setBounds 先于监听器注册，首次显示不触发 resize）。
             final JLayeredPane lp = new JLayeredPane() {
                 @Override
                 public void doLayout() {

@@ -32,36 +32,14 @@ import com.phonepctransfer.util.ShareIn
 import com.phonepctransfer.voice.CallManager
 import kotlin.system.exitProcess
 
-/**
- * 唯一的 Activity。
- *
- * 生命周期 → 剪贴板联动语义：
- *  - onResume / onPause        → 「应用是否可见」。**挂小窗时是 RESUMED**，
- *                                剪贴板轮询挂在这个状态上（不是焦点上），所以小窗里照样能同步。
- *  - onWindowFocusChanged      → 「是否持有窗口焦点」。读剪贴板真正需要的是它（Android 10+）；
- *                                失焦**不停**轮询，只在拿到焦点时补读一次。
- *  - onUserLeaveHint           → 用户主动离开，此刻仍有焦点，是补推剪贴板的可靠时机。
- *
- * 另外这里还是**系统「分享」的入口**（manifest 里给 SEND / SEND_MULTIPLE 注册了全部 MIME 类型）：
- * 别的应用分享文件过来 → 解析出 Uri → 交给 AppCore 弹「发送到哪台设备」→ 选定即开始传。
- */
+/** 唯一 Activity，兼系统「分享」入口；剪贴板联动挂生命周期状态（可见即轮询、拿焦点补读、主动离开补推） */
 class MainActivity : ComponentActivity() {
 
-    // 文件/文件夹的挑选已改为**应用内**的 [com.phonepctransfer.ui.FileBrowser]（2026-10-05）：
-    // 不再用 ActivityResultContracts.OpenDocument / OpenDocumentTree 那套系统选择器。
-    // （SAF 授权对话框只在「没有『所有文件访问』」的降级路径上出现，由浏览器页面自己发起。）
+    // 文件/文件夹挑选用应用内 FileBrowser，不再走系统 SAF 选择器（无「所有文件访问」的降级路径由浏览器页面发起）
 
-    // ==================== 启动权限引导（一项一问，2026-10-01）====================
-    //
-    // 冷启动把「未授予、且没被永久跳过」的项排成一队，**一项一弹**，三个出口：
-    //   前往   → 发起该项申请（运行时弹框 / 跳对应系统设置页）
-    //   取消   → 本次跳过，下次冷启动再问
-    //   不需要 → 只把这一项写进 Prefs.permNeverAsk，以后不再问该项
-    // 任何一项不给都不拦启动：队列走完后统一 toast 提醒「相关功能可能异常」。
-    // 无障碍保活不在这支队列里，另走独立一问两按钮（见 [maybeAskA11yKeepAlive]）。
-    // 队列走完时，如果本次**刚授予过**「本地网络 / 文件读取」（BootPerms.rebuildOnGrant）→
-    // 自动退出并重新拉起一次：授权前建好的 socket 与设备列表是「半授权」状态的产物，
-    // 不换进程就会「点了允许照样连不上」（见 [restartForPermissions]）。
+    // ==================== 启动权限引导 ====================
+    // 冷启动对未授予且未永久跳过的项一项一弹（前往/取消/不需要），不给不拦启动；
+    // 无障碍保活另走独立一问；本次刚授予本地网络/文件读取则队列走完后重启进程一次重建链路（见 [restartForPermissions]）。
 
     /** 待询问队列（= BootPerms.list()，已授予与「不需要」的项在推进时跳过） */
     private val bootQueue = mutableListOf<BootPerm>()
@@ -75,18 +53,14 @@ class MainActivity : ComponentActivity() {
     /** 「要不要使用无障碍保活」这一问是否显示（本次冷启动只问一次） */
     private val a11yAsk = mutableStateOf(false)
 
-    /**
-     * 本次冷启动里是否**刚授予过** [BootPerms.rebuildOnGrant]（本地网络 / 文件读取）里的某一项。
-     * 命中就在队列走完时用一次干净的重启把链路和设备列表重建起来（见 [restartForPermissions]）。
-     */
+    /** 本次冷启动是否刚授予过本地网络/文件读取（是则队列走完后重启一次重建链路） */
     private var bootRebuildNeeded = false
 
     /** 运行时权限：单个申请（一次只弹一个系统框，由回调驱动下一项） */
     private val bootRuntimeLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             val p = bootQueue.getOrNull(bootIdx)
-            // 拒绝**不阻断**流程：后面还有别的权限要问，且这些权限多是「用到才必需」。
-            // 只给一句提示，让用户知道哪块功能会缺。
+            // 拒绝不阻断流程，仅提示相关功能可能异常
             if (!granted && p != null) AppCore.toast("未授予「${p.title}」，相关功能可能异常")
             // 授予的是「前提性」权限 → 记下来，本轮问完重启一次（旧 socket 不随权限变化）
             if (granted && p != null && p.id in BootPerms.rebuildOnGrant) bootRebuildNeeded = true
@@ -117,8 +91,7 @@ class MainActivity : ComponentActivity() {
             if (granted) {
                 cont?.invoke() ?: AppCore.startCall()
             } else {
-                // 走到回调里说明本次「已请求过」：此时 shouldShowRequestPermissionRationale
-                // 返回 false 才是真正的「永久拒绝（不再询问）」；否则是普通拒绝，再点还会弹框。
+                // 已请求过后 rationale=false 才是永久拒绝（不再询问），否则是普通拒绝再点还会弹
                 if (!shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)) {
                     AppCore.toast("录音权限已被拒绝，请到系统设置 → 应用 → 权限 中开启")
                 } else {
@@ -145,27 +118,20 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Android 15+（API 35）对 targetSdk 35+ 的应用强制 edge-to-edge；这里显式开启让低版本行为一致。
-        // 系统栏内边距交给 ChatScreen 的顶栏/底栏各自消费（否则内容会被状态栏、导航栏压住）。
+        // 显式开启 edge-to-edge（各版本行为一致），系统栏内边距由 ChatScreen 顶栏/底栏各自消费
         enableEdgeToEdge()
-        // 关掉系统给系统栏自动叠的「对比度蒙层」：三键导航时 Android 会在导航栏区域叠一层半透明黑，
-        // 会把应用主题色盖成一条黑边（该开关 API 29+ 起才有）。
+        // 关闭系统栏对比度蒙层（API 29+，否则三键导航叠一条黑边）
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             window.isNavigationBarContrastEnforced = false
             window.isStatusBarContrastEnforced = false
         }
         AppCore.init(applicationContext)
-        // 上一次是因为「刚授予了本地网络 / 文件权限」而自杀重启的 → 说明一句为什么闪了一下
-        //（提示只能在重启后弹：重启前的进程马上要死，toast 来不及交给系统）
+        // 因授权触发自杀重启的，重启后说明一句（toast 只能重启后弹）
         if (AppCore.prefs.permRestartNotice) {
             AppCore.prefs.permRestartNotice = false
             AppCore.toast("权限已生效，已重启应用以重建连接与设备列表")
         }
-        // 录音权限申请入口：通话/视频按钮点击且未授权时触发。
-        // ⚠ 不能在这里用 shouldShowRequestPermissionRationale 预判「永久拒绝」——
-        // 该 API 在「首次请求前」同样返回 false，会把第一次点通话误判成永久拒绝、
-        // 从而根本不弹权限框（表现为「点了没反应」）。正确做法是直接申请，
-        // 在回调里（已请求过）再区分是普通拒绝还是永久拒绝。
+        // 录音权限申请入口：直接申请，回调里再区分普通/永久拒绝（rationale API 首请求前也返回 false，不能预判）
         AppCore.recordPermRequester = { after ->
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
                 PackageManager.PERMISSION_GRANTED
@@ -187,20 +153,14 @@ class MainActivity : ComponentActivity() {
                 cameraPermLauncher.launch(Manifest.permission.CAMERA)
             }
         }
-        // 来电启动意图（全屏意图 / 通知按钮）——必须在 setContent 之前处理：
-        // showWhenLocked 越早设越稳；「接听」动作也要在相机权限申请入口注册好之后才执行。
+        // 来电启动意图（须先于 setContent：showWhenLocked 越早越稳，接听动作还依赖相机申请入口已注册）
         applyCallIntent(intent)
-        // 启动权限引导先跑：一项一弹，每一问的三个出口都在 MainActivity 的 onBootPerm* 里。
-        // 必须排在 setContent **之前**，界面才能首帧就把当前那一问画出来。
+        // 启动权限引导须先于 setContent，首帧才能画出当前那一问
         startBootPermAsks()
         setContent {
-            // 主题状态在**根作用域**读取后传给 PPTheme（见 Theme.kt 的注释）：
-            // 切换时整个内容 lambda 重新执行，配色保证当帧跟上新主题。
+            // 主题状态在根作用域读取后传给 PPTheme，保证配色当帧跟上新主题
             val dark = isAppDark()
-            // 系统栏样式**显式钉死**成当前主题（2026-10-01 用户反馈：浅色模式下
-            // 通知栏时间还是白的）。onCreate 里那次 enableEdgeToEdge() 是 auto=跟随系统，
-            // ColorOS 在系统深色 + 应用浅色时会把状态栏图标一直按白色画，
-            // 只设 isAppearanceLightStatusBars 会被它盖回去；每次主题变化重设一次固定样式。
+            // 系统栏样式显式钉死成当前主题（ColorOS 浅色主题下状态栏图标否则一直画白）
             DisposableEffect(dark) {
                 val transparent = android.graphics.Color.TRANSPARENT
                 val barStyle = if (dark) SystemBarStyle.dark(transparent)
@@ -209,8 +169,7 @@ class MainActivity : ComponentActivity() {
                 onDispose { }
             }
             PPTheme(dark = dark) {
-                // 锁屏来电（2026-09-22）：呼入有结果（接听/拒绝/超时）后撤销「盖在锁屏之上」，
-                // 免得应用长期凌驾锁屏（那等于锁屏上能直接翻聊天记录）。
+                // 呼入有结果后撤销「盖在锁屏之上」，避免应用长期凌驾锁屏
                 val inc = AppCore.incomingCall
                 val talking = AppCore.callState == CallManager.State.TALKING
                 LaunchedEffect(inc != null, talking) {
@@ -242,10 +201,7 @@ class MainActivity : ComponentActivity() {
         handleShareIntent(intent)
     }
 
-    /**
-     * 应用已在后台/已被 singleTask 收起时，别的应用又分享过来：走这里，**不重建界面**。
-     * 系统把本任务带到前台后回调，所以用户看到的就是「应用跳到前台 + 弹选择框」。
-     */
+    /** 后台收到分享：不重建界面，任务带到前台后直接处理 */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
@@ -254,15 +210,11 @@ class MainActivity : ComponentActivity() {
         applyCallIntent(intent)
     }
 
-    /**
-     * 解析系统「分享」并交给 AppCore → 界面弹「发送到哪台设备」。
-     * 非分享 Intent（如点通知/点图标进来的 ACTION_MAIN）会被 [ShareIn.parse] 直接滤掉。
-     */
+    /** 解析系统「分享」交 AppCore 弹「发送到哪台设备」（非分享 Intent 被 [ShareIn.parse] 滤掉） */
     private fun handleShareIntent(intent: Intent?) {
         val payload = ShareIn.parse(this, intent) ?: return
         AppCore.onShared(payload)
-        // 提前把链路拉起来（此刻确实在前台，满足 targetSdk 34+ 的 eligible-state 校验），
-        // 这样用户选完设备往往链路已经就绪，可以直接开始传、不用先落到待发队列。
+        // 前台提前拉起链路，选完设备往往可直接开传、不必落待发队列
         ensureService()
     }
 
@@ -277,10 +229,7 @@ class MainActivity : ComponentActivity() {
         super.onPause()
     }
 
-    /**
-     * 用户主动离开（HOME / 最近任务 / 切换应用）。此回调早于 onPause，此时 Activity 仍持有
-     * 焦点，是补推剪贴板的唯一可靠时机（失焦后系统不让读剪贴板）。
-     */
+    /** 用户主动离开（早于 onPause、仍持有焦点），是补推剪贴板的唯一可靠时机 */
     override fun onUserLeaveHint() {
         AppCore.onUserLeaveHint()
         super.onUserLeaveHint()
@@ -294,38 +243,27 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // onCreate 里注入的两个权限申请 lambda 捕获了本 Activity，却被 AppCore 单例长期持有：
-        // 配置变更（旋转）后旧 Activity 会被多活一份，直到下次 onCreate 覆盖。这里主动断开。
-        // 时序安全：配置变更时旧 Activity 完全销毁后才创建新实例，新 onCreate 会重新注入；
-        // 置 null 后 AppCoreCall 的 ?.invoke 自然跳过，比「调用已死 Activity 的 launcher」更安全。
+        // 两个权限申请 lambda 捕获了本 Activity 却被 AppCore 单例长期持有：销毁时主动断开，防调用已死 Activity 的 launcher
         AppCore.recordPermRequester = null
         AppCore.cameraPermRequester = null
     }
 
-    /**
-     * 前台服务常驻拉起（WiFi 门禁已移除，数据网络下也运行）。启动点全部位于前台生命周期，
-     * 满足 targetSdk 34+ 对 startForeground 的 eligible-state 硬校验。
-     */
+    /** 前台服务常驻拉起（启动点都在前台生命周期，满足 startForeground 校验） */
     private fun ensureService() {
         AppCore.refreshLan()
         val i = Intent(this, TransferService::class.java)
         runCatching { startForegroundService(i) }
     }
 
-    // ==================== 锁屏来电（2026-09-22） ====================
+    // ==================== 锁屏来电 ====================
 
-    /**
-     * 处理来电相关的启动意图（由 [CallNotif] 的全屏意图 / 通知按钮拉起）：
-     *  - [CallNotif.EXTRA_CALL_UI] = true → 允许本界面盖在锁屏**之上**（用户在锁屏上直接接听/挂断）
-     *  - [CallNotif.EXTRA_CALL_ACTION] = accept/reject → 通知按钮的动作；进程被系统重建时在此兜底执行
-     */
+    /** 处理来电启动意图（[CallNotif] 全屏意图/通知按钮拉起）：允许盖锁屏之上，并兜底执行接听/挂断动作 */
     private fun applyCallIntent(intent: Intent?) {
         val i = intent ?: return
         if (!i.getBooleanExtra(CallNotif.EXTRA_CALL_UI, false)) return
         showOverLockScreen()
         val act = i.getStringExtra(CallNotif.EXTRA_CALL_ACTION)
-        // ⚠️ 取完立刻清掉：Activity 重建（配置变更 / 被系统回收后恢复）会拿**同一个 Intent**
-        //    再走一遍 onCreate，不清就会「重建一次 = 又接听/又拒绝一次」。
+        // 动作取完立刻清掉，防 Activity 重建后拿同一 Intent 重复执行
         i.removeExtra(CallNotif.EXTRA_CALL_ACTION)
         when (act) {
             CallNotif.ACTION_ACCEPT -> AppCore.acceptCall()
@@ -351,12 +289,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * 冷启动入口：算出待问队列，从第一项开始**一项一弹**。
-     *
-     * 这里只弹说明，**不申请任何东西** —— 申请必须等用户在单项弹窗上点「前往」。
-     * 核心语义不变：先把这一项的用途讲清楚，再要这一项。
-     */
+    /** 冷启动入口：建待问队列并从第一项开始一项一弹（只弹说明，申请等用户点「前往」） */
     private fun startBootPermAsks() {
         bootQueue.clear()
         bootQueue += BootPerms.list()
@@ -364,14 +297,7 @@ class MainActivity : ComponentActivity() {
         askNextBootPerm()
     }
 
-    /**
-     * 推进器：弹出 [bootIdx] 那一行的说明弹窗。
-     *  - 已授予 / 已选过「不需要」→ 直接让位给下一项
-     *  - 队列走完 → 刚授予过「本地网络 / 文件读取」就先重启进程一次（[restartForPermissions]，
-     *    旧 socket 不随权限变化）；否则提醒「没给会怎样」→ 再问独立的那一题（无障碍保活）
-     *
-     * ⚠️ 一次只问一项：批量申请在部分 ROM 上会把多个权限框合成一个不可读的长列表。
-     */
+    /** 推进器：一项一弹（已授予/「不需要」跳过）；队列走完若刚授予本地网络/文件读取先重启，否则提醒缺项并问无障碍保活 */
     private fun askNextBootPerm() {
         val never = AppCore.prefs.permNeverAsk
         while (bootIdx < bootQueue.size) {
@@ -384,8 +310,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         bootAskItem.value = null
-        // 刚授予过「本地网络 / 文件读取」→ 先干净重启一次再继续（新进程里这些项已被视为满足，
-        // 不会重复重启；缺的项照旧逐项问，「没给会怎样」的提醒与无障碍那一问也放到重启之后）。
+        // 刚授予过本地网络/文件读取 → 先重启一次再继续（新进程视为已满足，不会重复重启）
         if (bootRebuildNeeded) {
             restartForPermissions()
             return
@@ -394,18 +319,7 @@ class MainActivity : ComponentActivity() {
         maybeAskA11yKeepAlive()
     }
 
-    /**
-     * 刚授予过 [BootPerms.rebuildOnGrant]（本地网络 / 文件读取）→ **自杀并重新拉起自己一次**。
-     *（2026-10-01 用户定调：避免授权过程中在缺权限状态下继续跑功能）
-     *
-     * 为什么必须换进程：权限生效前绑好的 28765/28766 socket 不会随权限变化 —— Android 16+ 没允许
-     * 本地网络时，socket 已经在「按 uid 丢弃局域网包」的规则下建立了，点了允许旧进程照样连不上
-     * 任何设备（Android 16 机型 实测：授权后立刻连仍超时，重启进程才通）。设备列表与在途会话同理。
-     *
-     * 顺序讲究：`send()` 是同步 binder 调用，返回时启动请求已经登记在系统侧，紧接着杀掉本进程，
-     * 系统会为新界面另起一个干净进程。提示不在这里弹（进程马上就没了，toast 发不出去），
-     * 改成写 [Prefs.permRestartNotice]，由重启后的第一个 onCreate 说明一句。
-     */
+    /** 自杀并重新拉起自己一次：旧 socket 不随权限变化，授权后旧进程照样连不上；提示 toast 推迟到重启后首个 onCreate */
     private fun restartForPermissions() {
         AppCore.prefs.permRestartNotice = true
         val i = packageManager.getLaunchIntentForPackage(packageName)
@@ -460,15 +374,7 @@ class MainActivity : ComponentActivity() {
         askNextBootPerm()
     }
 
-    /**
-     * 权限没给**不拦使用**，但要说清哪块功能会受影响（用户定调：可以不给，但要提醒）。
-     *
-     * 实测 a12/MIUI12、a16/ColorOS16：全屏意图会被 ROM 自家闸门静默拦掉，锁屏来电真正靠得住的
-     * 是**显示悬浮窗**（AOSP 层硬编码的后台起界面豁免；清单必须声明 SYSTEM_ALERT_WINDOW，
-     * 否则悬浮窗管理列表里根本没有本应用 —— 2026-09-22 踩过）。这两项没开的结果是「能收通知、
-     * 点通知接听」，但不会自动把接听界面顶到锁屏之上。只 toast 一句，不再自动跳设置页：
-     * 跳 = 变相逼用户开，与「可以不给」矛盾（旧的单点跳转引导由此取代）。
-     */
+    /** 权限没给不拦使用，只 toast 提醒受影响的功能（锁屏来电实际靠「显示悬浮窗」而非全屏意图） */
     private fun remindMissingPerms() {
         // 本地网络（API 36+）没给 = 一台设备都连不上，优先级高于下面两条「功能受限」的提醒
         val lan = BootPerms.list().firstOrNull { it.id == BootPerms.ID_LAN }
@@ -496,10 +402,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * 「要不要使用无障碍保活」——**独立一问**，不掺进权限队列（2026-10-01 用户定调）。
-     * 已开启、已选过「不需要」、或本次冷启动已经问过 → 都不再打扰；一次冷启动最多问一次。
-     */
+    /** 「无障碍保活」独立一问（不掺权限队列，一次冷启动最多问一次） */
     private fun maybeAskA11yKeepAlive() {
         if (a11yAsk.value) return
         if (BootPerms.ID_A11Y in AppCore.prefs.permNeverAsk) return

@@ -1,40 +1,77 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 图标前景：左电脑屏幕 + 右手机，中间双向箭头 -->
+<!-- 启动图标前景：与 PC 端 AppIcon.java 同一套几何（108 视口）。
+     渐变底 overscan 到 -20..128：自适应图标的前景可能被放大/视差，铺满才不会露底。
+     设备与箭头按 0.70 缩放居中，保证落在 72dp 可见圆内不被圆形遮罩切掉。 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- 显示区域背景色（用于挖空屏幕内框） -->
-    <path
-        android:fillColor="#0E4C8A"
-        android:pathData="M24,36 H62 V56 H24 Z" />
-    <path
-        android:fillColor="#0E4C8A"
-        android:pathData="M76,52 H92 V84 H76 Z" />
+    <!-- 背景：对角渐变 #42A5F5 → #1565C0（与 PC 同色） -->
+    <path android:pathData="M-20,-20 H128 V128 H-20 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="0"
+                android:startY="0"
+                android:endX="108"
+                android:endY="108">
+                <item android:color="#42A5F5" android:offset="0" />
+                <item android:color="#1565C0" android:offset="1" />
+            </gradient>
+        </aapt:attr>
+    </path>
 
-    <!-- 电脑屏幕外壳 -->
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M20,30 H66 A3,3 0 0 1 69,33 V59 A3,3 0 0 1 66,62 H47 V68 H56 V73 H33 V68 H42 V62 H23 A3,3 0 0 1 20,59 V33 A3,3 0 0 1 23,30 Z" />
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:scaleX="0.7"
+        android:scaleY="0.7">
 
-    <!-- 手机外壳 -->
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M73,46 H95 A3,3 0 0 1 98,49 V87 A3,3 0 0 1 95,90 H73 A3,3 0 0 1 70,87 V49 A3,3 0 0 1 73,46 Z" />
+        <!-- 电脑外壳 -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M18,28 H48 A4,4 0 0 1 52,32 V52 A4,4 0 0 1 48,56 H18 A4,4 0 0 1 14,52 V32 A4,4 0 0 1 18,28 Z" />
+        <!-- 电脑屏幕（挖空） -->
+        <path
+            android:fillColor="#1565C0"
+            android:pathData="M21,33 H45 A2,2 0 0 1 47,35 V49 A2,2 0 0 1 45,51 H21 A2,2 0 0 1 19,49 V35 A2,2 0 0 1 21,33 Z" />
+        <!-- 支架颈 + 底座 -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M29,56 H37 V60 H29 Z" />
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M24,60 H42 A2,2 0 0 1 42,64 H24 A2,2 0 0 1 24,60 Z" />
 
-    <!-- 双向箭头（手机 → 电脑 / 电脑 → 手机） -->
-    <path
-        android:fillColor="#FFD54F"
-        android:pathData="M30,80 H52 V76 H30 Z" />
-    <path
-        android:fillColor="#FFD54F"
-        android:pathData="M50,73 L60,78 L50,83 Z" />
-    <path
-        android:fillColor="#4FC3F7"
-        android:pathData="M28,92 H50 V96 H28 Z" />
-    <path
-        android:fillColor="#4FC3F7"
-        android:pathData="M30,89 L20,94 L30,99 Z" />
+        <!-- 手机外壳 -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M81,38 H93 A5,5 0 0 1 98,43 V73 A5,5 0 0 1 93,78 H81 A5,5 0 0 1 76,73 V43 A5,5 0 0 1 81,38 Z" />
+        <!-- 手机屏幕 + 底部按键（挖空） -->
+        <path
+            android:fillColor="#1565C0"
+            android:pathData="M82,44 H92 A2,2 0 0 1 94,46 V70 A2,2 0 0 1 92,72 H82 A2,2 0 0 1 80,70 V46 A2,2 0 0 1 82,44 Z" />
+        <path
+            android:fillColor="#1565C0"
+            android:pathData="M83.75,75 H90.25 A0.75,0.75 0 0 1 90.25,76.5 H83.75 A0.75,0.75 0 0 1 83.75,75 Z" />
+
+        <!-- 上箭头：手机 → 电脑（向左，白色） -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M60,44 H70 A2,2 0 0 1 70,48 H60 A2,2 0 0 1 60,44 Z" />
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M58,41 L52,46 L58,51 Z" />
+
+        <!-- 下箭头：电脑 → 手机（向右，亮青） -->
+        <path
+            android:fillColor="#4FC3F7"
+            android:pathData="M56,64 H66 A2,2 0 0 1 66,68 H56 A2,2 0 0 1 56,64 Z" />
+        <path
+            android:fillColor="#4FC3F7"
+            android:pathData="M68,61 L74,66 L68,71 Z" />
+    </group>
 </vector>

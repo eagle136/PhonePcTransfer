@@ -9,13 +9,10 @@ import com.phonepctransfer.util.SegMeter
 import java.util.ArrayDeque
 
 /**
- * HEVC / H.264 硬件解码器，输出到 Surface（计划 §5.3）。
- *
- * 设计要点：
- *  - **CONFIG 帧确定性 `configure()`**：参数集（VPS/SPS/PPS）作为 `BUFFER_FLAG_CODEC_CONFIG`
- *    入队，不依赖任何 Annex-B 解析。
- *  - **入队即返回**：网络读线程只调 [enqueue]，解码在私有 `pp-video-dec` 线程 ——
- *    在读线程里初始化解码器会阻塞 → 对端 35s 判死掉线（项目已踩过的红线）。
+ * HEVC / H.264 硬件解码器，输出到 Surface。
+ *  - **CONFIG 帧确定性 `configure()`**：参数集（VPS/SPS/PPS）作为 `BUFFER_FLAG_CODEC_CONFIG` 入队，不依赖任何 Annex-B 解析。
+ *  - **入队即返回**：网络读线程只调 [enqueue]，解码在私有 `pp-video-dec` 线程——
+ *    在读线程里初始化解码器会阻塞 → 对端 35s 判死掉线。
  *  - **有界队列 + 丢最旧**：UI/解码跟不上时宁可丢帧也不无限积压（视频通话的正确取舍）。
  */
 class VideoDecoder(
@@ -33,8 +30,8 @@ class VideoDecoder(
 
     /**
      * 队列元素（与 PC 端 `FfmpegDecoder.PendingAu` 同构）：
-     *  · [recvMs] —— 本端收到并入队的时刻（墙钟）：只用于算排队时延 `lat`（任务单 1.3）。
-     *  · [tsMs]   —— 发送端的**通话相对**时间戳（对端起呼=0 的 ms）：只作 presentationTimeUs；
+     *  · [recvMs] = 本端收到并入队的时刻（墙钟）：只用于算排队时延 `lat`；
+     *  · [tsMs]   = 发送端的**通话相对**时间戳（对端起呼=0 的 ms）：只作 presentationTimeUs，
      *    它与 [recvMs] 不同零点，**禁止相减**。
      */
     private class Item(
@@ -48,7 +45,7 @@ class VideoDecoder(
     private val queue = ArrayDeque<Item>()
     private val lock = Object()
 
-    // ==================== vOut 配对环（任务单 1.2，与 PC 端 FfmpegDecoder 同设计） ====================
+    // ==================== vOut 配对环（与 PC 端 FfmpegDecoder 同设计） ====================
     // 压入 = 「出队并已喂进 MediaCodec 的**图像** AU」的时刻；弹出 = 输出一帧渲染返回后。
     // 配对依据：发端编码器不产 B 帧 → 喂入序 = 输出序，1 AU 出 1 帧。
     // 参数集（config）喂得进去但不产帧，所以**不压环**，否则输出与时刻从这一刻起永久错开一帧。
@@ -87,17 +84,16 @@ class VideoDecoder(
 
     /**
      * 最近一帧「入队 → 真正喂给解码器」的排队时延（ms）—— video_fb 的 lat 指标。
-     * **唯一写入点**在 [drainLoop] 取帧处（任务单 1.3：此前全工程只有声明与读取，恒 0）。
+     * **唯一写入点**在 [drainLoop] 取帧处。
      */
     @Volatile
     var lastQueueDelayMs: Int = 0
         private set
 
     /**
-     * 接收端此刻是否正处于「丢帧期」（任务单 1.3，与 PC 端 `FfmpegDecoder.dropping()` 同名）。
-     * 安卓这条链路本来就是**丢最旧、不等 IDR**，所以口径是「最近一次入队有没有挤掉旧帧」：
-     * 溢出 → true，下一次入队不溢出 → false。语义与 PC 一致：**这一时刻的 lat 不可信，
-     * 画面正在丢帧**（旧口径把它折成 lat=0，最坏状态反而表现为"零延迟"）。
+     * 接收端此刻是否正处于「丢帧期」（与 PC 端 `FfmpegDecoder.dropping()` 同名）：
+     * 安卓这条链路本来就是**丢最旧、不等 IDR**，所以口径是「最近一次入队有没有挤掉旧帧」（溢出 → true，下一次入队不溢出 → false）。
+     * 语义与 PC 一致：**这一时刻的 lat 不可信、画面正在丢帧**（折成 lat=0 会让最坏状态反而表现为"零延迟"）。
      */
     @Volatile
     var dropping: Boolean = false
@@ -130,12 +126,9 @@ class VideoDecoder(
     }
 
     /**
-     * 按编码参数创建解码器。**必须已有 Surface**，否则返回 false。
-     * 重复调用会重建（参数变化时正是我们要的行为）。
-     *
+     * 按编码参数创建解码器。**必须已有 Surface**，否则返回 false；重复调用会重建（参数变化时正是我们要的行为）。
      * ⚠ `@Synchronized`：调用方可能来自两个线程（UI 挂 Surface / 网络分发线程收 cfg），
-     * 无锁并发会出现「一边 configure、另一边 stop+release 同一个 MediaCodec」→
-     * `IllegalArgumentException` → 对端画面整场黑屏（2026-09-22 a16 实测）。
+     * 无锁并发会出现「一边 configure、另一边 stop+release 同一个 MediaCodec」→ `IllegalArgumentException` → 对端画面整场黑屏。
      */
     @Synchronized
     fun prepare(mimeWanted: String, width: Int, height: Int): Boolean {
@@ -181,10 +174,8 @@ class VideoDecoder(
 
     /**
      * 网络读线程调用：只入队（有界，满则丢最旧并计数）。
-     *
-     * @param tsMs 该帧的**发送端通话相对**毫秒（对端起呼=0，与对端音频帧同零点）。
-     *             它直接喂给 `queueInputBuffer` 当 presentationTimeUs，因此只需单调，
-     *             不可与本端墙钟比较大小。
+     * tsMs = 该帧的**发送端通话相对**毫秒（对端起呼=0，与对端音频帧同零点）：
+     * 直接喂给 `queueInputBuffer` 当 presentationTimeUs，因此只需单调，不可与本端墙钟比较大小。
      */
     fun enqueue(data: ByteArray, len: Int, config: Boolean, tsMs: Long) {
         if (!running) return
@@ -219,7 +210,7 @@ class VideoDecoder(
                     if (polled != null) {
                         deqNano = System.nanoTime()
                         // lat 的**唯一写入点**：入队（本端墙钟 recvMs）→ 真正喂解码器前。
-                        // 只用同一个墙钟轴做差，绝不相减对端 ts（任务单 1.3）
+                        // 只用同一个墙钟轴做差，绝不相减对端 ts
                         lastQueueDelayMs = (System.currentTimeMillis() - polled.recvMs)
                             .coerceIn(0L, 9999L).toInt()
                     }

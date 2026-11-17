@@ -37,7 +37,7 @@ public final class PcMain {
     // ===== 单实例锁 =====
     // 每台机器只允许跑一个实例：先抢 127.0.0.1:8767 守卫端口，抢不到说明已有实例在跑，
     // 就连上它的守卫端口发一条 SHOW 让它把主窗口提到前台，然后本进程直接退出
-    // （旧版会继续跑成一个「没有 TCP 监听」的残废实例，托盘图标多一个还互相打架）。
+    // （不退出会继续跑成一个「没有 TCP 监听」的残废实例，托盘图标多一个还互相打架）。
     private static final int GUARD_PORT = 8767;
     private static java.net.ServerSocket guardSocket;
 
@@ -275,12 +275,12 @@ public final class PcMain {
 
     public static void main(String[] args) {
         try {
-            // ===== UI 缩放钉定（2026-09-29：1.25 → 1.0，必须是 main 里最先做的事）=====
+            // ===== UI 缩放钉定（必须是 main 里最先做的事）=====
             // 需求：按 100% 渲染 —— 1 逻辑 px = 1 物理 px，组件坐标/边框/字体底边全部落整数像素，
             // 消除分数 DPI 的抗锯齿抖动；宋体小字号（12~16px）内嵌点阵 1:1 命中，笔画最锐利。
             // Swing 本身 DPI-aware，会拿渲染缩放乘一切（字体/像素都是逻辑单位，比例不破，
             // 但物理观感跟着缩放变）→ 把渲染缩放钉在 1.0。
-            // 读 config.json 的 uiScale（缺省 1.0；0/"system" = 跟随系统；旧值 1.25 自动迁移为 1.0），设
+            // 读 config.json 的 uiScale（缺省 1.0；0/"system" = 跟随系统），设
             // sun.java2d.uiScale —— ⚠ setProperty 必须发生在任何 AWT/Swing 类初始化之前
             // 才生效（JBR 25 实测：-D 与程序内 setProperty 均验证有效，见 tools/DpiProbe.java）。
             Path root = Store.defaultRoot();
@@ -288,7 +288,7 @@ public final class PcMain {
             if (uiScale > 0) {
                 System.setProperty("sun.java2d.uiScale", String.valueOf(uiScale));
             }
-            // 文本抗锯齿：关（2026-09-29，与 100%+宋体清晰度改造配套）—— 小字号走宋体内嵌点阵，
+            // 文本抗锯齿：关 —— 小字号走宋体内嵌点阵，
             // 笔画锐利无灰边；大字号（>18px）走 outline，那几处单独显式开 AA（见 Ui.AALabel）。
             // ⚠ 同 uiScale，必须在任何 AWT/Swing 类初始化之前设置才生效。
             System.setProperty("awt.useSystemAAFontSettings", "off");
@@ -324,7 +324,7 @@ public final class PcMain {
                     + "  TCP " + store.tcpPort() + "  UDP " + store.udpPort());
             Log.i("候选 IP: " + store.peerIps());
 
-            // 主题（2026-09-27）：窗口还没建，只需换调色板 + UIManager 默认值；
+            // 主题：窗口还没建，只需换调色板 + UIManager 默认值；
             // 必须在 new ChatWindow 之前，否则首帧按浅色画完再切换会闪一下
             Ui.applyDark(store.darkTheme());
             Log.i("主题: " + (store.darkTheme() ? "深色" : "浅色"));
@@ -337,7 +337,7 @@ public final class PcMain {
                 Log.i("已清理 " + pruned + " 个 5 天未使用的设备地址");
             }
 
-            // 历史封顶（plan/15）：单设备历史文件超 8MB 时读-合并-按 ts 留最近 2000 条重写；
+            // 历史封顶：单设备历史文件超 8MB 时读-合并-按 ts 留最近 2000 条重写；
             // 同时清掉孤儿缩略图缓存（mid 已不在任何设备历史 / 待发队列里的）
             int capped = store.capHistoryFiles();
             if (capped > 0) {
@@ -351,7 +351,7 @@ public final class PcMain {
             final Link link = new Link();
             link.setStore(store);
 
-            // ===== 视频能力协商（PC 端**只收不发**，R2）=====
+            // ===== 视频能力协商（PC 端**只收不发**）=====
             // 能不能收视频取决于有没有可用的 ffmpeg：没有就广播 vid=false。
             // 手机端据 hello.vid 决定「敢不敢发 0x03 视频帧」——闸门在 Link.sendVideoTo()，
             // 对老端/无能力端一个视频帧都不会发出去（否则对端 readFrame 抛 IOException 断链）。
@@ -376,12 +376,12 @@ public final class PcMain {
 
             final ChatWindow win = new ChatWindow(link, store);
 
-            // 后台入向闸门判据（2026-10-01，与安卓端 incomingGate 同规则）：
+            // 后台入向闸门判据（与安卓端 incomingGate 同规则）：
             // 窗口隐藏进托盘 = 后台 → 陌生设备的 TCP 连入一律拒接，已知设备放行；
             // 窗口可见 = 前台 → 不限。isVisible() 线程安全（pp-accept 线程直接读）。
             link.windowHidden = () -> !win.isVisible();
 
-            // ===== 同设备多地址回落（2026-09-19，与安卓端对齐）=====
+            // ===== 同设备多地址回落（与安卓端对齐）=====
             // 点的是 A 地址、实际连上的是同一台设备的 B 地址 → 把「当前对话地址」跟到 B，
             // 否则顶栏/地址菜单回显的还是那个不通的 A。回调在 pp-connect 线程 → 转 EDT。
             link.onGroupFallback = (req, actual) ->
@@ -392,7 +392,7 @@ public final class PcMain {
             installVideoUi(call, store);
 
             // 本机剪贴板变化：直接把正文推给手机（手机端为纯被动接收，不再主动拉取；
-            // 2026-09-15 从 clip_notify「通知+手机来拉」改为 push 正文，配合安卓端新语义）
+            // 从 clip_notify「通知+手机来拉」改为 push 正文，配合安卓端新语义）
             final Clip clip = new Clip(new Clip.Listener() {
                 @Override
                 public void onClipChanged(String text, String sha1) {
@@ -418,7 +418,7 @@ public final class PcMain {
                     } else {
                         label = "○ 未运行";
                     }
-                    // 左栏底部只剩「接收目录」一行（2026-09-21 用户定调）：在线数 / 候选 IP
+                    // 左栏底部只剩「接收目录」一行：在线数 / 候选 IP
                     // 这类诊断信息不再上界面，所以这里不再拼 sub 文案（接收目录由左栏自己显示）。
                     win.setState(label, "");
                     Tray.setTooltip(label);
@@ -447,7 +447,7 @@ public final class PcMain {
                             && TransferKeywords.isSilentlyFiltered(m.text)) {
                         return;
                     }
-                    // 归属兜底（2026-09-21）：帧里没带 peer 的，先按 mid 反查一次再往界面上送。
+                    // 归属兜底：帧里没带 peer 的，先按 mid 反查一次再往界面上送。
                     // 不补这一步的话，界面的归属判据只能把这条件不明的消息**丢掉**（宁可不显示，
                     // 也不能让它串到别的设备的会话里）。
                     if (m.peerIp == null || m.peerIp.isEmpty()) {
@@ -458,7 +458,7 @@ public final class PcMain {
                     }
                     win.onMessageAdded(m);
                     if (!Msg.KIND_CLIP.equals(m.kind)) {
-                        // 历史对**自己发的消息也落盘**（旧版只落收到的 → 切走再切回/重启
+                        // 历史对**自己发的消息也落盘**（只落收到的话 → 切走再切回/重启
                         // 后自己发的内容全部凭空消失，聊天区看起来是空白的）。
                         // CLIP 不是消息，照旧不落；peerIp 归属不到不落（防写 _unknown.jsonl）。
                         if (m.peerIp != null && !m.peerIp.isEmpty()) {
@@ -491,7 +491,7 @@ public final class PcMain {
                             store.appendHistory(peer, m.toJson());
                         }
                     }
-                    // 收到文件**落盘完成**才弹托盘提示（2026-09-30）：以前挂在 added 上，
+                    // 收到文件**落盘完成**才弹托盘提示：以前挂在 added 上，
                     // 而接收 file_meta 被误标 ST_OK → 传输一开始就弹「文件已保存」，
                     // 完成这个真终态反而没有提示。
                     if (!m.isSelf() && Msg.KIND_FILE.equals(m.kind) && Msg.ST_OK.equals(m.status)
@@ -583,7 +583,7 @@ public final class PcMain {
                 }
 
                 /**
-                 * 振铃期逐档媒体协商（任务单 2.5）：交通话层转给媒体模块。
+                 * 振铃期逐档媒体协商：交通话层转给媒体模块。
                  * 与其它通话回调同一条独立线程，不占网络读线程。
                  */
                 @Override
@@ -641,7 +641,7 @@ public final class PcMain {
             disc.start();
 
             // ===== 启动扫一次局域网（只此一次）=====
-            // 闸门（2026-09-21 起）：本机 IP 必须落在**私网段**（10/8、172.16/12、192.168/16）
+            // 闸门：本机 IP 必须落在**私网段**（10/8、172.16/12、192.168/16）
             // 才真的扫 —— 公网 / 链路本地地址没有「本网段 /24」可扫，逐个扫 254 个地址既没意义，
             // 也容易被对端网络当成端口扫描。
             // 扫描窗口 = 广播询问 + **本网段 /24 逐地址单播询问**（本机 10.1.2.3 → 只扫 10.1.2.1-254）。
@@ -692,7 +692,8 @@ public final class PcMain {
                                         Log.i("启动扫描后自动连接 " + ip
                                                 + (label != null ? "（" + label + "）" : ""));
                                         link.selectAndConnect(ip, label);
-                                        store.setLastIp(ip);
+                                        // 不再写 store.setLastIp(ip)：那是「上次会话」的记忆，
+                                        // 每轮扫描都覆盖会让下次启动恢复成最后扫描到的那台
                                     }
                                     win.setSub("自动连接 " + found.size() + " 台设备…");
                                 } else {
@@ -717,6 +718,14 @@ public final class PcMain {
                                 }
                             } catch (Throwable t) {
                                 Log.w("自动连接失败: " + t);
+                            }
+                            // 启动恢复的会话要重新对齐：上面逐台 selectAndConnect 会把链路
+                            // 当前目标改成最后一台，而界面显示的是「上次会话」那台 ——
+                            // 不对齐就会出现「顶栏/剪贴板协商指向 A，聊天区是 B」。
+                            String shown = win.shownIp();
+                            if (!shown.isEmpty()) {
+                                Store.Group sg = store.groupOfIp(shown);
+                                link.selectTarget(shown, sg == null ? null : sg.displayName());
                             }
                             win.refreshDevices();
                         }
@@ -797,7 +806,7 @@ public final class PcMain {
      *
      * <p>只在**安装版**里做：源码版（run.bat / IDE）的 command 是 JDK 的 java.exe，
      * 照着它造出来的 .lnk 双击只会起一个不带参数的 JVM，桌面上就是多出一个永远打不开
-     * 应用的坏快捷方式（2026-09-30「装了 MSI 却没有桌面快捷方式」里真正的成因）。
+     * 应用的坏快捷方式（「装了 MSI 却没有桌面快捷方式」里真正的成因）。
      */
     private static void ensureDesktopShortcut() {
         String exe = installedLauncherExe();
@@ -930,7 +939,7 @@ public final class PcMain {
                 // 字体由系统菜单字体决定、Java 侧既读不到也改不了，中文会整条渲染成方块。
                 // JPopupMenu 走 Java2D 绘制，和应用其余界面（聊天窗）共用同一套字体回退链，中文正常。
                 menu = new JPopupMenu();
-                // 托盘菜单，用户定调不参与字号统一（保持 14）
+                // 托盘菜单不参与字号统一（保持 14）
                 Font menuFont = new Font(Fonts.FAMILY, Font.PLAIN, 14);
 
                 item(menu, menuFont, "打开聊天窗口", win::showWindow);
@@ -1017,7 +1026,7 @@ public final class PcMain {
         /**
          * 右键弹出托盘菜单。
          *
-         * ⚠️ 坐标有两套，别混用（2026-09-29：程序钉定 1.0，系统仍是 125%）：
+         * ⚠️ 坐标有两套，别混用（程序钉定 1.0，系统仍是 125%）：
          *   - Swing 的组件/popup 用「逻辑坐标」：钉定 1.0 后逻辑 = 物理（本机 2560x1440）
          *   - TrayIcon 的 MouseEvent 给的可能是「设备像素」：仅当系统缩放 ≠ 钉定值时两套才分离
          * 拿设备像素直接 setLocation，落点会跑到屏外，被 popup 机制挤走 —— 表现就是
@@ -1054,9 +1063,9 @@ public final class PcMain {
          * 若坐标不在逻辑屏内，说明给来的是设备像素 —— 换算回 Swing 坐标系。
          *
          * <p>换算因子必须取「Swing 实际使用的渲染缩放」（main 设的 sun.java2d.uiScale），
-         * 而不是 gc.getDefaultTransform()（那是**系统**缩放）：2026-09-29 起程序钉 1.0 而
+         * 而不是 gc.getDefaultTransform()（那是**系统**缩放）：程序钉 1.0 而
          * 系统仍 125%，若按系统 1.25 除会得到「逻辑坐标」，但 Swing 此时要的是设备坐标 → 菜单错位。
-         * 未钉定（跟随系统）时两者相同，退回系统 transform 即旧行为。
+         * 未钉定（跟随系统）时两者相同，退回系统 transform 即同行为。
          */
         private static Point toLogicalScreen(Point raw) {
             GraphicsConfiguration gc = GraphicsEnvironment.getLocalGraphicsEnvironment()
@@ -1184,7 +1193,7 @@ public final class PcMain {
         /**
          * 托盘图标。
          *
-         * 2026-09-15：改为**与安卓端 launcher 图标同源** —— 之前这里是手绘的一套近似图形
+         * **与安卓端 launcher 图标同源** —— 之前这里是手绘的一套近似图形
          * （蓝底 + 屏 + 手机 + 箭头）与手机端不一致；现在统一走 {@link AppIcon}（几何 1:1
          * 复刻 {@code android/.../drawable/ic_launcher_foreground.xml}），安装包/快捷方式/
          * 托盘/窗口标题栏 四处同一张图。32px = 托盘标准尺寸。

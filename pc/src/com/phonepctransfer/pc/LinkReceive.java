@@ -19,7 +19,7 @@ final class LinkReceive {
 
     /**
      * 接收进度帧的 UI 限流窗口（毫秒）。局域网传大文件时 1% 一帧可一秒上百帧，
-     * 每帧整泡重建 + revalidate 会淹没 EDT，界面长时间停在旧百分比（2026-09-30 修「卡在 0%」）。
+     * 每帧整泡重建 + revalidate 会淹没 EDT，界面长时间停在旧百分比。
      * 5Hz 刷新对进度条完全够用；完成/失败/暂停等终态帧不受限流影响。
      */
     static final long UI_THROTTLE_MS = 200L;
@@ -65,7 +65,7 @@ final class LinkReceive {
          * 落盘线程**正在**写盘：缓冲已被取走（pending=null）但 sink.write() 还没返回。
          * ⚠️ 收尾判据必须是「pending 为空 **且** writeBusy 为假」—— 只看 pending 会在最后一块
          * 还握在写盘线程手里时就关流，落出 0 字节/截断文件，而 digest 只校验收到的字节，
-         * 照样报「校验通过」（与 Android 端同构，2026-09-17 一并修）。
+         * 照样报「校验通过」（与 Android 端同构）。
          */
         volatile boolean writeBusy = false;
         /** 已成功写进 sink 的字节数（诊断用） */
@@ -399,9 +399,9 @@ final class LinkReceive {
             L.log("会话断开，中止 " + aborted.size() + " 路接收（半成品保留，重传自动续传）");
         }
         // 顺带回收目录记录（未完成目录闲置 10 分钟兜底 / 成品超限量）——
-        // 平时心跳线程每 5s 也会跑，断链此刻立即跑一次，不等下一个心跳（plan 03）
+        // 平时心跳线程每 5s 也会跑，断链此刻立即跑一次，不等下一个心跳
         pruneDirs();
-        // 顺带回收超龄半成品（plan 07）：「取消帧丢失/中途废弃」的孤儿条目不必等到下次启动；
+        // 顺带回收超龄半成品：「取消帧丢失/中途废弃」的孤儿条目不必等到下次启动；
         // purge 只回收 ts 超 3 天的条目，不碰为续传/停滞保留的新鲜半成品，语义不冲突
         if (L.store != null) {
             L.store.purgeStalePartials(Link.PARTIAL_MAX_AGE_MS);
@@ -631,7 +631,7 @@ final class LinkReceive {
      *  2. 注册表里有半成品（本端重启过）→ 追加打开、重算前缀摘要，准备好续传通道；
      *  3. 都没有 → 从头传。
      *
-     * 在 1 之前还有一道**重复投递闸门**（2026-10-01）：这条 mid 已经收妥过就直接报
+     * 在 1 之前还有一道**重复投递闸门**：这条 mid 已经收妥过就直接报
      * 「已有整个文件」，对端随即只发 file_meta + file_done、一个分片都不发，本端在
      * file_meta 处丢弃 —— 不再产生「xxx (1)」副本，也不再叠一条托盘通知。
      */
@@ -779,7 +779,7 @@ final class LinkReceive {
                 // 气泡标失败提醒用户重传；接收端文件已在，是否删除由用户决定
                 Msg u = new Msg();
                 u.mid = st.mid;
-                // 归属带上（2026-09-21）：不带的话界面归属不明会把这条失败标记画进当前会话
+                // 归属带上：不带的话界面归属不明会把这条失败标记画进当前会话
                 u.peerIp = st.item == null ? "" : st.item.peerIp;
                 u.dir = Msg.DIR_SELF;
                 u.kind = Msg.KIND_FILE;
@@ -898,7 +898,7 @@ final class LinkReceive {
                 }
                 Rx rx;
                 if (live == null) {
-                    // 重复投递闸门（2026-10-01 根源修）：这条 mid 已经完整收妥过，就绝不再
+                    // 重复投递闸门：这条 mid 已经完整收妥过，就绝不再
                     // 建第二条接收通道 —— 否则 createRx 会挑「xxx (1)」这个新名字落一份副本，
                     // 用户看到的正是「发 2 个文件、文件夹里躺 5 个」+ 一串托盘通知。
                     // 只对普通单文件生效：文件夹成员的去重交给 DirRx（目录本身按 mid 复用），
@@ -945,7 +945,7 @@ final class LinkReceive {
                     L.pausedMids.remove(mid);
                     Msg m = new Msg();
                     m.mid = mid;
-                    // ⚠️ 归属必须打上（2026-09-21 修）：这一条是**普通文件接收的第一条气泡**，
+                    // ⚠️ 归属必须打上：这一条是**普通文件接收的第一条气泡**，
                     //    原来漏了 peerIp → 界面的归属判据（空 = 放行）会把别的设备发来的文件
                     //    画进当前打开的会话里 —— 正是用户报的「不同设备聊天窗口混在一起」。
                     m.peerIp = s.remoteIp();
@@ -955,7 +955,7 @@ final class LinkReceive {
                     m.fileSize = size;
                     m.progress = 0;
                     // 在途就是 SENDING —— 之前新接收标成 ST_OK，PcMain 立即按终态落历史并弹
-                    // 「文件已保存」托盘：传输还在跑，界面却已是完成态，进度条永远停在 0%（2026-09-30 修）
+                    // 「文件已保存」托盘：传输还在跑，界面却已是完成态，进度条永远停在 0%
                     m.status = Msg.ST_SENDING;
                     m.ts = Json.lng(j, "ts", System.currentTimeMillis());
                     L.emit(m);
@@ -992,7 +992,7 @@ final class LinkReceive {
             ioOk = false;
             L.log("落盘字节数不符 " + rx.name + "：磁盘 " + diskSize + "B ≠ 应收 " + rx.received + "B");
         }
-        // 再和「对端声明的文件大小」比一次（与 Android 端同口径，2026-09-30）：发送端源被截断时
+        // 再和「对端声明的文件大小」比一次（与 Android 端同口径）：发送端源被截断时
         // sha256 算的是实际发出的那些字节，照样判通过 → 半截文件会被标成已保存。
         // 只判「收少了」；声明值偏小不判死，免得把能用的传输打成失败。
         if (rx.size > 0 && rx.received < rx.size) {
@@ -1194,14 +1194,14 @@ final class LinkReceive {
                         if (pct > 99) {
                             pct = 99;
                         }
-                        // UI 帧限流：同单文件进度帧（2026-09-30）
+                        // UI 帧限流：同单文件进度帧
                         long nowUi = System.currentTimeMillis();
                         if (pct != dir.lastPct && nowUi - dir.lastUiAt >= UI_THROTTLE_MS) {
                             dir.lastPct = pct;
                             dir.lastUiAt = nowUi;
                             Msg m = new Msg();
                             m.mid = dir.mid;
-                            m.peerIp = dir.peerIp;   // 归属（2026-09-21）
+                            m.peerIp = dir.peerIp;   // 归属
                             m.dir = Msg.DIR_PEER;
                             m.kind = Msg.KIND_FILE;
                             m.fileName = dir.name;
@@ -1221,8 +1221,8 @@ final class LinkReceive {
                 // 速率采样（接收侧）：写盘字节数已由 appendToRx 累加
                 Speeds.sample(mid, rx.received);
                 int pct = (int) ((rx.received * 100) / rx.size);
-                // UI 帧限流（2026-09-30）：局域网大文件 1% 一帧、一秒可出上百帧，
-                // 每帧都整泡重建会淹死 EDT —— 界面长时间停在旧百分比（用户报「卡在 0%」）。
+                // UI 帧限流：局域网大文件 1% 一帧、一秒可出上百帧，
+                // 每帧都整泡重建会淹死 EDT —— 界面长时间停在旧百分比。
                 // pct 没发出去的下一块会带着更新的 pct 再试；收尾/完成帧不走这条限流路径。
                 long nowUi = System.currentTimeMillis();
                 if (pct != rx.lastPct && nowUi - rx.lastUiAt >= UI_THROTTLE_MS) {
@@ -1232,14 +1232,14 @@ final class LinkReceive {
                     L.pausedMids.remove(mid);
                     Msg m = new Msg();
                     m.mid = mid;
-                    m.peerIp = rx.peerIp;   // 归属（2026-09-21）
+                    m.peerIp = rx.peerIp;   // 归属
                     m.dir = Msg.DIR_PEER;
                     m.kind = Msg.KIND_FILE;
                     m.fileName = rx.name;
                     m.fileSize = rx.size;
                     m.progress = pct;
-                    // 传输中的进度帧一律 SENDING：旧代码非续传首帧标 ST_OK，
-                    // 会把每个 1% 都当终态补写进历史（磁盘洪泛）且界面状态错乱（2026-09-30 修）
+                    // 传输中的进度帧一律 SENDING：非续传首帧标 ST_OK 的话，
+                    // 会把每个 1% 都当终态补写进历史（磁盘洪泛）且界面状态错乱
                     m.status = Msg.ST_SENDING;
                     if (L.listener != null) {
                         L.listener.onMessageUpdated(m);
@@ -1359,7 +1359,7 @@ final class LinkReceive {
     /**
      * 文件夹收尾（v2.6，对端 dl=1 时才有）。
      *
-     * 老流程接收端没有「对端发完了」这个信号，只能靠 doneFiles&gt;=count 猜；成员在发送端
+     * 接收端没有「对端发完了」这个信号，只能靠 doneFiles&gt;=count 猜；成员在发送端
      * 被跳过或发送失败时永远等不到 → **静默缺文件**。新流程由 dir_end 明确收尾：
      *  ① 有清单：与实收清单求差集，缺失项回发 dir_missing 让对端补发；
      *  ② last=1（对端不再补发）：无论是否缺件都定稿，缺件则明确标失败并逐项列出。

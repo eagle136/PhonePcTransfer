@@ -6,23 +6,10 @@ import java.net.NetworkInterface
 
 /**
  * 枚举本机**可以拿去「添加设备」**的地址，供设备列表逐行展示 / 点击复制。
- *
- * 输出顺序（2026-09-15 用户定调）：
- *  1. **局域网 IPv4** —— 192.168.* → 10.* → 172.16-31.* → 其它
- *  2. **169.254.\*** 链路本地 IPv4（Windows 拿不到 DHCP 时的兜底地址，用户要求一并列出，
- *     所以排在最末而不像 [LanGate.localIpv4] 那样直接丢掉）
- *  3. **IPv6 内网地址 1 个** —— fc00::/7（ULA）优先，否则 fe80::/10（链路本地）
- *  4. **IPv6 公网地址** —— 2000::/3（俗称 2xxx / 3xxx 开头），按数值升序
- *
- * **本机在数据网络时**（[list] 的 `includeCellular = true`，2026-09-19 用户要求）额外追加：
- *  5. **蜂窝网卡的 IPv6 公网地址** —— 手机在 4G/5G 下运营商通常下发一个公网 v6，
- *     对方若也在 v6 网络上可以直接用它连过来；不显示的话本机在数据网络下就是「（暂无）」，
- *     用户没东西可复制。
- *
- * 常规网卡黑名单：p2p / tun / tap / dummy / ifb（内核中间层，实际是 rmnet 的兄弟接口，
- * 只有 fe80，会把「内网 v6」那行顶掉）/ sit / ip6tnl（点对点与隧道地址拿给对端连不上）；
- * **蜂窝网卡（rmnet / ccmni / v4-464xlat）默认同样排除** —— 蜂窝 v4 基本在 NAT 后面，
- * 列出来只会误导；只有显式 `includeCellular` 时**只取其中的 IPv6 公网地址**。
+ * 输出顺序：1. 局域网 IPv4（192.168.* → 10.* → 172.16-31.* → 其它）；2. 169.254.* 链路本地 IPv4（排在最末）；3. IPv6 内网 1 个（fc00::/7 优先，否则 fe80::/10）；
+ * 4. IPv6 公网（2000::/3，数值升序）5.（`includeCellular = true` 时）蜂窝网卡 IPv6 公网地址。
+ * 网卡黑名单：p2p / tun / tap / dummy / ifb / sit / ip6tnl；蜂窝网卡（rmnet / ccmni / v4-464xlat）
+ * 默认排除（蜂窝 v4 基本在 NAT 后面），`includeCellular` 时只取其中的 IPv6 公网地址。
  * 同一地址只出现一次；任何异常都返回已收集到的部分（不抛、不影响界面）。
  */
 object LocalIps {
@@ -35,9 +22,7 @@ object LocalIps {
 
     /**
      * 排好序的地址列表；读不到就空列表。
-     *
-     * @param includeCellular 本机是否正在走运营商数据网络。为真时额外收集蜂窝网卡的
-     *   **IPv6 公网地址**（链路本地 / ULA / IPv4 仍不列）并放在最末。
+     * @param includeCellular 本机是否正在走运营商数据网络：为真时额外收集蜂窝网卡的 **IPv6 公网地址**（链路本地 / ULA / IPv4 仍不列）并放在最末。
      */
     fun list(includeCellular: Boolean = false): List<String> {
         val v4 = LinkedHashSet<String>()
@@ -132,10 +117,7 @@ object LocalIps {
 
     /**
      * 把 [v6Key] 的展开式压成 RFC 5952 惯用写法：每组去前导零，**最长**的一段连续 0 组换成 `::`。
-     *
-     * 为什么非压不可：Windows / JVM 的 `getHostAddress()` 返回的是**不压缩**的展开式
-     * （实测 `2001:db8:614:3ba0:0:0:0:12`），又长又难认；压完是 `2001:db8:614:3ba0::12`，
-     * 两端显示口径一致，粘到「＋设备」里也照样能用。
+     * Windows / JVM 的 `getHostAddress()` 返回的是**不压缩**的展开式，又长又难认；压完后两端显示口径一致，粘到「＋设备」里也照样能用。
      */
     private fun compressV6(expanded: String): String {
         val g = expanded.split(':').map { s ->

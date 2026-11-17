@@ -4,22 +4,12 @@ import android.util.Log
 import java.util.Locale
 
 /**
- * 接收管线分阶段计时（诊断用，2026-10-30 加）。字段与口径和 PC 端 `TxStats.java` 完全一致。
- *
- * 每秒汇总一行 ASCII：
- * ```
- * [xfer] rx=131.2MB/s blk=31 read=412 copy=8 digest=0 wait=96 write=530 part=12 ms/s
- * ```
- * 各列 = 这一秒内花在该阶段的墙钟毫秒数：
- *  - read   读线程在 Protocol.readFrame 里（含等 socket）
- *  - copy   把分片拷进 4MB 轮转缓冲
- *  - digest SHA-256（一次性传完时为 0 —— 只在续传通道才算）
- *  - wait   读线程等落盘线程归还缓冲（背压）
- *  - write  落盘线程 sink.write()
- *  - part   落盘线程重写 partials.json
- *
- * read 与 write/wait 分属两个线程，同一行加起来可能超过 1000ms，正常。
- * 判定：read 贴近 1000 = 网络封顶；wait+write 大 = 磁盘封顶；copy+digest 大 = CPU 封顶。
+ * 接收管线分阶段计时（诊断用）；字段与口径和 PC 端 `TxStats.java` 完全一致。
+ * 每秒汇总一行：`[xfer] rx=… blk=… read=… copy=… digest=… wait=… write=… part=… ms/s`，
+ * 各列 = 这一秒内花在该阶段的墙钟毫秒数（read=readFrame 含等 socket，copy=分片拷进 4MB 轮转缓冲，
+ * digest=SHA-256(一次性传完时为 0)，wait=读线程等落盘线程归还缓冲(背压)，write=落盘 sink.write()，part=重写 partials.json）。
+ * read 与 write/wait 分属两个线程，同一行加起来可能超过 1000ms，正常；
+ * 判定：read 贴近 1000 = 网络封顶，wait+write 大 = 磁盘封顶，copy+digest 大 = CPU 封顶
  */
 internal object TxStats {
 

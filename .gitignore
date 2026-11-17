@@ -33,11 +33,29 @@
 /pc/tools/runtime/
 
 # ---- editor / agent scratch ----
+/回收站/
+/TASKLIST_*.txt
+/分析_*.txt
 /_backup/
 /.workbuddy/
 /.vscode/
 /run agent.bat
 /all/
+/.diag/
+/.tmp/
+/pc/.tmp/
+/comment_fix_*.txt
+/_tmp_*.ps1
+/nul
+
+# ---- local-only docs & screenshots (kept on disk, not in repo) ----
+/docs/
+/SOURCE_MAP.md
+/shots/
+
+# ---- local backup helper ----
+/备 份 代 码.bat
+/代 码 备 份
 
 # ---- build products inside tool dirs ----
 *.class

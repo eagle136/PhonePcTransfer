@@ -25,10 +25,9 @@ final class ChatBubbles {
         this.W = W;
     }
 
-    // 原先这里有一个 LINK_COLOR（气泡里小按钮的文字色）—— 常驻按钮撤掉后它没有使用者了，
-    // 一并删除。以后若再加气泡内文字链接，色值仍取 Material primary 同源的 #1565C0。
+    // 气泡内文字链接的色值取 Material primary 同源的 #1565C0。
 
-    // ==================== 传输速率刷新（2026-09-22）====================
+    // ==================== 传输速率刷新 ====================
     //
     // 气泡里的进度条文案是「87%  0.95M/s」，速率每 500ms 就变一次；而气泡本身只在**消息更新**
     // 时才重建（进度按整数百分比上报，10GB 文件 1% = 105MB，好几秒才来一次）。
@@ -97,8 +96,20 @@ final class ChatBubbles {
 
     void scrollToBottom() {
         SwingUtilities.invokeLater(() -> {
+            // 先把布局同步跑完再置底。
+            // 重载历史 / 新增气泡只是 revalidate（异步排队），此刻滚动条模型里的 maximum
+            // 还是**旧值**——直接 setValue(maximum) 会被旧上限夹住，表现就是「点了设备，
+            // 聊天区还停在上面/旧位置」。validate() 让滚动面板与视口当帧完成布局，
+            // 上限随之更新，这时置底才真的落到最后一条。
+            W.msgPanel.revalidate();
+            W.scroll.validate();
             JScrollBar bar = W.scroll.getVerticalScrollBar();
             bar.setValue(bar.getMaximum());
+            // 图片/长文本的高度可能在下一轮布局才定稿 → 再补一次（幂等，已在底部时无副作用）
+            SwingUtilities.invokeLater(() -> {
+                JScrollBar b = W.scroll.getVerticalScrollBar();
+                b.setValue(b.getMaximum());
+            });
         });
     }
 
@@ -124,12 +135,12 @@ final class ChatBubbles {
         col.setOpaque(false);
 
         JLabel meta = new JLabel((self ? "我" : peerName(m.peerIp)) + "  " + m.timeText() + m.statusSuffix());
-        meta.setName("FileBubbleMeta"); // 探针白名单句柄（T06）：署名行
+        meta.setName("FileBubbleMeta"); // 探针白名单句柄：署名行
         // 档位：常规 15（=发送文件按钮同档）
         meta.setFont(new Font(ChatWindow.UI_FONT, Font.PLAIN, Ui.FS_STD));
         meta.setForeground(Ui.BUBBLE_META);
         meta.setAlignmentX(self ? Component.RIGHT_ALIGNMENT : Component.LEFT_ALIGNMENT);
-        // 为什么补余量（2026-09-28，本文件所有 padH 调用同此口径，其余处不再重复）：
+        // 为什么补余量（本文件所有 padH 调用同此口径，其余处不再重复）：
         // JLabel 首选宽 = FontMetrics.stringWidth，是**零容差**的 advance 之和；而实测抗锯齿渲染的
         // 真实墨迹比它宽 5~13%（同源常量 ChatDevices.INK_SAFETY = 1.12），组件绘制又被硬裁到自身
         // bounds，于是署名行末尾的状态字（"已发送" 的 "送"）会被削掉右缘。留 12px 余量即按此口径兜底。
@@ -144,15 +155,15 @@ final class ChatBubbles {
 
         row.add(col, self ? BorderLayout.EAST : BorderLayout.WEST);
         // 气泡手势：**左键短按 = 打开内容**（图片全屏查看、文件交给系统打开）、
-        // **右键 = 菜单（打开/复制/删除）**。删除只能从右键菜单进（2026-10-15 用户定调）：
+        // **右键 = 菜单（打开/复制/删除）**。删除只能从右键菜单进：
         // 原来还有一条「左键长按 600ms = 直接删除」，但它和「按住拖动划选气泡文字」是同一个动作，
         // 划词选中一超过 600ms 就弹出删除确认框，长按删除这条已整条撤掉。
         //
-        // ⚠ 手柄**只挂气泡本体 body**（2026-09-21 修正）：以前挂的是整行 `row` ——
+        // ⚠ 手柄**只挂气泡本体 body**（不是整行 `row`）：
         // 它是满宽的 {@code BorderLayout} 容器，气泡靠 EAST/WEST 贴边，于是行内另一侧那一大片
         // **空白**也带着手柄，点在空白处照样弹菜单/触发删除（用户报就是这个）。
         // 改挂 body 后：署名行、气泡旁边的留白、行上下 6/14px 的间距都不再响应，只有气泡本身可点。
-        // ⚠ Swing 鼠标事件**不冒泡**（实测 2026-09-16）→ 必须在 body 内部递归挂到每个子组件上。
+        // ⚠ Swing 鼠标事件**不冒泡**→ 必须在 body 内部递归挂到每个子组件上。
         attachBubbleGestures(body, m);
         return row;
     }
@@ -214,11 +225,8 @@ final class ChatBubbles {
     }
 
     /**
-     * 气泡右键菜单（2026-09-21 用户定调）：气泡上不再常驻任何按钮，功能全部收进这个小窗。
-     *
-     * <p>**文案一律中文**（用户 2026-09-21 明确要求，覆盖「PC 新文案一律英文」那条）——
-     * 这是唯一一处中文的功能菜单（「展开全文 / 取消发送」本来就是中文）。
-     *
+     * 气泡右键菜单：气泡上不再常驻任何按钮，功能全部收进这个小窗。
+     * <p>**文案一律中文**（唯一一处中文的功能菜单，覆盖「PC 新文案一律英文」那条）。
      * <p>菜单项按消息类型与**当前可用性**现算，不做置灰：
      * <ul>
      *   <li>文本：复制文本（复制的是**完整原文**，不受气泡里「展开全文」的折叠影响）</li>
@@ -227,8 +235,8 @@ final class ChatBubbles {
      *   <li>文件夹（收到且已落盘）：在文件夹中显示</li>
      *   <li>任何一条都有：删除（文本/图片会同步通知在线对端，见 v2.4）</li>
      * </ul>
-     * 传输中（progress 0..99）与 FAILED 的文件**不给**打开/复制/定位 —— 本地文件是不完整的，
-     * 复制出去只会得到半张图（原「常驻按钮」版本同口径，只是从置灰改成不出现）。
+     * 传输中（progress 0..99）与 FAILED 的文件**不给**打开/复制/定位 —— 本地文件不完整，
+     * 复制出去只会得到半张图。
      */
     void showBubblePopup(java.awt.event.MouseEvent e, Msg m) {
         javax.swing.JPopupMenu pm = buildBubbleMenu(m);
@@ -315,7 +323,7 @@ final class ChatBubbles {
      *
      * <p>**只有「文本 + 图片」发 msg_del**（协议 §4.7 与安卓端 `AppCore.deleteMessage` 同口径）：
      * 文件/文件夹的删除只影响本机记录 —— 它们本来就不参与 hsync，不会被补回来，
-     * 发给对端反而会让对端删掉一条不该删的记录（旧代码对所有 kind 都发，是偏差，已对齐）。
+     * 发给对端反而会让对端删掉一条不该删的记录（对所有 kind 都发是偏差，已对齐）。
      */
     void deleteMessage(Msg m) {
         final boolean syncable = syncableKind(m);
@@ -379,7 +387,7 @@ final class ChatBubbles {
         area.setOpaque(false);
         // 档位：常规 15（基准行，=发送文件按钮同档）
         area.setFont(new Font(ChatWindow.UI_FONT, Font.PLAIN, Ui.FS_STD));
-        // 气泡正文颜色跟主题（浅色近黑 / 深色白字，2026-09-27）；显式设色才能在
+        // 气泡正文颜色跟主题（浅色近黑 / 深色白字）；显式设色才能在
         // 主题切换的重着色遍历里被识别替换（默认黑是 LAF 值，不归主题管）
         area.setForeground(Ui.BUBBLE_TEXT);
         area.setBorder(BorderFactory.createEmptyBorder(2, 2, 2, 2));
@@ -401,7 +409,7 @@ final class ChatBubbles {
         if (truncated) {
             final boolean[] expanded = new boolean[]{false};
             JButton more = new JButton("展开全文（共 " + m.text.length() + " 字）");
-            // 2026-09-29（「全部统一」配套）：链接式蓝字按钮保持 FLAT（不套灰卡、蓝字不被覆盖）
+            // 链接式蓝字按钮保持 FLAT（不套灰卡、蓝字不被覆盖）
             Ui.flat(more);
             // 档位：常规 15（=发送文件按钮同档）
             more.setFont(new Font(ChatWindow.UI_FONT, Font.PLAIN, Ui.FS_STD));
@@ -422,7 +430,7 @@ final class ChatBubbles {
             rp.add(more);
         }
 
-        // 动作入口一律收进**右键菜单**（2026-09-21 用户定调）：气泡里不再常驻「Copy」这类按钮，
+        // 动作入口一律收进**右键菜单**：气泡里不再常驻「Copy」这类按钮，
         // 免得每条消息都挂一排字、把气泡撑得又长又乱。
 
         rp.setAlignmentX(self ? Component.RIGHT_ALIGNMENT : Component.LEFT_ALIGNMENT);
@@ -513,7 +521,7 @@ final class ChatBubbles {
             addPauseRow(rp, m, self);
             if (self && (Msg.ST_SENDING.equals(m.status) || Msg.ST_PENDING.equals(m.status))) {
                 JButton cancel = new JButton("取消发送");
-                // 2026-09-29（「全部统一」配套）：链接式红字按钮保持 FLAT（不套灰卡、红字不被覆盖）
+                // 链接式红字按钮保持 FLAT（不套灰卡、红字不被覆盖）
                 Ui.flat(cancel);
                 // 档位：常规 15（=发送文件按钮同档）
                 cancel.setFont(new Font(ChatWindow.UI_FONT, Font.PLAIN, Ui.FS_STD));
@@ -554,8 +562,8 @@ final class ChatBubbles {
             final java.util.concurrent.atomic.AtomicBoolean replaced = new java.util.concurrent.atomic.AtomicBoolean(false);
             Thread t = new Thread(() -> {
                 // 重试：收到图片时这条气泡是**刚被重建**的，文件可能刚关流、系统还没把它索引好，
-                // 一次 decode 失败很常见。以前失败就静默 return → 气泡永远停在「图片加载中…」，
-                // 只有切会话（重载全部气泡）才会重试成功 —— 用户 2026-09-19 报的正是这个现象。
+                // 一次 decode 失败很常见。若失败就静默 return → 气泡永远停在「图片加载中…」，
+                // 只有切会话（重载全部气泡）才会重试成功。
                 // 现在失败按 0/300/600/1200ms 重试，仍失败才放弃并落日志。
                 final long[] waits = {0L, 300L, 600L, 1200L};
                 ImageIcon icon = null;
@@ -633,10 +641,10 @@ final class ChatBubbles {
             rp.add(pb);
         }
         // 收到并已落盘：只给一枚绿色「已保存」标记，**绝不显示路径**
-        // （2026-10-01 用户定调：气泡上始终不显示文件路径；口径与 Android 端 Bubble.kt 一致：
+        // （气泡上始终不显示文件路径；口径与 Android 端 Bubble.kt 一致：
         //  绿色勾 + 「已保存」文字，而不是把 filePath 摊开）。
         // 条件三连：非自己发的 + 状态 OK + 本地路径非空 —— 缺 status==OK 会在传输中/失败时误报已保存。
-        // 图片不排除（无 !isImage）：与 Android 端 Bubble.kt:330 同口径，图片落盘后同样显示「已保存」（见 A5/R4）。
+        // 图片不排除（无 !isImage）：与 Android 端 Bubble.kt:330 同口径，图片落盘后同样显示「已保存」。
         if (!self && Msg.ST_OK.equals(m.status)
                 && m.filePath != null && !m.filePath.isEmpty()) {
             JLabel saved = new JLabel("已保存");
@@ -650,7 +658,7 @@ final class ChatBubbles {
             rp.add(saved);
         }
 
-        // 「Copy image / Show in folder / 打开文件」等入口一律收进**右键菜单**（2026-09-21 用户定调），
+        // 「Copy image / Show in folder / 打开文件」等入口一律收进**右键菜单**，
         // 气泡里不再常驻按钮；可不可用由 [showBubblePopup] 现算（传输中/失败时不给打开与复制）。
 
         addDenyRow(rp, m, self);
@@ -659,7 +667,7 @@ final class ChatBubbles {
         // 取消发送：只对自己发出的、尚未完成的文件显示；取消后两端同步不显示
         if (self && (Msg.ST_SENDING.equals(m.status) || Msg.ST_PENDING.equals(m.status))) {
             JButton cancel = new JButton("取消发送");
-            // 2026-09-29（「全部统一」配套）：链接式红字按钮保持 FLAT（不套灰卡、红字不被覆盖）
+            // 链接式红字按钮保持 FLAT（不套灰卡、红字不被覆盖）
             Ui.flat(cancel);
             // 档位：常规 15（=发送文件按钮同档）
             cancel.setFont(new Font(ChatWindow.UI_FONT, Font.PLAIN, Ui.FS_STD));
@@ -898,12 +906,11 @@ final class ChatBubbles {
         }
     }
 
-    // ==================== 气泡动作（2026-09-21 起全部走右键菜单）====================
+    // ==================== 气泡动作（全部走右键菜单）====================
     //
     // 原来这里有一对 helper：`miniButton()`（气泡里的 11px 无边框彩字按钮）+ `actionRow()`
-    // （按钮行）。2026-09-19 用户要求「文本加复制、文件加打开」，于是每条气泡下面常驻一排
-    // 「Copy / Copy image / Show in folder」—— 2026-09-21 用户改主意：**常驻按钮全部撤掉，
-    // 改右键菜单**（文案中文）。两个 helper 随之变成死代码，一并删除，别再长回来。
+    // （按钮行），每条气泡下面常驻一排「Copy / Copy image / Show in folder」—— 后来撤掉，
+    // 改右键菜单（文案中文）。两个 helper 随之变成死代码，一并删除，别再长回来。
     // 唯一剩下的气泡内按钮是「展开全文 / 收起」与「取消发送」（中文、条件性出现），
     // 以及数据流量未同意的红色叹号。
 
@@ -980,17 +987,13 @@ final class ChatBubbles {
 
     /**
      * 「在文件夹中显示」—— 在系统文件管理器里定位并选中这个文件（右键菜单项，中文文案）。
-     *
-     * <p>Windows 用 {@code explorer /select,<路径>}：JDK 的
-     * {@code Desktop.browseFileDirectory} 在 Windows 上并不保证实现可用，
-     * 而 explorer 是各版本 Windows 都有的稳做法。⚠️ 参数拆法有讲究（2026-09-26 修）：
-     * 路径不能与 {@code /select,} 拼成同一个参数——路径带空格时 Java 会把整个参数
-     * 包上引号，变成 {@code explorer "/select,C:\a b\c.txt"}，explorer 解析不了
-     * 这种形态，会静默回落打开「文档/主文件夹」（右键「在文件夹中显示」打开错位置的根因）。
-     * 正确形态是 {@code /select,} 与**自带引号的路径**各占一个参数：
-     * {@code new ProcessBuilder("explorer.exe", "/select,", "\"" + 路径 + "\"")}——
-     * Java 对「首尾已是引号」的参数不再二次包引号，最终命令行即
-     * {@code explorer /select, "C:\a b\c.txt"}（JDK6 起|Win7~Win11 均验证可行的形态）。
+     * <p>Windows 用 {@code explorer /select,<路径>}：{@code Desktop.browseFileDirectory} 在 Windows 上
+     * 不保证可用，explorer 是各版本 Windows 都有的稳做法。⚠️ 参数拆法有讲究：
+     * 路径不能与 {@code /select,} 拼成同一个参数 —— 路径带空格时 Java 会把整个参数包上引号，
+     * 变成 {@code explorer "/select,C:\a b\c.txt"}，explorer 解析不了，会静默回落打开「文档/主文件夹」
+     * （右键「在文件夹中显示」打开错位置的根因）。正确形态：{@code /select,} 与**自带引号的路径**
+     * 各占一个参数 —— {@code new ProcessBuilder("explorer.exe", "/select,", "\"" + 路径 + "\"")}
+     * （Java 对首尾已是引号的参数不再二次包引号；Win7~Win11 均验证可行）。
      * macOS 用 {@code open -R}；其余平台退化为「打开父目录」。
      */
     void showInFolder(final File f) {
@@ -1132,7 +1135,7 @@ final class ChatBubbles {
      *  静态字段，切主题时被重新赋值）：深浅主题切换后只需 repaint 就自动换色，
      *  不能把 Color 在构造时烤进字段 —— 那样切主题后老气泡永远停在旧配色。
      *
-     *  <p>2026-09-28 改：原实现先 {@code fillRoundRect} 再 {@code super.paintComponent}
+     *  <p>原实现先 {@code fillRoundRect} 再 {@code super.paintComponent}
      *  （顺序反着、语义不清），现按需求把层次写死，并换成 {@link CardSkin} 的透明 PNG 圆角贴图
      *  （9 宫格拉伸），圆角半径仍是 16。 */
     private static final class RoundedPanel extends JPanel {

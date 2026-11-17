@@ -32,7 +32,7 @@ import javax.swing.plaf.basic.BasicScrollBarUI;
 /**
  * 统一的现代扁平视觉风格（纯 Swing，零外部依赖）。
  *
- * <p>改造前所有按钮都是 Windows 原生立体灰按钮、输入框是凹槽灰框 —— 这是"老土"感的主要来源。
+ * <p>原生立体灰按钮、凹槽灰输入框是"老土"感的主要来源。
  * 这里集中提供：
  * <ul>
  *   <li>{@link #install()}：在创建任何 UI 之前调用一次，调全局默认字体 / 滚动条 / 弹出菜单配色；</li>
@@ -48,10 +48,10 @@ final class Ui {
 
     // ===== 调色板 =====
     //
-    // 主题切换（2026-09-27）：下面这组「会跟主题走」的颜色**不能再是 final** ——
+    // 主题切换：下面这组「会跟主题走」的颜色**不能再是 final** ——
     // 它们在运行时被 {@link #applyDark(boolean, java.awt.Container)} 整体替换，
     // 所有引用点（含自定义 paint 里的直接读字段）下一次重绘自动拿到新值。
-    // 2026-09-28 用户改调：按钮 / 弹菜单**也要跟主题**（深色=黑底白字），
+    // 按钮 / 弹菜单**也要跟主题**（深色=黑底白字），
     // 见下方 BTN_* 与 MENU_* 两组；两组都随 assignPalette 一起被替换。
     // ⚠ 槽位顺序即语义：snapshot() / assignPalette 深浅两分支必须同步维护（三个位置齐动）。
     // ⚠ 同值槽位靠实例身份映射（见 ThemeMap）；新增槽位前先读 checkPaletteDuplicates 的日志。
@@ -67,10 +67,10 @@ final class Ui {
     static volatile Color SURFACE      = Color.WHITE;                 // 顶栏 / 侧栏 / 面板底
     static volatile Color PAGE_BG      = new Color(0xF4, 0xF5, 0xF7); // 聊天区底色
 
-    // ===== 弹菜单专属配色（2026-09-28 新增，跟主题走，不复用 DIVIDER）=====
+    // ===== 弹菜单专属配色（跟主题走，不复用 DIVIDER）=====
     // ⚠ MENU_BORDER **不是** DIVIDER：DIVIDER 是顶/底栏那种可有可无的极淡分割线
     //   （浅色 #EAECF0 与白底亮度差仅 19、深色 #2A2C30 与黑底亮度差 44，弹菜单用它当边框
-    //   就是「太浅 / 看不见」的 R1/R2 根因①）。MENU_BORDER 保证与相邻底亮度差 ≥45。
+    //   就是「太浅 / 看不见」的根因）。MENU_BORDER 保证与相邻底亮度差 ≥45。
     //   以后做「统一色板」重构时**别把这两个合并**。
     static volatile Color MENU_BG      = new Color(0xFF, 0xFF, 0xFF); // 弹菜单底 + 菜单项底
     static volatile Color MENU_BORDER  = new Color(0xC8, 0xCD, 0xD4); // 弹菜单外框 1px
@@ -84,7 +84,7 @@ final class Ui {
     static volatile Color BUBBLE_SELF  = new Color(0xD6, 0xE8, 0xFF); // 自己的气泡：清新浅蓝
     static volatile Color BUBBLE_PEER   = new Color(0xF0, 0xF2, 0xF5); // 对方的气泡：中性浅灰
     static volatile Color BUBBLE_META  = new Color(0x6B, 0x72, 0x7B); // 气泡内次要文字
-    /** 气泡正文文字色（浅色=近黑；深色主题下气泡变灰、正文转白，2026-09-27 新增） */
+    /** 气泡正文文字色（浅色=近黑；深色主题下气泡变灰、正文转白） */
     static volatile Color BUBBLE_TEXT  = new Color(0x1F, 0x23, 0x28);
     /** 深色模式下输入框底色（浅色恒白） */
     static final Color FIELD_DARK = new Color(0x1B, 0x1C, 0x1F);
@@ -105,10 +105,9 @@ final class Ui {
     static volatile Color IP_TEXT      = new Color(0x4A, 0x6B, 0x8A); // 灰蓝，替代原突兀深绿
     static volatile Color IP_CAPTION   = new Color(0x9A, 0xA0, 0xA8);
 
-    // ===== 按钮专属配色（2026-09-28 起跟主题）=====
-    // 2026-09-28 起按钮跟主题（深色=黑底 #000000 + 白字 #E8EAED + 边框 #4A4E54）；
+    // ===== 按钮专属配色（跟主题）=====
+    // 按钮跟主题（深色=黑底 #000000 + 白字 #E8EAED + 边框 #4A4E54）；
     // 数值在 assignPalette 里成对维护，改浅色必须同步深浅两分支。
-    //（旧 2026-09-27 定调「按钮之类的颜色不用改」**已作废**，见下方调色板注释与 README。）
     private static volatile Color BTN_FILL      = Color.WHITE;                 // = 浅色 SURFACE
     private static volatile Color BTN_HOVER     = new Color(0xF0, 0xF2, 0xF6); // SECONDARY hover
     private static volatile Color BTN_SUB_HOVER = new Color(0xEC, 0xEE, 0xF2); // SUBTLE hover
@@ -117,22 +116,22 @@ final class Ui {
     private static volatile Color BTN_FG        = new Color(0x1F, 0x23, 0x28); // = 浅色 TEXT_MAIN
     private static volatile Color BTN_FG_SUB    = new Color(0x6B, 0x72, 0x7B); // = 浅色 TEXT_SUB
 
-    // ===== 标题栏（自绘窗口外壳）专属配色（2026-09-28 新增，跟主题）=====
-    // 深色 = 深灰顶栏 #313338（用户 Q1 定稿）；浅色 = 浅灰白 #F0F1F4（Q2 = 一起改，同一套自绘路径）。
+    // ===== 标题栏（自绘窗口外壳）专属配色（跟主题）=====
+    // 深色 = 深灰顶栏 #313338；浅色 = 浅灰白 #F0F1F4（同一套自绘路径）。
     // 数值在 assignPalette 里成对维护，改浅色必须同步深浅两分支。
     static volatile Color CHROME_BG   = new Color(0xF0, 0xF1, 0xF4); // 标题栏底（浅色默认值）
     static volatile Color CHROME_FG   = new Color(0x6B, 0x72, 0x7B); // 标题栏文字
     static volatile Color CHROME_LINE = new Color(0xE4, 0xE7, 0xEB); // 标题栏下 1px 分割线
 
-    // ===== 窗口外框 1px 细线（2026-09-29 新增，跟主题）=====
+    // ===== 窗口外框 1px 细线（跟主题）=====
     // 目的：深色 SURFACE 纯黑 / 浅色 SURFACE 纯白，窗口与桌面之间没有可辨边界
     //   → 沿圆角内容区画一圈 1px 描边（深色=浅灰、浅色=深灰），边界一眼可见。
     // ⚠ 与 DIVIDER / CHROME_LINE 都不是一个东西：那两个是"内部"分割线，亮度差可以很小；
     //   本常量是**窗口最外圈**，必须与相邻底色有明显亮度差。别合并。
     static volatile Color WIN_BORDER = new Color(0x86, 0x8C, 0x94); // 浅色：深灰细线（默认值）
 
-    // ===== 滚动条（FlatScrollBarUI 专用）配色（2026-09-28 新增，跟主题）=====
-    // 深色 = 黑底 + 白箭头 + 绿滑块（用户 R4 定稿）；滑块绿 #43A047（Q3）、hover #4CAF50。
+    // ===== 滚动条（FlatScrollBarUI 专用）配色（跟主题）=====
+    // 深色 = 黑底 + 白箭头 + 绿滑块；滑块绿 #43A047、hover #4CAF50。
     static volatile Color SCROLL_TRACK       = new Color(0xF2, 0xF3, 0xF5); // 轨道底（浅色）
     static volatile Color SCROLL_THUMB       = new Color(0xB4, 0xBA, 0xC2); // 滑块（浅色）
     static volatile Color SCROLL_THUMB_HOVER = new Color(0x9A, 0xA0, 0xA8); // 滑块 hover（浅色）
@@ -151,8 +150,8 @@ final class Ui {
     private static void assignPalette(boolean d) {
         dark = d;
         if (d) {
-            // 深色：背景纯黑、气泡灰、字体白（2026-09-27 用户定调）；按钮/弹菜单也跟（2026-09-28）
-            SURFACE       = new Color(0x00, 0x00, 0x00);       // 顶栏/侧栏/面板底 = 纯黑（2026-09-29：独立实例，不共享 Color.BLACK，槽位身份映射才精确）
+            // 深色：背景纯黑、气泡灰、字体白；按钮/弹菜单也跟
+            SURFACE       = new Color(0x00, 0x00, 0x00);       // 顶栏/侧栏/面板底 = 纯黑（独立实例，不共享 Color.BLACK，槽位身份映射才精确）
             PAGE_BG       = new Color(0x00, 0x00, 0x00);       // 聊天区底 = 纯黑（同上）
             TEXT_MAIN     = new Color(0xE8, 0xEA, 0xED);       // 正文白
             TEXT_SUB      = new Color(0x9A, 0xA0, 0xA6);       // 次要文字亮灰
@@ -175,7 +174,7 @@ final class Ui {
             MENU_SEL_BG  = new Color(0x2C, 0x3A, 0x52);
             MENU_SEL_FG  = Color.WHITE;
             ACCENT       = new Color(0x8F, 0xB8, 0xE8);
-            // 按钮（深色）：黑底 + 白字 + 可见边框（R3）
+            // 按钮（深色）：黑底 + 白字 + 可见边框
             BTN_FILL     = Color.BLACK;
             BTN_HOVER    = new Color(0x1B, 0x1C, 0x1F);
             BTN_SUB_HOVER= new Color(0x14, 0x15, 0x17);
@@ -183,19 +182,19 @@ final class Ui {
             BTN_BORDER_OFF = new Color(0x2A, 0x2C, 0x30);
             BTN_FG       = new Color(0xE8, 0xEA, 0xED);
             BTN_FG_SUB   = new Color(0x8A, 0x90, 0x99);
-            // 标题栏（深色）：深灰 #313338 顶栏（R1/R2/R3 的目标色）
+            // 标题栏（深色）：深灰 #313338 顶栏
             CHROME_BG      = new Color(0x31, 0x33, 0x38);
             CHROME_FG      = new Color(0xE8, 0xEA, 0xED);
             CHROME_LINE    = new Color(0x3A, 0x3D, 0x42);
             // 窗口外框（深色）：浅灰细线，压在纯黑 SURFACE 上（对比度 ≈ 4.6:1，边界清晰且不刺眼）
             WIN_BORDER     = new Color(0x6E, 0x74, 0x7C);
-            // 滚动条（深色）：黑底 + 白箭头 + 绿滑块（R4）
+            // 滚动条（深色）：黑底 + 白箭头 + 绿滑块
             SCROLL_TRACK       = new Color(0x00, 0x00, 0x00);  // 同上：独立实例（paint 期直读字段，不走映射，保持口径一致）
             SCROLL_THUMB       = new Color(0x43, 0xA0, 0x47);
             SCROLL_THUMB_HOVER = new Color(0x4C, 0xAF, 0x50);
             SCROLL_ARROW       = Color.WHITE;
         } else {
-            // 浅色 = 历史观感，逐字段还原（与上面初始值一一对应，改色前先同步这里）
+            // 浅色：逐字段还原（与上面初始值一一对应，改色前先同步这里）
             SURFACE       = Color.WHITE;
             PAGE_BG       = new Color(0xF4, 0xF5, 0xF7);
             TEXT_MAIN     = new Color(0x1F, 0x23, 0x28);
@@ -226,7 +225,7 @@ final class Ui {
             BTN_BORDER_OFF = new Color(0xE6, 0xE8, 0xEC);
             BTN_FG       = new Color(0x1F, 0x23, 0x28);
             BTN_FG_SUB   = new Color(0x6B, 0x72, 0x7B);
-            // 标题栏（浅色）：浅灰白顶栏（Q2 = 一起改，与深色同一套自绘路径）
+            // 标题栏（浅色）：浅灰白顶栏（与深色同一套自绘路径）
             CHROME_BG      = new Color(0xF0, 0xF1, 0xF4);
             CHROME_FG      = new Color(0x6B, 0x72, 0x7B);
             CHROME_LINE    = new Color(0xE4, 0xE7, 0xEB);
@@ -254,17 +253,6 @@ final class Ui {
     }
 
     /**
-     * 运行期切换主题：换调色板 → 刷 UIManager → 对已建组件树做一次「旧色 → 新色」重着色。
-     *
-     * <p>Swing 的组件颜色是**建的时候拷走**的（setBackground/setForeground 存的是 Color 引用），
-     * 只换调色板的话已建组件不会变 —— 所以按**槽位**配对映射（旧板快照 → 新板快照，
-     * 下标一一对应）整棵树替换一遍；颜色值相同的槽位靠实例身份区分，不用颜色值当键 ——
-     * 后者会串味（2026-09-29 修）。自定义 paint 里直接读 {@code Ui.XXX} 字段的（设备行/圆角气泡/窗口底），repaint 自动生效。
-     *
-     * @param d    true=深色 false=浅色
-     * @param root 已建窗口的根容器（frame.getContentPane()）；null = 只换调色板不做重着色
-     */
-    /**
      * 当前调色板的槽位快照（23 槽）。
      *
      * <p>⚠ 顺序即语义：下标 i 的槽位在「旧板/新板」两次快照里必须指同一个语义槽，
@@ -281,17 +269,15 @@ final class Ui {
 
     /**
      * 主题重着色用的颜色映射：**实例身份优先，值回退次之**。
-     *
-     * <p>为什么不能再用 {@code HashMap<Color,Color>}：{@code Color.equals} 比的是 RGB 值，
+     * <p>为什么不能用 {@code HashMap<Color,Color>}：{@code Color.equals} 比 RGB 值，
      * 而同一个值可能同时属于多个槽位 —— 浅色板 {@code #6B727B} =
      * TEXT_SUB/BUBBLE_META/CHROME_FG/SCROLL_ARROW，深色板 {@code #E8EAED} =
-     * TEXT_MAIN/BUBBLE_TEXT/CHROME_FG。逐个 put 会「后写覆盖先写」，把其中某个槽位的
-     * 目标色套到**所有**同值槽位上（2026-09-29 实测：切回浅色后气泡正文/正文被映射成
-     * CHROME_FG 的 #6B727B，整片发灰、最深像素 34→112，看着就是「糊」）。
-     *
-     * <p>组件颜色都是直接持有 {@code Ui.XXX} 字段实例（全项目已核对：无
-     * {@code new Color(x.getRGB())} 这类等价色），所以用 {@code ==} 命中即精确；
-     * 值回退只为兜底代码里手写的同值色，并按**声明序首个槽位**取值，保证确定性。
+     * TEXT_MAIN/BUBBLE_TEXT/CHROME_FG。逐个 put 会「后写覆盖先写」，把某个槽位的目标色
+     * 套到**所有**同值槽位上（实测：切回浅色后气泡正文被映射成 CHROME_FG 的 #6B727B，
+     * 整片发灰，看着就是「糊」）。
+     * <p>组件颜色都直接持有 {@code Ui.XXX} 字段实例（全项目已核对：无
+     * {@code new Color(x.getRGB())} 这类等价色），所以 {@code ==} 命中即精确；
+     * 值回退只为兜底代码里手写的同值色，按**声明序首个槽位**取值，保证确定性。
      */
     private static final class ThemeMap {
         private final java.util.IdentityHashMap<Color, Color> byIdentity;
@@ -328,13 +314,21 @@ final class Ui {
         return new ThemeMap(byIdentity, byValue);
     }
 
+    /**
+     * 运行期切换主题：换调色板 → 刷 UIManager → 对已建组件树做一次「旧色 → 新色」重着色。
+     * <p>Swing 的组件颜色是**建的时候拷走**的，只换调色板已建组件不会变 —— 所以按**槽位**配对
+     * （旧板快照 → 新板快照，下标一一对应）整棵树替换一遍；颜色值相同的槽位靠实例身份区分，不用颜色值当键。
+     * 自定义 paint 里直接读 {@code Ui.XXX} 字段的（设备行/圆角气泡/窗口底），repaint 自动生效。
+     *
+     * @param d    true=深色 false=浅色
+     * @param root 已建窗口的根容器（frame.getContentPane()）；null = 只换调色板不做重着色
+     */
     static void applyDark(boolean d, java.awt.Container root) {
-        // ① 先记下旧值（按引用比对用）
         Color[] oldVals = snapshot();              // ① 先记下旧值（槽位下标 = 语义）
         assignPalette(d);
         Color[] newVals = snapshot();              // ② 再取新值（与旧值下标一一对应）
         ThemeMap map = buildThemeMap(oldVals, newVals);
-        // ② UIManager 默认值跟上（此后新建的对话框/弹出菜单直接用新配色）
+        // UIManager 默认值跟上（此后新建的对话框/弹出菜单直接用新配色）
         installLafColors();
         if (root == null) {
             return; // 早退路径在 fireThemeChanged() 之前：只换调色板时不刷弹菜单（无害但没必要）
@@ -343,13 +337,11 @@ final class Ui {
         retheme(root, map);
         root.revalidate();
         root.repaint();
-        // ③.5 2026-09-29：再排一次「整窗重绘」（invokeLater = 排在当前队列所有任务之后，
-        // 含调用方随后排入的 refreshDevices 局部重绘任务；脏区累积到下一次绘制脉冲才真正画）。
-        // 原因：调用方（toggleTheme）随后做的是局部重绘（deviceListPanel / msgPanel）——
-        // 局部重绘只重画子组件，会把父级 paintChildren 里最后画的「窗口描边线」
-        // （WindowChrome.RoundedContent）盖掉且不重画；实测浅色→深色后设备列表区域
-        // 左描边线消失（与启动即深色差 1956px）。整窗标脏让局部重绘并入一次全量重绘，
-        // 描边线在所有子组件之上重画，两种深色路径像素一致。
+        // ③.5 再排一次「整窗重绘」（invokeLater = 排在当前队列所有任务之后，
+        // 含调用方随后排入的 refreshDevices 局部重绘任务）：局部重绘只重画子组件，
+        // 会把父级 paintChildren 里最后画的「窗口描边线」（WindowChrome.RoundedContent）
+        // 盖掉且不重画 —— 实测浅色→深色后设备列表区域左描边线消失。整窗标脏并入一次
+        // 全量重绘，描边线在所有子组件之上重画，两种深色路径像素一致。
         final java.awt.Container root0 = root;
         javax.swing.SwingUtilities.invokeLater(new Runnable() {
             @Override
@@ -385,9 +377,9 @@ final class Ui {
     }
 
     /** 递归重着色：背景/前景命中旧色映射就换；边框里嵌的分割线颜色一并重建。
-     * 映射按槽位身份（实例）优先，不再用颜色值当键（2026-09-29）。
-     * 2026-09-29：根容器**自身**也重着色——contentPane 的 bg 是建窗时从
-     * "Panel.background" 拷走的槽位色，早先只换它的子组件、根自己留在旧色。
+     * 映射按槽位身份（实例）优先，不再用颜色值当键。
+     * 根容器**自身**也重着色——contentPane 的 bg 是建窗时从 "Panel.background" 拷走的槽位色；
+     * 早先只换它的子组件、根自己留在旧色。
      * 不透明窗（逐像素透明不支持的回退路径 / 全屏）下根 bg 会整窗填充，
      * 浅→深切完整个窗框留一圈白（离屏截图实测 margin 全白）。 */
     private static void retheme(java.awt.Container c, ThemeMap map) {
@@ -396,7 +388,7 @@ final class Ui {
             if (comp instanceof java.awt.Container) {
                 // 递归调用会对 comp 自己再调一次 rethemeComp，父循环里不能再调，
                 // 否则每个容器被重着色**两次**：第二遍把「刚换上的新色」再当旧色查映射。
-                // 2026-09-29 实证（BgChainProbe）：深色→浅色时新色白命中值回退
+                // 实证（BgChainProbe）：深色→浅色时新色白命中值回退
                 // （旧板 SCROLL_ARROW = Color.WHITE → 新板 #6B727B），左栏整片变灰。
                 retheme((java.awt.Container) comp, map);
             } else {
@@ -407,7 +399,7 @@ final class Ui {
 
     /**
      * 边框里的主题分割线换色：裸 MatteBorder 直接换；CompoundBorder（顶栏/底栏都是
-     * 「分割线 + 留白」的复合边框，2026-09-27 实测漏换）逐层递归；其它边框原样返回。
+     * 「分割线 + 留白」的复合边框）逐层递归；其它边框原样返回。
      *
      * @return 新边框；没有需要换的颜色时返回**原引用**（调用方按引用比对决定要不要 setBorder）
      */
@@ -446,7 +438,7 @@ final class Ui {
     /** 在 PcMain.main 最前面、创建任何窗口之前调用一次 */
     static void install() {
         // 全局默认字体：优先宋体（100% 缩放下小字号点阵最锐利），缺失时回退系统默认
-        // 档位：常规 15（=发送文件按钮同档）——未显式设字体的组件都吃它（风险 R3）
+        // 档位：常规 15（=发送文件按钮同档）——未显式设字体的组件都吃它
         Font base = new Font(FONT, Font.PLAIN, FS_STD);
         UIManager.put("defaultFont", base);
         UIManager.put("Button.font", base);
@@ -458,7 +450,7 @@ final class Ui {
         UIManager.put("TextField.font", base);
         UIManager.put("TextArea.font", base);
 
-        // 2026-09-29（用户「全部统一这样显示」）：所有 JButton 默认走 ModernButtonUI——
+        // 所有 JButton 默认走 ModernButtonUI——
         // 文件选择器 / 确认框 / 弹窗里的按钮与主窗按钮同一观感；未显式设样式的按钮
         // 落 SECONDARY（可见灰卡 + 深字）。自绘 / 扁平按钮（滚动条箭头 / 顶栏地址 /
         // 圆形图标 / 图片查看器 × / 气泡内链接式文字）显式用 FLAT（不画卡片、不覆盖前景）。
@@ -468,7 +460,7 @@ final class Ui {
         UIManager.put("ButtonUI", "com.phonepctransfer.pc.Ui$ModernButtonUI");
 
         // 细一点的滚动条
-        // 注（2026-09-28）：以下 3 个 ScrollBar.* 键对自定义滚动条已**失效**——
+        // 以下 3 个 ScrollBar.* 键对自定义滚动条已**失效**——
         // 聊天区/设备列表的滚动条改用 FlatScrollBarUI（见本文件底部），颜色在 paint 期
         // 现取 Ui.SCROLL_* 字段，不走 UIManager 值。保留这几行只为不影响其它仍用默认
         // 滚动条的组件（如有），删除反而可能改变它们的观感。
@@ -490,16 +482,16 @@ final class Ui {
      * install() 与 applyDark() 都会调：新建的组件从此取到当前主题的默认值。
      */
     private static void installLafColors() {
-        // ===== 弹菜单（R1/R2 修复）：用 MENU_* 专属色板，**不复用 DIVIDER** =====
-        // 根因②：以前只设了 PopupMenu.background / MenuItem.foreground，菜单项底色
-        // 一直是 LAF 默认亮灰 #EEEEEE —— 深色下与近白文字撞成一团（R2 的真身）。
+        // ===== 弹菜单：用 MENU_* 专属色板，**不复用 DIVIDER** =====
+        // 以前只设了 PopupMenu.background / MenuItem.foreground，菜单项底色
+        // 一直是 LAF 默认亮灰 #EEEEEE —— 深色下与近白文字撞成一团。
         // 这里把 MenuItem.background / Menu.background / Separator.* 一并纳入主题。
         // 已知且接受的浅色视觉变化：菜单项行底由 LAF 亮灰 #EEEEEE 变纯白 #FFFFFF，
         // 弹菜单由「白框 + 亮灰行」变「纯白底 + 1px #C8CDD4 边框」—— 这正是现代扁平该有的样子。
         UIManager.put("PopupMenu.background", MENU_BG);
         UIManager.put("PopupMenu.foreground", MENU_FG);
         UIManager.put("PopupMenu.border", BorderFactory.createLineBorder(MENU_BORDER, 1));
-        UIManager.put("MenuItem.background", MENU_BG);      // ← 根因②：本次新增
+        UIManager.put("MenuItem.background", MENU_BG);      // ← 本次新增
         UIManager.put("MenuItem.foreground", MENU_FG);
         UIManager.put("Menu.background", MENU_BG);          // ← JMenu 行底，本次新增
         UIManager.put("Menu.foreground", MENU_FG);
@@ -526,7 +518,7 @@ final class Ui {
         UIManager.put("Label.foreground", TEXT_MAIN);
         UIManager.put("TextField.foreground", TEXT_MAIN);
         // 输入框底色一并跟主题：以前只换前景，漏套 field() 的裸 JTextField 就是
-        // 「白底 + 深色下的近白字」= 字看不见（2026-10-04「添加设备」实测 1.21:1）。
+        // 「白底 + 深色下的近白字」= 字看不见。
         // field() 自己还会再设一遍同值，两者一致，这里只是兜底。
         UIManager.put("TextField.background", dark ? FIELD_DARK : Color.WHITE);
     }
@@ -563,7 +555,7 @@ final class Ui {
         }
     }
 
-    // ===== 弹菜单运行期主题化（2026-09-28 新增，根因③）=====
+    // ===== 弹菜单运行期主题化 =====
 
     /**
      * 把当前调色板的 MENU_* 落到一个**已建好**的 JPopupMenu 上（含递归子菜单）。
@@ -602,9 +594,9 @@ final class Ui {
         }
     }
 
-    // ===== 主题切换监听（2026-09-28 新增）=====
+    // ===== 主题切换监听 =====
     // 长期存活的弹菜单（托盘菜单）不在组件树里，只能靠监听刷新；
-    // 漏注册一个监听 = 那个菜单永远停在创建时那套色（根因③）。
+    // 漏注册一个监听 = 那个菜单永远停在创建时那套色。
     private static final java.util.List<Runnable> THEME_LISTENERS =
             new java.util.concurrent.CopyOnWriteArrayList<Runnable>();
 
@@ -668,8 +660,8 @@ final class Ui {
     private enum Style { PRIMARY, SECONDARY, SUBTLE, FLAT }
 
     /** 圆角现代按钮 UI：自己画背景，文字/图标仍交给 BasicButtonUI 画。
-     *  ⚠ 一律读 BTN_* 字段（2026-09-28 起跟主题走，见「按钮专属配色」注释）。
-     *  2026-09-29 起也作为全局 ButtonUI（见 install）：public + createUI 工厂是 JDK
+     *  ⚠ 一律读 BTN_* 字段（跟主题走，见「按钮专属配色」注释）。
+     *  也作为全局 ButtonUI（见 install）：public + createUI 工厂是 JDK
      *  UIDefaults.getUI(JComponent) 对 Class 值的硬性要求。 */
     public static final class ModernButtonUI extends BasicButtonUI {
 
@@ -710,12 +702,12 @@ final class Ui {
 
             Color fill = null;
             Color fg;
-            // 2026-09-29（用户反馈「默认发糊、移上去才清晰」）：SECONDARY/SUBTLE 的**默认态**
+            // SECONDARY/SUBTLE 的**默认态**
             // 直接用原 hover 底色 BTN_HOVER——旧默认 BTN_FILL 与 SURFACE 同色（浅色白卡白底 /
             // 深色黑卡黑底），卡片几乎隐形、整颗按钮看着发淡发糊；BTN_HOVER 与底有亮度差，
             // 卡片可见即「清晰」。hover/按下再深一档 BTN_SUB_HOVER 保留反馈（复用既有色，无新色）。
             // PRIMARY（蓝底白字）两态本来就高对比，不动。
-            // FLAT（2026-09-29「全部统一」配套）：自绘 / 链接式按钮不画卡片、保留自身前景色。
+            // FLAT：自绘 / 链接式按钮不画卡片、保留自身前景色。
             switch (s) {
                 case FLAT:
                     fg = null;
@@ -736,19 +728,9 @@ final class Ui {
                     break;
             }
 
-            // ===== 卡片绘制的历史沿革（保留，避免以后再踩同一个坑）=====
-            // ① 最早：1px drawRoundRect 矢量描边。细描边在分数设备坐标（如 Windows 125% 缩放——
-            //    旧钉定值，2026-09-29 起钉 100%；「跟随系统缩放」模式下仍会出现）下，
-            //    四条边落到的亚像素偏移各不相同，同一笔宽在不同边上视觉粗细不同
-            //    （2026-09-27 用户实测「设置」按钮上边框消失；同日还反馈按钮右边框看起来缺失）。
-            // ② 2026-09-27/09-28：改成「填充环」——外圆角矩形填 border 色 + 内圆角矩形填 fill 色。
-            //    填充环在任何 DPI 下四条边的覆盖结构相同（整行 + 整行 + 两端部分行），比描边稳，
-            //    但仍然是**每次重绘现算矢量**，抗锯齿边缘依旧随分数坐标抖动，且卡片底与文字同处
-            //    一个按钮矩形、首选宽零容差 ⇒ 文字仍可能被自身 bounds 削边。
-            // ③ 2026-09-28（本次）：改为 **透明 PNG 圆角卡片贴图 + 9 宫格拉伸**（见 CardSkin）。
-            //    栅格化只在首次发生一次，抗锯齿结果固化在 PNG 像素里，之后按 9 宫格铺满任意尺寸；
-            //    四边粗细与 DPI 无关，恒定一致。
-            // ==========================================================
+            // ===== 卡片绘制：透明 PNG 圆角贴图 + 9 宫格拉伸（见 CardSkin）=====
+            // 矢量描边 / 填充环在分数坐标下四边亚像素漂移、首选宽零容差文字被自身 bounds 削边；
+            // 贴图栅格化只发生一次、抗锯齿固化在像素里，四边粗细与 DPI 无关、恒定一致。
             //
             // L1 卡片层：先在组件背景上垫卡片（按钮不透明=false，四角透明的部分透出父容器底色）。
             //   · SECONDARY：白底 + 浅灰环（禁用时用更淡的 BTN_BORDER_OFF）；
@@ -773,10 +755,10 @@ final class Ui {
         }
 
         /**
-         * 首选尺寸 + 墨迹安全余量（2026-09-28）。
+         * 首选尺寸 + 墨迹安全余量。
          *
          * <p>JButton 的首选宽 = 文字 stringWidth + 边框 insets，是**零容差**的；而抗锯齿渲染的
-         * 实际墨迹比度量宽 5~13%（与 {@code ChatDevices.INK_SAFETY = 1.12} 同源口径，2026-09-27
+         * 实际墨迹比度量宽 5~13%（与 {@code ChatDevices.INK_SAFETY = 1.12} 同源口径，
          * 实测 Consolas 11px：度量 140px、渲染 147px@100%、157px@125%）。按钮的绘制被裁剪到自身
          * bounds，于是首/末字形被削掉半边（用户附图里的「文字被裁」）。
          *
@@ -798,7 +780,7 @@ final class Ui {
         }
     }
 
-    // ===== 大字号文本 AA（2026-09-29）=====
+    // ===== 大字号文本 AA =====
 
     /**
      * 显式开文本 AA 的 JLabel：全局文本 AA 已关（小字号走宋体内嵌点阵最锐利），
@@ -856,7 +838,7 @@ final class Ui {
     /**
      * 圆角输入框边框：聚焦时描边略粗一点表示状态。
      *
-     * <p><b>铁律（2026-09-28）：{@code paintBorder} 里只准画「空心环」，绝不画实心卡片。</b>
+     * <p><b>铁律：{@code paintBorder} 里只准画「空心环」，绝不画实心卡片。</b>
      * 因为 {@code JComponent.paint} 的顺序是 paintComponent → paintChildren → <b>最后</b>
      * paintBorder，边框是画在文字**之上**的；一旦这里画实心卡片，就会把输入框里的文字整个盖住。
      * 所以本类一律以 {@code fill = null} 调 {@link CardSkin#paint}（内芯用 AlphaComposite.Clear
@@ -881,7 +863,7 @@ final class Ui {
                 return;
             }
             Graphics2D g2 = (Graphics2D) g.create();
-            // 空心环：芯透明（fill=null），聚焦时环宽 3.0px、失焦 2.0px（2026-09-29 起 100% 下取整，
+            // 空心环：芯透明（fill=null），聚焦时环宽 3.0px、失焦 2.0px（100% 下取整，
             // 保留聚焦层次）—— 层次上永远挡不住文字
             CardSkin.paint(g2, w, h, 9, null, color, focused ? 3.0 : 2.0);
             g2.dispose();
@@ -899,13 +881,13 @@ final class Ui {
         }
     }
 
-    // ==================== 自定义滚动条（R4：黑轨道 / 白箭头 / 绿滑块） ====================
+    // ==================== 自定义滚动条（黑轨道 / 白箭头 / 绿滑块） ====================
 
     /**
      * 扁平滚动条 UI：圆角黑轨道 + 自绘白箭头按钮 + 绿色胶囊滑块。
      *
      * <p>颜色全部在 paint 期现取 {@code Ui.SCROLL_*} 字段（切主题 repaint 即换色）；
-     * 刻意**不**走 UIManager 值（install() 里的旧 ScrollBar.* 键已失效，见那里注释）。
+     * 刻意**不**走 UIManager 值（install() 里的 ScrollBar.* 键已失效，见那里注释）。
      */
     private static final class FlatScrollBarUI extends BasicScrollBarUI {
         /** 箭头按钮短边尺寸（px） */
@@ -913,7 +895,7 @@ final class Ui {
         /** 条宽（px）——默认 12，调用方可经 installScrollBar 覆盖 */
         private static final int WIDTH = 12;
         /**
-         * 滑块圆角半径（px）——2026-09-29 新增。
+         * 滑块圆角半径（px）。
          * 原来 fillRoundRect 传的是 (w, h)：arcH 被绑到滑块**长度**上，两端变成细长半椭圆
          * （"拉尖"）。现在固定半径，arcW = arcH = 2 × 本值，再按短边收敛。
          * 3 = 与 ArrowButton 悬停圆角(6,6)同系；要更方正改 2，要更圆改 4。
@@ -930,7 +912,7 @@ final class Ui {
             boolean horiz = sb.getOrientation() == JScrollBar.HORIZONTAL;
             float arc = horiz ? bounds.height : bounds.width;
             // 铺满整条（含箭头按钮区）：箭头是透明底，要透出轨道。
-            // 箭头按钮修成 14px 高后（2026-09-28 T11），BasicScrollBarUI 算出的
+            // 箭头按钮修成 14px 高后，BasicScrollBarUI 算出的
             // trackBounds 会内缩掉两端 → 这里还原成整条，否则箭头区露出滚动面板底色
             Rectangle full = horiz
                     ? new Rectangle(0, bounds.y, c.getWidth(), bounds.height)
@@ -957,7 +939,7 @@ final class Ui {
             g2.setColor(hover ? SCROLL_THUMB_HOVER : SCROLL_THUMB);
             int w = Math.max(4, bounds.width - 4);
             int h = Math.max(4, bounds.height - 4);
-            // 小圆角长条（2026-09-29）：arcW = arcH = 2×THUMB_R（半径），与滑块长度解耦；
+            // 小圆角长条：arcW = arcH = 2×THUMB_R（半径），与滑块长度解耦；
             // 滑块极短时 (w,h) 会小于 arc，用 min 收敛，避免圆角大于短边画出畸形
             int arc = Math.min(THUMB_R * 2, Math.min(w, h));
             g2.fillRoundRect(bounds.x + 2, bounds.y + 2, w, h, arc, arc);
@@ -992,7 +974,7 @@ final class Ui {
             ArrowButton(int dir) {
                 this.dir = dir;
                 // 全局 ButtonUI = ModernButtonUI 后，箭头按钮必须 FLAT：透明底透出轨道，
-                // 不能被 SECONDARY 灰卡垫底（2026-09-29「全部统一」配套）
+                // 不能被 SECONDARY 灰卡垫底
                 putClientProperty(ModernButtonUI.STYLE_KEY, Style.FLAT);
                 setOpaque(false);
                 setContentAreaFilled(false);
@@ -1002,7 +984,7 @@ final class Ui {
                 setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
                 // BasicScrollBarUI.layoutVScrollbar/HScrollbar 按按钮 getPreferredSize() 定按钮尺寸：
                 // 无文本/无边框/无图标的 JButton 首选尺寸是 0×0 → 按钮被布局成 12×0，
-                // 三角被零高裁掉不显示（2026-09-28 T11 离屏实测）→ 显式钉死 14×14
+                // 三角被零高裁掉不显示（离屏实测）→ 显式钉死 14×14
                 setPreferredSize(new Dimension(ARROW_H, ARROW_H));
                 addMouseListener(new MouseAdapter() {
                     @Override public void mouseEntered(MouseEvent e) { hover = true; repaint(); }
@@ -1051,7 +1033,7 @@ final class Ui {
      * 给滚动条装自定义 UI（只作用于垂直条，一行接入）。
      *
      * @param sp    目标滚动面板
-     * @param width 条宽：聊天区 = 12，左侧设备列表 = 10（Q4/Q6 定稿）
+     * @param width 条宽：聊天区 = 12，左侧设备列表 = 10
      */
     static void installScrollBar(JScrollPane sp, int width) {
         JScrollBar bar = sp.getVerticalScrollBar();

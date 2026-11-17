@@ -9,22 +9,8 @@ import java.net.InetSocketAddress
 import java.net.NetworkInterface
 
 /**
- * UDP 28766 广播发现（**低噪声版**）。
- *
- * 发包策略：
- *  - **启动只广播一次**（[sendLoop]），告诉局域网「我在这儿」；此后线程待命，
- *    不产生任何周期性网络行为（前台常驻期间也不会反复发包）。
- *  - 常驻 [recvLoop] 纯被动接收对端 beacon，收到谁就把谁回调给上层（自动进设备列表）。
- *  - 唯一的例外是 [scanOnce]：启动时那一次有界扫描。它发的 beacon 带 `q:"1"`
- *    （query 标记），**收到的对端会回一次自己的 beacon** —— 这样"被动方"不需要周期广播
- *    也能被扫到，同时"后启动的一方发现先启动的一方"这个老问题不靠 2s 周期广播解决。
- *    回应带每设备 2s 限频，且回应帧不带 q，不会来回反弹。
- *
- * 一次 [scanOnce] 里其实有**两条路径**（2026-09-21 增加第二条）：
- *  ① **广播询问** —— 发 `q:1` 的 beacon 到各网卡广播地址 + `255.255.255.255`；
- *  ② **网段扫描** —— 只扫**本机地址所在的 /24**，逐地址单播同一个询问帧
- *     （本机 `10.1.2.3` → 只扫 `10.1.2.1` ~ `10.1.2.254`）。
- *     广播在 AP 隔离、跨 AP、大子网（如 /16）里常常到不了对端，逐地址单播能直接命中。
+ * UDP 28766 广播发现(低噪声):启动只广播一次,此后纯被动接收对端 beacon,收到谁就把谁回调(自动进设备列表);
+ * [scanOnce] 是唯一主动扫描(广播询问 + 本机 /24 逐地址单播,询问带 q:1,对端回应 2s 限频、不反弹)
  */
 class Discovery(
     private val deviceId: String,
@@ -42,15 +28,11 @@ class Discovery(
     /** 串行化 beacon 发送：启动广播与主动扫描（scanOnce）可能并发调用 */
     private val sendLock = Any()
 
-    /**
-     * 主动扫描期间用于收集"回应"的设备 IP；为 null 表示当前没有扫描在进行。
-     * recvLoop 每收到一个对端 beacon 就往里丢一份（见 scanOnce）。
-     */
+    /** 主动扫描期间收集"回应"的设备 IP；null = 无扫描在进行（recvLoop 收到对端 beacon 就往里丢） */
     @Volatile
     private var scanCollector: MutableSet<String>? = null
 
-    /** 对「扫描询问」回应的限频表：IP → 上次回应时刻（防被反复唤醒时刷屏）
-     *  超过 1h 的条目在 [shouldReply] 入口顺手清扫，长时间运行保持有界 */
+    /** 扫描询问回应限频表:IP→上次回应时刻(2s 限频);超 1h 条目在 shouldReply 入口清扫 */
     private val lastReplyAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     fun start() {
@@ -82,11 +64,7 @@ class Discovery(
         return o.toString().toByteArray(Charsets.UTF_8)
     }
 
-    /**
-     * 启动广播线程：**只发一次**（这是本端唯一的主动广播）。
-     *
-     * 发完就待命 —— 没有周期广播，没有轮询，局域网里只有对端开口时我们才回应（见 recvLoop）。
-     */
+    /** 启动广播线程:只发一次(本端唯一主动广播),发完待命纯被动 */
     private fun sendLoop() {
         runCatching { sendBeaconOnce(false) }
             .onSuccess { Log.i(TAG, "启动广播已发出（仅此一次，之后纯被动接收对端广播）") }
@@ -118,25 +96,12 @@ class Discovery(
     }
 
     /**
-     * 主动扫描一轮：先发一个带 `q` 的询问，再在 [timeoutMs] 窗口内每约 800ms 补发一次，
-     * 收集这期间**收到回应**（对端 beacon）的设备 IP。
-     *
-     * 窗口给 3000ms 是为了留够对端「收到询问 → 回一次」的往返余量（对端回应有 2s 限频）。
-     * 扫描期内回应的设备同时也会走 [onPeer] 回调被自动加入设备列表。
-     *
-     * 窗口内的顺序（2026-09-21）：
-     *  1. 先广播一轮询问；
-     *  2. 紧接着做**网段扫描**：本机 IPv4 所属 /24 的 `.1`~`.254` 逐个单播同一个询问帧
-     *     （本机是 `10.1.2.3` 就只扫 `10.1.2.x`，跳过自己）；
-     *  3. 余下时间每 800ms 补广播一次；**窗口过半**时对「还没回应的地址」补扫一轮
-     *     （首轮可能因 ARP 未收敛而丢包）。
-     *
-     * @param ownIpv4 本机主 IPv4。为空、或不属于私网段（10/8、172.16/12、192.168/16）时
-     *   **只做广播路径**，不做网段扫描 —— 公网 / 蜂窝地址逐个扫 254 个地址毫无意义。
-     * @param skipIps 本机**全部** IPv4（多地址设备：WiFi + 热点切换后会同时挂着两个）。
-     *   只跳过 [ownIpv4] 的话，扫描会打到自己的另一个地址上 —— 本机自己应答、自己入列，
-     *   之后链路层就一直对着自己重连。
-     * @return 本次窗口内收到回应的 IP 集合（已去重）；非运行状态返回空集
+     * 主动扫描一轮:先广播带 q 询问,窗口内(默认 3000ms,对端回应 2s 限频,留够往返余量)
+     * 每 800ms 补发、先扫一遍本机 /24(.1~.254)、窗口过半对未回应地址补扫(首轮可能 ARP 丢包),
+     * 收集期间收到回应(对端 beacon)的设备 IP(它们同时经 onPeer 自动入列)。
+     * @param ownIpv4 本机主 IPv4;为空或非私网段则只做广播路径(公网/蜂窝逐地址扫无意义)
+     * @param skipIps 本机全部 IPv4(热点切换后同时挂两个;只跳 ownIpv4 会打到自己另一地址、自己入列)
+     * @return 窗口内收到回应的 IP 集合(去重);非运行状态返回空集
      */
     fun scanOnce(
         timeoutMs: Long = 3000,
@@ -184,11 +149,8 @@ class Discovery(
     }
 
     /**
-     * 逐地址单播询问帧。**不整段持锁**（否则扫描期间[recvLoop]的回应会被卡住），
-     * 只在每包 send 时短暂进 [sendLock]。
-     *
-     * 每 [SWEEP_BURST] 个地址歇 [SWEEP_PACE_MS]：254 个包瞬时打出去会把网卡发送队列 +
-     * ARP 未解析队列顶满（内核会把超出的包直接丢掉），节流后命中率明显更高。
+     * 逐地址单播询问帧:不整段持锁(否则扫描期间 recvLoop 的回应被卡),每包 send 时短暂进 sendLock;
+     * 每 SWEEP_BURST 个地址歇 SWEEP_PACE_MS(254 包瞬发会顶满网卡发送队列+ARP 队列,内核丢超出的包)
      */
     private fun sweepSubnet(hosts: List<String>) {
         val s = synchronized(sendLock) { ensureSendSocket() } ?: return
@@ -254,8 +216,7 @@ class Discovery(
                 // 正在主动扫描时，把这个"回应"记进本轮结果
                 scanCollector?.add(ip)
                 onPeer(ip, j.optString("name", ip), id, j.optInt("port", Protocol.DEFAULT_TCP_PORT))
-                // 对方在扫描（带了 q）→ 回一次自己的 beacon，让它不用等我们周期广播也能发现我们。
-                // 回应帧不带 q，所以不会互相反弹；并且按 IP 2s 限频，被反复唤醒也不会刷屏。
+                // 对方在扫描(带q)→回一次自己的 beacon(回应帧不带 q 不反弹;按 IP 2s 限频不刷屏)
                 if (j.optInt("q", 0) == 1 && shouldReply(ip)) {
                     Log.i(TAG, "回应 $ip 的扫描询问")
                     sendBeaconOnce(false)
@@ -305,12 +266,8 @@ class Discovery(
         private const val SWEEP_MAX = 254
 
         /**
-         * 本机 IPv4 是否属于「值得逐地址扫 /24」的私网段；是则返回前三段
-         * （`10.1.2.3` → `10.1.2`），否则 null。
-         *
-         * 只认 10/8、172.16/12、192.168/16：这三段才可能同时坐着本机与对端。
-         * 公网地址、蜂窝 4G/5G 地址、链路本地 169.254/16、IPv6 一律不扫 ——
-         * 逐个扫 254 个不属于自己的地址既扫不到对端，也容易被当成端口扫描。
+         * 本机 IPv4 是否属于值得逐地址扫 /24 的私网段;是则返回前三段(10.1.2.3→10.1.2),否则 null。
+         * 只认 10/8、172.16/12、192.168/16(公网/蜂窝/链路本地/IPv6 不扫:逐地址 254 个扫不到对端,易被当端口扫描)
          */
         fun subnetPrefixOf(ip: String?): String? {
             val v = ip?.trim()?.substringBefore('%') ?: return null

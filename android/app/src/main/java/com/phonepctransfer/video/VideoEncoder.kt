@@ -10,11 +10,9 @@ import android.view.Surface
 import java.nio.ByteBuffer
 
 /**
- * HEVC / H.264 **硬件**编码器（Surface 输入，零拷贝）（计划 §5.2）。
- *
+ * HEVC / H.264 **硬件**编码器（Surface 输入，零拷贝）。
  * 取帧方式：`dequeueOutputBuffer` → 按 `BUFFER_FLAG_CODEC_CONFIG` 区分
  * 「配置帧（VPS/SPS/PPS）」与「普通帧」，首帧 IDR 标 `KEYFRAME` 位。
- *
  * ⚠ 输出是 **Annex-B 裸流**（MediaCodec 编码器的默认输出格式），
  * 正好对上 PC 端 `ffmpeg -f hevc -i pipe:0` 的输入要求，**不需要任何转换**。
  */
@@ -189,7 +187,7 @@ class VideoEncoder(
         }
     }
 
-    /** 档位切换（一期只改码率 → 一次 setParameters，**不 stop、不重建**） */
+    /** 档位切换（只改码率 → 一次 setParameters，**不 stop、不重建**） */
     fun setBitrate(bitrate: Int) {
         val c = codec ?: return
         runCatching {
@@ -212,12 +210,11 @@ class VideoEncoder(
 
     /**
      * 请求**重发一份参数集**（对端解码器刚换代/刚接入时用，与 [requestKeyFrame] 配对）。
-     *
      * ⚠ 参数集每个编码器实例只发一次（[configSent]），而 PC 的解码进程既晚于通话起步、
-     *   又会随每次换尺寸重建 ⇒ 新进程从来没有解析到过 VPS/SPS/PPS，日志表现为一整段
-     *   `[hevc] PPS id out of range: 0`，画面灰白后卡死。光要 IDR 不够：那台机的编码器
-     *   不吐 CODEC_CONFIG 输出缓冲、也不把参数集内联进 IDR（08:37:59 那通实测），必须再发一次 csd。
-     * ⚠ 只置标志、由 [drainLoop]（编码器线程）真正发出 —— 本方法可能在**网络读线程**上被调，
+     *   又会随每次换尺寸重建 ⇒ 新进程从来没有解析到过 VPS/SPS/PPS（日志表现为一整段
+     *   `[hevc] PPS id out of range: 0`，画面灰白后卡死）。光要 IDR 不够：
+     *   编码器不吐 CODEC_CONFIG 输出缓冲、也不把参数集内联进 IDR，必须再发一次 csd。
+     * ⚠ 只置标志、由 [drainLoop]（编码器线程）真正发出——本方法可能在**网络读线程**上被调，
      *   而发送侧的 `seq` 自增没有跨线程保护，从读线程直接发帧会造出重复 seq（收端按单调去重丢帧）。
      */
     fun resendConfig() {

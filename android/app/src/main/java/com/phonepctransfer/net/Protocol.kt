@@ -8,16 +8,9 @@ import java.io.InputStream
 import java.io.OutputStream
 
 /**
- * 传输协议 v2：帧 = [4 字节大端 uint32 长度][载荷]
- *
- * v2 起（2026-09-13）：
- *  - 长度字段最高位（0x80000000）为 0 → JSON 控制帧；为 1 → 二进制分片帧（低 31 位为载荷长度）。
- *    文件分片从「256KB + base64 + JSON」改为「1MB + 裸二进制」，消除 33% base64 膨胀和
- *    大字符串 JSON 编解码开销 —— 这是传输速率只有无线网络 35% 左右的主因。
- *  - 断点续传：file_query / file_resume 控制帧（见 docs/PROTOCOL.md §4.3）
- *  - 文件夹传输：dir_meta 帧声明目录，file_meta 携带 dirId/relPath
- *
- * 与 PC 端 com.phonepctransfer.pc.Protocol.java 严格一致。
+ * 传输协议 v2:帧 = [4B 大端 uint32 长度][payload];长度字段最高位 0 = JSON 控制帧,1 = 二进制帧(低 31 位是 payload 长度)。
+ * 文件分片为 1MB 原始二进制(v1 的 256KB+base64+JSON 带来 33% 膨胀);断点续传 = file_query/file_resume;文件夹传输 = dir_meta 声明目录 + file_meta 带 dirId/relPath。
+ * 与 PC 端 com.phonepctransfer.pc.Protocol.java 严格一致
  */
 object Protocol {
 
@@ -45,9 +38,7 @@ object Protocol {
 
     /**
      * 二进制帧子类型：视频帧（HEVC / H.264 Annex-B 裸流，**一包 = 恰好一个访问单元**）。
-     *
-     * ⚠ 向后兼容闸门：老版本对端 readFrame 遇到 0x03 会抛 IOException → 断链。
-     * 因此**只有对端 hello 广播了 `vid=1` 才允许发**（见 Link.peerVidCap）。
+     * ⚠ 只有对端 hello 广播了 `vid=1` 才允许发（见 Link.peerVidCap）；老版本对端遇到 0x03 会抛 IOException 断链
      */
     const val BIN_VIDEO: Byte = 0x03
 
@@ -58,10 +49,8 @@ object Protocol {
     const val VIDEO_FLAG_CONFIG = 0x02
 
     /**
-     * 视频单帧硬闸门 128 KB。
-     *
-     * 视频帧与音频帧、文件分片**共用同一条会话的 writeLock**：一个超大 IDR 会让
-     * `write()` 长时间独占写锁 → 音频/心跳/文件全被挡住。超限直接丢弃并记日志。
+     * 视频单帧硬闸门 128 KB：视频/音频/文件分片共用同一条会话 writeLock,超大 IDR 会让 write() 长时间独占写锁挡住一切,
+     * 超限直接丢弃并记日志
      */
     const val MAX_VIDEO_FRAME = 128 * 1024
 
@@ -69,12 +58,8 @@ object Protocol {
 
     /**
      * 数据报版本，占 [0] 的高 4 位；低 4 位是流类型。
-     *
-     * 这是**媒体通道自己的**数据报：UDP 档原样发，媒体 TCP 档发同一份报（怎么在字节流上框帧
-     * 方案没写，归 2.6）。带内档不用它 —— 那里仍是上面的 [BIN_AUDIO]/[BIN_VIDEO] 帧制（I3 例外条款）。
-     *
-     * ⚠ 本节**没有**新增任何 `BIN_*` 主 TCP 二进制子类型：老端读帧遇到未知子类型会直接
-     *   IOException 断链（I8，与 [callInvite] 里那句提醒同一个理由）。
+     * 媒体通道**自己的**数据报：UDP 档原样发，媒体 TCP 档发同一份报（字节流上怎么框帧归 2.6）；带内档不用它（仍是 BIN_AUDIO/BIN_VIDEO 帧制, I3 例外条款）。
+     * ⚠ 不新增任何 `BIN_*` 主 TCP 二进制子类型（老端读帧遇到未知子类型会直接 IOException 断链, I8）
      */
     const val DG_VER = 1
 
@@ -89,8 +74,8 @@ object Protocol {
     const val DG_TYPE_FEEDBACK = 4
 
     /**
-     * ctrl 子类型：载荷**首字节**。§4.4 给了两个候选位置（[0] 的低 4 位 / payload 首字节），
-     * 本条定死取后者 —— [0] 低 4 位已经被四个流类型占着，再塞五种 ctrl 就得挤掉类型位。
+     * ctrl 子类型：载荷**首字节**（§4.4 两个候选位置中定死取后者 —— [0] 低 4 位已被四个流类型占着,
+     * 再塞五种 ctrl 就得挤掉类型位）
      */
     const val CT_PROBE = 1
     const val CT_KEYFRAME_REQ = 2
@@ -102,23 +87,20 @@ object Protocol {
     const val DG_HEADER_LEN = 8
 
     /**
-     * 头后 4B ts = 发送端**通话相对**毫秒（`util/CallClock.elapsedMs()`，起呼=0）。
-     * 宽度与零点口径照带内音视频帧的既有先例（[writeAudio] / [writeVideo] 各 4B 大端）；
-     * 两端各自零点，接收端**不得**拿它与本端墙钟相减（S1 / 任务单 3.8 的两段式帧龄）。
+     * 头后 4B ts = 发送端**通话相对**毫秒（`util/CallClock.elapsedMs()`，起呼=0），照带内帧的 4B 大端先例；
+     * 两端各自零点，接收端**不得**拿它与本端墙钟相减（S1 / 任务单 3.8 的两段式帧龄）
      */
     const val DG_TS_LEN = 4
 
     /** 一份报的固定开销（不含 payload）= 8 + 4 */
     const val DG_OVERHEAD = DG_HEADER_LEN + DG_TS_LEN
 
-    /**
-     * ctrl **整报**上限 64B（§4.4）。音频/视频/反馈报不受它约束 —— 它们的上限是 3.2 的 1200B。
-     */
+    /** ctrl **整报**上限 64B（§4.4）；音频/视频/反馈报不受它约束（它们的上限是 3.2 的 1200B） */
     const val DG_CTRL_MAX_REPORT = 64
 
     /**
-     * [3] flags：**只有这三**位有定义。bit0/bit1 的位序照带内视频帧的 [VIDEO_FLAG_*]
-     * （IDR=0x01、CONFIG=0x02）⇒ 带内生产者迁过来时这两位不用重映射；bit2 是新加的"帧内最后一片"。
+     * [3] flags：**只有这三**位有定义；bit0/bit1 位序照带内视频帧的 [VIDEO_FLAG_*]（生产者迁过来不用重映射）,
+     * bit2 是新加的"帧内最后一片"
      */
     const val DG_FLAG_IDR = 0x01
     const val DG_FLAG_CONFIG = 0x02
@@ -158,9 +140,8 @@ object Protocol {
     const val OWNER_BIT_RECV = 0x02
 
     /**
-     * 快照 flags（[12..13] 低 7 位）：**位序 = §4.4 括号里的书写序，一位不多一位不少** ——
-     * aggregated / camOn / muted / sendingPaused / wantVideo / needKeyframe / bg。
-     * 前四位是推流端 owner 组、后三位是收流端组（顺序照 D14-1 的字段表，不是按字母）。
+     * 快照 flags（[12..13] 低 7 位）：**位序 = §4.4 括号里的书写序，一位不多一位不少**
+     *（aggregated/camOn/muted/sendingPaused/wantVideo/needKeyframe/bg；前四位是推流端 owner 组、后三位是收流端组，顺序照 D14-1 字段表）
      */
     const val SNAP_FLAG_AGGREGATED = 0x0001
     const val SNAP_FLAG_CAM_ON = 0x0002
@@ -327,13 +308,8 @@ object Protocol {
     // ==================== 数据流量确认（v2.7，仅双方 dm=1 时使用）====================
 
     /**
-     * 发起方 → 对端：**用数据流量做这件事，你同意吗？**
-     *
-     * 为什么要有这一帧：每条链路两端各自的网络环境是独立的 —— 发起方在 WiFi 不代表
-     * 接收方不在运营商数据网络上。想让「接收方也在用流量」时能先问一句，
-     * 就必须由发起方在对端开口之前问；对端在非数据网络下**自动应答同意**（不打扰用户）。
-     *
-     * `kind`：`file` / `voice` / `video`；`name` 为文件（夹）名，通话为空。
+     * 发起方 → 对端：**用数据流量做这件事，你同意吗？**（两端各自网络环境独立：发起方在 WiFi 不代表接收方不在数据网络上;
+     * 对端在非数据网络下**自动应答同意**，不打扰用户）。kind=file/voice/video；name 为文件（夹）名，通话为空
      */
     fun dataAsk(mid: String, kind: String, name: String = "", size: Long = 0L): JSONObject =
         msg("data_ask")
@@ -478,11 +454,8 @@ object Protocol {
     // ==================== 文件夹完整性校验（v2.6，仅双方 dl=1 时使用）====================
 
     /**
-     * 文件夹成员发完（无论成败）后的收尾帧。接收端凭此**明确知道传输结束**，
-     * 立刻用 dir_meta.list 与实收清单求差集，把缺失项回发 dir_missing。
-     *
-     * 为什么必须有这一帧：老流程下接收端只能靠 doneFiles>=count 猜「收齐了」，
-     * 而成员在发送端被跳过/发送失败时接收端永远等不到 → 静默缺文件。
+     * 文件夹成员发完（无论成败）后的收尾帧：接收端凭此**明确知道传输结束**，立刻用 dir_meta.list 与实收清单求差集、把缺失项回发 dir_missing
+     *（老流程下接收端只能靠 doneFiles>=count 猜「收齐了」，成员在发送端被跳过/失败时永远等不到 → 静默缺文件）
      */
     fun dirEnd(mid: String, sent: Int, last: Boolean): JSONObject = msg("dir_end")
         .put("mid", mid)
@@ -514,11 +487,8 @@ object Protocol {
     // ==================== 语音通话 ====================
 
     /**
-     * 写一个语音音频帧（Opus 编码，0.2s 一帧）。
-     * 载荷 = [1B 子类型 BIN_AUDIO][4B seq 大端][4B ts 大端(ms)][opus data...]。
-     *
-     * ts = 发送端**通话相对**毫秒（`util/CallClock.elapsedMs()`，起呼=0），4B 无符号；
-     * 6h 上限通话不会回绕。禁止再塞绝对墙钟。
+     * 写一个语音音频帧（Opus 编码，0.2s 一帧）。载荷 = [1B 子类型 BIN_AUDIO][4B seq 大端][4B ts 大端(ms)][opus data...]。
+     * ts = 发送端**通话相对**毫秒（`util/CallClock.elapsedMs()`，起呼=0），4B 无符号；6h 上限通话不会回绕，禁止再塞绝对墙钟
      */
     @Throws(IOException::class)
     fun writeAudio(out: OutputStream, seq: Int, ts: Long, data: ByteArray, off: Int, len: Int) {
@@ -543,16 +513,10 @@ object Protocol {
 
     /**
      * 呼叫请求（呼出方 → 被叫方）。callerName/callerIp 用于弹窗展示。
-     *
-     * @param af 本端期望的**语音帧长（ms）**：20 = 低延迟模式。老版本对端不带这个字段
-     *           （读到 0）→ 两端都按 200ms 兼容模式跑，与改造前行为一致。
-     * @param mport 本端**媒体端口**（任务单 2.4 / 方案 §4.2）；0 = 未 bind / 未声明 → 对端只能走带内档
-     * @param mudp  本端媒体端口是否 UDP；false = 未声明（媒体 TCP / 带内）
-     * @param msid  本次通话的随机 token（串话隔离用，**不是安全边界**，S12）；空 = 未声明
-     *
-     * ⚠ 协商字段**只有这三个**：没有 `cport` / `cip`——独立控制 TCP 通道已取消（U9 / N9）。
-     * ⚠ 新标识只走 JSON 可选字段，**没有**新增二进制帧子类型（未知子类型会让老端直接抛 IOException
-     *   断链，读帧处那句 "未知二进制帧子类型"，I8）。
+     * af = 本端期望的**语音帧长（ms）**：20 = 低延迟，老端读到 0 → 两端都按 200ms 兼容模式跑；
+     * mport = 本端**媒体端口**（0 = 未 bind/未声明 → 对端只能走带内档）；mudp = 本端媒体端口是否 UDP；
+     * msid = 本次通话随机 token（串话隔离用，**不是安全边界**，S12），空 = 未声明。
+     * ⚠ 协商字段**只有这三个**（没有 cport/cip，独立控制 TCP 通道已取消）；新标识只走 JSON 可选字段，**没有**新增二进制帧子类型（未知子类型会让老端 IOException 断链）
      */
     fun callInvite(
         callerName: String, callerIp: String, vid: Boolean = false, lv: Int = 0, af: Int = 0,
@@ -568,14 +532,9 @@ object Protocol {
         .put("msid", msid)    // 本次通话随机 token；空/缺省 = 未声明
 
     /**
-     * 同意接听（被叫方 → 呼出方）。
-     * @param vid 接听方是否接受视频（自己没法收视频就回 false，两端取与）
-     * @param lv  接听方可接受的档位，两端取 min
-     * @param af  接听方期望的语音帧长（ms），语义同 [callInvite]
-     * @param mport/mudp/msid 接听方本端媒体通道三元组，语义与缺省回退口径同 [callInvite]
-     *
-     * ⚠ **没有**新增 ip 字段：call_accept 从来不带本机地址（对照 [callInvite] 独有的 name/ip 两项），
-     *   媒体方向靠 probe + learn-by-receiving 定（任务单 2.7），不靠报文里的地址声明。
+     * 同意接听（被叫方 → 呼出方）。vid = 接听方是否接受视频（自己没法收就回 false，两端取与）；lv = 接听方可接受的档位（两端取 min）；
+     * af = 接听方期望的语音帧长（ms），语义同 [callInvite]；mport/mudp/msid = 接听方本端媒体通道三元组（缺省回退口径同 [callInvite]）。
+     * ⚠ **没有**新增 ip 字段：call_accept 从来不带本机地址，媒体方向靠 probe + learn-by-receiving 定（任务单 2.7）
      */
     fun callAccept(
         vid: Boolean = false, lv: Int = 0, af: Int = 0,
@@ -589,26 +548,10 @@ object Protocol {
         .put("msid", msid)
 
     /**
-     * 振铃期的**逐档媒体协商帧**（任务单 2.5 / 方案 §4.3① 的「交换」那一步）。
-     *
-     * 为什么需要第三条帧：§4.2 只把三元组挂在 [callInvite] / [callAccept] 上，而这两条各有
-     * 一次发言机会（主叫发 invite、被叫发 accept）。§4.3⑤ 要求「本档不通就换下一档、回到 ①」
-     * —— 被叫在第 2/3/4 档**没有任何帧**能把新 bind 出来的本端端口带出去，
-     * 主叫就永远学不到对端的新端口，双向 probe 无法继续。
-     * （2026-10-02 用户点 (a)：允许新增这条 JSON 协商帧；§4.2 标题「不新增往返」读作
-     * **不新增 TCP 往返、不新增二进制子类型**，主 TCP 早已连好，多一条 JSON 帧不算往返。）
-     *
-     * ⚠ 只新增 JSON 的 `type` 值，**没有**新增二进制帧子类型（I8：未知二进制子类型会让
-     *   老端直接抛 IOException 断链）。老端读到未知 JSON type 只打一行「未知帧类型」日志、
-     *   不断链（[Link] 读帧处的 else 分支），所以 I11 的「不得断链」仍然成立。
-     *
-     * @param mport       本端**本档** bind 到的媒体端口；0 = 本端已落带内档（第五档）
-     * @param mudp        本端媒体端口是否 UDP（true = UDP 档，false = 媒体 TCP 档或带内）
-     * @param msid        本端为本次通话生成的随机 token（每端各自生成，2026-10-02 用户点；
-     *                    串话隔离用，**不是安全边界**，S12）
-     * @param tierOrdinal 本端当前档在 [AvTransport.Tier] 序列里的序号。
-     *                    ⚠ 两端序号**不保证相等**（安卓按 §4.1 跳过两个 443 档），
-     *                    所以本字段只用于日志与「对端走到第几档」，连通性判据是 probe 本身
+     * 振铃期的**逐档媒体协商帧**（方案 §4.3① 的「交换」那一步）：callInvite/callAccept 各只有一次发言机会，
+     * 被叫在第 2/3/4 档换 bind 后没有别的帧能把本端新端口带出去，主叫就学不到对端新端口。只新增 JSON 的 `type` 值，**没有**新增二进制帧子类型（I8）。
+     * mport = 本端**本档** bind 到的媒体端口（0 = 已落带内档第五档）；mudp = 本端媒体端口是否 UDP；msid = 本次通话随机 token（串话隔离，**不是安全边界**，S12）。
+     * tierOrdinal = 本端当前档在 [AvTransport.Tier] 序列里的序号；两端序号**不保证相等**（安卓跳过两个 443 档），只进日志，连通性判据是 probe 本身
      */
     fun callMedia(
         mport: Int, mudp: Boolean, msid: String, tierOrdinal: Int
@@ -635,15 +578,9 @@ object Protocol {
 
     /**
      * 写一个视频帧（HEVC / H.264 Annex-B 裸流）。
-     *
-     * 载荷 = [1B 子类型 BIN_VIDEO][4B seq 大端][4B ts 大端(ms)][1B flag][N 字节 AU]
-     * 长度字段 = BIN_FLAG or (1 + 4 + 4 + 1 + N)。
-     *
-     * **一个包 = 恰好一个访问单元（AU）**：接收端不需要扫 `00 00 01` 起始码，
-     * 直接把载荷喂给解码器即可。`ts` 为**发送端通话相对毫秒**（`util/CallClock.elapsedMs()`，
-     * 与同一通话的音频帧同一零点），用于 A/V 时间轴对齐；两端各自零点，不与本端墙钟相减。
-     *
-     * @param flag bit0=KEYFRAME(IDR)、bit1=CONFIG(参数集)，见 VIDEO_FLAG_*
+     * 载荷 = [1B 子类型 BIN_VIDEO][4B seq 大端][4B ts 大端(ms)][1B flag][N 字节 AU]，长度字段 = BIN_FLAG or (1+4+4+1+N)。
+     * **一个包 = 恰好一个访问单元（AU）**：接收端直接把载荷喂给解码器；ts = 发送端通话相对毫秒（与同通话音频帧同一零点, 两端各自零点）。
+     * flag: bit0=KEYFRAME(IDR)、bit1=CONFIG(参数集)，见 VIDEO_FLAG_*
      */
     @Throws(IOException::class)
     fun writeVideo(
@@ -671,12 +608,9 @@ object Protocol {
     }
 
     /**
-     * 编码参数变更通知（发送方 → 接收方）。改分辨率时接收方要重启解码器。
-     *
-     * @param front 本端摄像头是否**前置**（2026-09-19 用户要求）。接收端据此决定
-     *   「对方画面」的默认显示角：对端用前置时默认多转 180°（= 点了两次旋转钮）。
-     *   **兼容性**：`cam` 是 JSON 里的**新增键**，老对端（不带此键）按 `optInt(...,0)`
-     *   拿到后置 → 行为与改造前完全一致，不需要 hello 能力位门控（也没有未知二进制子类型）。
+     * 编码参数变更通知（发送方 → 接收方）；改分辨率时接收方要重启解码器。
+     * front = 本端摄像头是否**前置**：接收端据此决定「对方画面」默认显示角（对端用前置时默认多转 180°）。
+     * 兼容性：`cam` 是 JSON 里的**新增键**，老对端（不带此键）按 optInt(...,0) 拿后置 → 行为与改造前完全一致，不需 hello 能力位门控
      */
     fun videoCfg(
         codec: String, w: Int, h: Int, fps: Int, br: Int, rot: Int, front: Boolean
@@ -690,9 +624,8 @@ object Protocol {
         .put("cam", if (front) 1 else 0)
 
     /**
-     * 接收侧健康反馈（接收方 → 发送方，每 2s 一次），供发送侧升降档判断。
-     * @param drop 丢帧百分比；lat 排队延迟 ms（**真实值**，不再用 -1 当丢帧哨兵）；
-     *             dropping 接收端正处丢帧期（任务单 1.3，与 PC 端同名同义）；kbps 实际接收码率
+     * 接收侧健康反馈（接收方 → 发送方，每 2s 一次），供发送侧升降档判断:
+     * drop 丢帧百分比；lat 排队延迟 ms（**真实值**，不再用 -1 当丢帧哨兵）；dropping 接收端正处丢帧期（与 PC 端同名同义）；kbps 实际接收码率
      */
     fun videoFb(fps: Int, drop: Int, lat: Int, dropping: Boolean, kbps: Int): JSONObject = msg("video_fb")
         .put("fps", fps)
@@ -703,9 +636,7 @@ object Protocol {
 
     /**
      * 请求对端临时停/开视频（如接收端切后台）。
-     *
-     * @param key 请求**立刻一个 IDR**（接收端解码器刚换代，等不起 1s GOP）。
-     *            只在 true 时落键 —— 老对端的帧与改前逐字节一致，新对端缺键按 false（I11）。
+     * key = 请求**立刻一个 IDR**（接收端解码器刚换代，等不起 1s GOP）；只在 true 时落键，老对端缺键按 false（I11）
      */
     fun videoReq(on: Boolean, key: Boolean = false): JSONObject = msg("video_req")
         .put("on", on)
@@ -755,15 +686,8 @@ object Protocol {
     }
 
     /**
-     * 编一份数据报。
-     *
-     * @param type       [DG_TYPE_*]
-     * @param streamSeq  该流的独立序号（0–65535）
-     * @param flags      [DG_FLAG_*] 的按位或；非视频报传 0
-     * @param sliceIdx   视频切片下标；**非视频报必须 0**
-     * @param sliceCount 该帧总切片数；**非视频报必须 1**
-     * @param payload    可为 null（此时 len 必须为 0）；ctrl 报的子类型首字节请走
-     *                   [encodeCtrl]，不要手工塞
+     * 编一份数据报：type=[DG_TYPE_*]，streamSeq=该流独立序号（0–65535），flags=[DG_FLAG_*] 按位或（非视频报传 0）；
+     * sliceIdx/sliceCount=视频切片下标/总切片数（**非视频报必须 0/1**）；payload 可为 null（此时 len 必须 0），ctrl 报子类型首字节走 [encodeCtrl]
      */
     @Throws(IOException::class)
     fun encodeDatagram(
@@ -780,8 +704,7 @@ object Protocol {
             throw IOException("非视频报的分片字段恒 0/1，实际 $sliceIdx/$sliceCount")
         }
         // 视频报自己的形状约束：一帧至少 1 片，下标从 0 起 —— 这是 8B 头**内部**的不变式，
-        // 不是 3.2 的重组策略（那里才管"缺任一片整帧丢"）。放在这里，重组缓冲就永远
-        // 见不到 idx>=count 这种不可能的组合。
+        // 不是 3.2 的重组策略（那里才管"缺任一片整帧丢"）；放这里，重组缓冲就永远见不到 idx>=count
         if (type == DG_TYPE_VIDEO_SLICE &&
             (sliceCount < DG_SLICE_COUNT_NONE || sliceIdx >= sliceCount)
         ) {
@@ -801,11 +724,8 @@ object Protocol {
     }
 
     /**
-     * 编一份 ctrl 数据报：子类型首字节由本方法写入，"整报 ≤64B" 也只在**这一处**守
-     * （ctrl 的五个出口 —— 2.5 的 probe、3.9 的 keyframe_req、3.13 的快照，加 stop_resume /
-     * level_sync —— 全从这里走，所以校验只需要一个地方）。
-     *
-     * @param body 子类型之后的正文，可为 null；probe 的 msid 就放这里
+     * 编一份 ctrl 数据报：子类型首字节由本方法写入，"整报 ≤64B" 也只在这一处守（ctrl 五个出口全从这里走）。
+     * body = 子类型之后的正文，可为 null；probe 的 msid 就放这里
      */
     @Throws(IOException::class)
     fun encodeCtrl(
@@ -869,10 +789,8 @@ object Protocol {
 
     /**
      * 解一份数据报。
-     *
      * 畸形报（长度不足 / 版本不认识 / 类型未知 / 非视频报却带了分片）**一律抛 IOException**：
-     * UDP 收包侧 catch 住直接丢这一份就够，不许吞成"看着像空报"的返回值 ——
-     * 半解的报会被当成合法帧送进重组缓冲，那就是 3.2 的"缺任一片整帧丢"永远不触发。
+     * UDP 收包侧 catch 住直接丢这一份，不许吞成"看着像空报"的返回值（半解的报会被当成合法帧送进重组缓冲, 3.2 的"缺任一片整帧丢"就永远不触发）
      */
     @Throws(IOException::class)
     fun decodeDatagram(buf: ByteArray, off: Int, len: Int): Datagram {
@@ -905,8 +823,8 @@ object Protocol {
     }
 
     /**
-     * 从 ctrl 报的正文（**已去掉子类型首字节**）解出 14B 快照。
-     * 定长是硬要求：长度不等直接抛，不做"截断凑数"（§4.4 写的是**定长** 14B）。
+     * 从 ctrl 报正文（**已去掉子类型首字节**）解出 14B 快照；
+     * 定长是硬要求：长度不等直接抛，不做"截断凑数"
      */
     @Throws(IOException::class)
     fun decodeSnapshotBody(body: ByteArray, off: Int, len: Int): Snapshot {
@@ -982,12 +900,9 @@ object Protocol {
 }
 
 /**
- * 「数据流量确认」的结果（v2.7）。
- *
- * 触发这一套流程的判据是**两端各自的网络环境**，不是对端 IP 的网段：
- *  - 本机在运营商数据网络上 → 本机提醒一次（每次使用都提醒，不记忆）
- *  - 对端在运营商数据网络上 → 由 [Protocol.dataAsk] 让对端自己提醒
- * 任何一侧拒绝，本次操作就中止；文件会在聊天里留一条带红色叹号的可重试消息。
+ * 「数据流量确认」的结果。
+ * 触发判据是**两端各自的网络环境**（不是对端 IP 网段）：本机在数据网络 → 本机提醒一次（每次使用都提醒，不记忆）；
+ * 对端在数据网络 → [Protocol.dataAsk] 让对端自己提醒；任何一侧拒绝，本次操作中止（文件在聊天里留一条带红色叹号的可重试消息）
  */
 enum class DataConsent {
     /** 同意（本机不需要提醒，或本机与对端都同意） */
@@ -1003,7 +918,7 @@ enum class DataConsent {
     NO_SESSION
 }
 
-/** 数据流量确认相关的固定文案（两端与三个场景一一对应，见用户 2026-09-17 定调） */
+/** 数据流量确认相关的固定文案（两端与三个场景一一对应） */
 object DataConsentText {
 
     const val KIND_FILE = "file"
@@ -1024,10 +939,7 @@ object DataConsentText {
         else -> if (name.isEmpty()) "文件" else "文件 $name"
     }
 
-    /**
-     * 发起方看到「对端拒绝用数据流量接收」时的提示文本，斜杠按三个场景分别取值：
-     * 「对方拒绝了使用数据流量接受文件 / 接受语音通话 / 接受视频通话」
-     */
+    /** 发起方看到「对端拒绝用数据流量接收」时的提示文本（斜杠按三个场景分别取值：文件/语音通话/视频通话） */
     fun peerRefusedText(kind: String): String = when (kind) {
         KIND_VOICE -> "对方拒绝了使用数据流量接受语音通话"
         KIND_VIDEO -> "对方拒绝了使用数据流量接受视频通话"

@@ -15,7 +15,7 @@ import javax.swing.Icon;
 import javax.swing.JButton;
 
 /**
- * 通话界面矢量图标（2026-09-16 用户定调：接听/挂断用「电话图标」风格，与 Android 端同构）。
+ * 通话界面矢量图标（接听/挂断用「电话图标」风格，与 Android 端同构）。
  *
  * 全部用 {@link Graphics2D} 手绘（PC 端禁 emoji，YaHei 会渲染成方框；也不引外部图片资源）。
  * 提供两块能力：
@@ -147,7 +147,7 @@ public final class CallIcons {
                 super.paintComponent(g0);
             }
         };
-        // 2026-09-29（「全部统一」配套）：自绘圆底图标按钮保持 FLAT（不套 Modern 灰卡）
+        // 自绘圆底图标按钮保持 FLAT（不套 Modern 灰卡）
         Ui.flat(b);
         b.setContentAreaFilled(false);
         b.setFocusPainted(false);

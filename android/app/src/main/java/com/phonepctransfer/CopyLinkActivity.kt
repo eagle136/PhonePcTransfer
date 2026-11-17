@@ -9,25 +9,7 @@ import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
 
-/**
- * 「复制链接」入口（2026-10-05，用户需求）：**让本应用出现在系统「用浏览器打开」的选择框里**，
- * 选中它 = 把链接复制到剪贴板 → 提示一句 → 立刻关闭（用户看不到任何界面）。
- *
- * 名字来源：选择框里显示的是**这个 Activity 的 `android:label`**（manifest 里写死「复制链接」），
- * 与「浏览器」注册方式一致 —— 只是我们并不渲染网页。
- *
- * 为什么单独一个 Activity、而不是给主界面加 VIEW 过滤器：
- *  - 主界面 [MainActivity] 是 `singleTask` 的聊天窗口，点链接会把**整个聊天界面**带到前台，
- *    与「复制完就关」冲突；
- *  - 这个 Activity 用透明主题（`Theme.PhonePcTransfer.CopyLink`）+ 空布局，`onCreate` 干完活
- *    立即 `finish()`；manifest 里还配了 `taskAffinity=""`（不归入主界面任务，避免把聊天界面
- *    一起顶到前台）、`excludeFromRecents`、`noHistory`。
- *
- * 复制走 [AppCore.copyTextToClipboard]（= 「长按消息 → 复制文本」同一条路径）：写本机剪贴板 +
- * 剪贴板同步开着且电脑已连接时顺手推给电脑 + 提示 + 日志。`AppCore.init` 是幂等的 ——
- * 应用本来就在跑时这里几乎零成本；没在跑则顺带把应用链路叫起来（这是「链接也能同步到电脑」
- * 的代价，用户已确认要这个行为）。
- */
+/** "复制链接"入口：让本应用出现在系统"用浏览器打开"选择框，选中即把链接复制到剪贴板并立刻关闭（透明无界面）；复制走 AppCore 链路，链接也能同步到电脑 */
 class CopyLinkActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -58,10 +40,7 @@ class CopyLinkActivity : Activity() {
         Log.w(TAG, "走 AppCore 复制失败，退化为纯本地复制: ${it.message}")
     }.isSuccess
 
-    /**
-     * 取链接：先 [Intent.getData]（正常的「用浏览器打开」），再退 `EXTRA_TEXT`
-     * （少数应用/自定义弹窗只把它塞在附加文本里，data 为空）。
-     */
+    /** 取链接：先取 Intent.getData，再退 EXTRA_TEXT（少数应用只把链接塞在附加文本里） */
     private fun extractLink(intent: Intent?): String? {
         val d = intent?.dataString
         if (!d.isNullOrBlank()) return d.trim()

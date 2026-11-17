@@ -72,8 +72,7 @@ private fun openStream(ctx: Context, localUri: String): InputStream? = runCatchi
 }.getOrNull()
 
 /**
- * 按上限降采样解码（两遍：先读尺寸算 inSampleSize，再真正解码），避免大图 OOM。
- * @param maxPx 长边最大像素
+ * 按上限降采样解码（两遍：先读尺寸算 inSampleSize，再真正解码），避免大图 OOM。maxPx=长边最大像素。
  */
 private fun decodeDownsampled(ctx: Context, localUri: String, maxPx: Int): ImageBitmap? {
     if (localUri.isEmpty()) return null
@@ -90,16 +89,10 @@ private fun decodeDownsampled(ctx: Context, localUri: String, maxPx: Int): Image
 }
 
 /**
- * 解码（带重试）。
- *
- * **为什么必须重试**（2026-09-19 修「收到图片要切窗口才显示」）：图片消息在 `file_meta`
- * 阶段就写进了 `localUri`，那一刻文件才刚 insert、**内容还是 0 字节**；如果此时就解码，
- * 必然失败。而 `source`（= localUri）在收完之后**不会变**，`LaunchedEffect` 便再也不会
- * 重跑 —— 界面就永远停在「载入中…」，直到 Composable 被销毁重建（这就是「切走再切回
- * 才显示」的由来）。所以这里改为：失败按 0/250/500/1000ms 重试 4 次；
- * 同时 `readyKey` 一旦变化（消息从「接收中」变成「已完成」）立即重新解码。
- *
- * @param readyKey 完成信号（调用方传消息的进度/状态）；变了就重新解码
+ * 解码（带重试）：图片消息在 `file_meta` 阶段就写进了 `localUri`，那一刻文件才刚 insert、内容还是 0 字节，此时解码必然失败；
+ * 而收完之后 `source`（= localUri）不会变，`LaunchedEffect` 便再也不会重跑，界面停在「载入中…」直到 Composable 销毁重建（「切走再切回才显示」问题）。
+ * 故：失败按 0/250/500/1000ms 重试 4 次；同时 `readyKey` 变化（消息从「接收中」变成「已完成」）立即重新解码。
+ * readyKey=完成信号（调用方传消息的进度/状态）；变了就重新解码。
  */
 @Composable
 private fun rememberDecoded(source: String, maxPx: Int, readyKey: Any? = null): ImageBitmap? {
@@ -124,9 +117,8 @@ private fun rememberDecoded(source: String, maxPx: Int, readyKey: Any? = null): 
 }
 
 /**
- * 解析出一份「可加载」的图片来源：
- *  1. 消息自带 `localUri`（本次改造后新收到的图片都有）→ 直接用；
- *  2. 旧历史记录没有 `localUri` → 按文件名去 MediaStore「下载/手机电脑互传」里回查。
+ * 解析出一份「可加载」的图片来源：1. 消息自带 `localUri`（新收到的图片都有）→ 直接用；
+ * 2. 旧历史记录没有 `localUri` → 按文件名去 MediaStore「下载/手机电脑互传」里回查。
  * 都拿不到返回 null（界面上显示占位文案）。
  */
 @Composable
@@ -176,10 +168,8 @@ private fun lookupInMediaStore(ctx: Context, name: String): String? {
 // ==================== 聊天页里的小图 ====================
 
 /**
- * 聊天气泡里的图片缩略图：按原始宽高比缩放、长边不超过 [maxSize]。
- * 不消费任何点击——短按/长按手势统一由外层气泡的 combinedClickable 处理。
- * @param source 已解析好的可加载地址（见 rememberImageSource）
- * @param readyKey 接收完成信号（进度/状态）：变化即重新解码，保证**收完立刻显示**
+ * 聊天气泡里的图片缩略图：按原始宽高比缩放、长边不超过 [maxSize]；不消费任何点击（短按/长按手势统一由外层气泡的 combinedClickable 处理）。
+ * source=已解析好的可加载地址（见 rememberImageSource）；readyKey=接收完成信号（进度/状态）：变化即重新解码，保证收完立刻显示。
  */
 @Composable
 fun ImageThumb(
@@ -196,7 +186,7 @@ fun ImageThumb(
         contentAlignment = Alignment.Center
     ) {
         if (bmp == null) {
-            // 「🖼」→ 矢量 [Glyph.IMAGE]（2026-09-19 去 emoji）；图标与文字同行居中
+            // 「🖼」→ 矢量 [Glyph.IMAGE]（去 emoji）；图标与文字同行居中
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.padding(14.dp)
@@ -230,11 +220,8 @@ fun ImageThumb(
 // ==================== 全屏查看器 ====================
 
 /**
- * 全屏图片查看：
- *  - 打开即「适应屏幕」（完整显示）
- *  - **双击**在「适应屏幕」与「原图 1:1」之间切换（1:1 = 1 图像像素占 1 屏幕像素）
- *  - 单指拖动平移，双指捏合缩放
- *  - 右上角悬浮关闭按钮
+ * 全屏图片查看：打开即「适应屏幕」（完整显示）；双击在「适应屏幕」与「原图 1:1」之间切换（1:1 = 1 图像像素占 1 屏幕像素）；
+ * 单指拖动平移，双指捏合缩放；右上角悬浮关闭按钮。
  */
 @Composable
 fun ImageViewerDialog(localUri: String, onClose: () -> Unit) {
@@ -364,8 +351,7 @@ private fun ImageViewer(localUri: String, onClose: () -> Unit) {
                 .clickable(onClick = onClose)
                 .padding(horizontal = 14.dp, vertical = 8.dp)
         ) {
-            // 「✕」字符 → 矢量 [Glyph.CLOSE]（2026-09-19）。20.sp 的字形换成 18dp 图标：
-            // 叉线的端点更干净（字符 ✕ 在不同字重下粗细差别很大），且不依赖字体覆盖。
+            // 「✕」字符 → 矢量 [Glyph.CLOSE]（18dp 图标）：叉线的端点更干净（字符 ✕ 在不同字重下粗细差别很大），且不依赖字体覆盖。
             GlyphIcon(Glyph.CLOSE, size = 18.dp, color = Color.White)
         }
     }

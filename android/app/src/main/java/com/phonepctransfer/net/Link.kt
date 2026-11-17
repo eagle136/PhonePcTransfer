@@ -37,18 +37,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 
 /**
- * 手机 ↔ 电脑 的 TCP 链路（**多设备独立长连接**）。
- *
- * 设计要点（与 docs/PROTOCOL.md 一致）：
- *  - 两端都监听 28765，也都能主动 connect，覆盖「同一 WiFi」与「手机开热点」两种拓扑
- *    （v2.1 起从 8765 迁移：MIUI 的 scene-daemon 会长期占用 127.0.0.1:8765，通配绑定必冲突）
- *  - **每台对端各一条独立会话**：同时可以和 PC、另一台手机都保持长连接，互不干扰
- *    （一台抖动/断开不影响其他）。协议零改动 —— TCP 连接本身就标识了对端，
- *    所以消息归属 = 读到它的那条会话，帧里不需要「发给谁」字段。
- *  - **只有用户点击设备才（重）连接**：connectTo() 投递一次请求、试一次、失败不重试
- *  - 去重收敛规则：同设备双连接时 preferOutgoing = (myId < peerId)，两端独立算得同一结论
- *  - 15s ping 保活，35s 无收包判定断链；断链后对本端发起成功过的会话自动重连（保持长连接）
- *  - **写失败即判死**：任何一次发送异常都立刻废弃该会话
+ * 手机↔电脑 TCP 链路(多设备独立长连接,与 docs/PROTOCOL.md 一致):两端都监听 28765 且都能主动 connect;
+ * 每台对端一条独立会话互不干扰;点设备才(重)连接、失败不重试;15s ping、35s 无收包判死;写失败即废弃会话
  */
 class Link(internal val ctx: Context, internal val prefs: Prefs) {
 
@@ -56,37 +46,21 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
 
     interface Listener {
         fun onState(state: State, peer: String)
-        /**
-         * 会话集合变化（某台连上 / 断开）。
-         * UI 用它只刷设备列表 —— 聊天区不受影响，别人的连接抖动不会打断当前对话。
-         */
+        /** 会话集合变化(某台连上/断开):UI只刷设备列表,聊天区不受影响 */
         fun onPeersChanged() {}
         /** 新增一条消息（自己发 / 收到对端） */
         fun onMessageAdded(m: MsgItem)
         /** 已有消息的状态或进度变化 */
         fun onMessageUpdated(m: MsgItem)
-        /**
-         * 一条消息被移除（文件被任一方取消）。
-         * 实现方应把该条从界面移除，并从本地历史/待发队列里删掉 —— 取消后两端都不再显示。
-         */
+        /** 一条消息被移除(任一方取消):界面移除+本地历史/待发队列删掉,两端都不再显示 */
         fun onMessageRemoved(mid: String) {}
-        /**
-         * 历史同步（hsync）一批补齐完成：从对端补入了 count 条消息。
-         * 实现方借此按 ts 重排聊天区（补入的旧消息是按到达顺序追加的）。
-         */
+        /** hsync一批补齐完成:补入count条;实现方按ts重排聊天区(补入按到达顺序追加) */
         fun onHsyncApplied(ip: String, count: Int) {}
         /** 需要把文本写入本机剪贴板（来自对端）。剪贴板同步不生成气泡，只写剪贴板。 */
         fun onClipToClipboard(text: String)
-        /**
-         * 旧握手协商遗留：对端对 clip_pull 回「缓冲为空」时触发。纯被动模型下本机
-         * 不再发起拉取，恒不会发生；保留接口仅为兼容，实现方无需处理。
-         */
+        /** 旧握手遗留:对端对clip_pull回"缓冲为空"时触发;纯被动模型下恒不会发生,保留仅为兼容 */
         fun onPeerClipEmpty() {}
-        /**
-         * 这份剪贴板内容本机是否"已经知道"（自己刚推出去过，或刚从对端拉回来过）。
-         * 为 true 时不再重复处理——避免把同一份内容反复写进剪贴板。
-         * 哈希由实现方持久化，跨进程重启依然有效。
-         */
+        /** 这份剪贴板内容本机是否"已经知道";true则不重复处理,哈希由实现方持久化 */
         fun shouldSkipPeerClip(sha1: String): Boolean = false
         fun onLog(s: String)
 
@@ -103,24 +77,11 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         fun onCallEnd(peerIp: String, reason: String) {}
         /** 收到呼出方取消（接听前） */
         fun onCallCancel(peerIp: String) {}
-        /**
-         * 收到一帧对端音频（在读线程回调，实现方应尽快转交播放队列）。
-         *
-         * @param ts 发送端的**通话相对**时间戳（ms，对端起呼=0）；只可与本端视频帧同轴比较，
-         *           不可与本端墙钟比大小（两端各自零点，见 `util/CallClock.kt`）
-         */
+        /** 收到一帧对端音频(读线程回调,尽快转交播放队列);ts是通话相对时间戳,不可与墙钟比 */
         fun onCallAudio(peerIp: String, seq: Int, ts: Long, data: ByteArray, len: Int) {}
 
         // ==================== 视频通话回调 ====================
-        /**
-         * 视频呼叫请求（带视频协商）。默认实现回落到纯语音版 [onCallInvite]，
-         * 这样没升级的实现方不会漏掉来电。
-         *
-         * @param af 对端期望的语音帧长（ms）；0 = 对端是老版本，未声明 → 用 200ms 兼容模式
-         * @param mport 对端媒体端口（任务单 2.4 / 方案 §4.2）；0 = 未声明 → 只能走带内档
-         * @param mudp  对端媒体端口是否 UDP；false = 未声明
-         * @param msid  对端本次通话的随机 token；空 = 未声明
-         */
+        /** 视频呼叫请求(带视频协商):默认回落到纯语音版onCallInvite,不漏来电 */
         fun onCallInviteVideo(
             peerIp: String, name: String, vid: Boolean, lv: Int, af: Int = 0,
             mport: Int = 0, mudp: Boolean = false, msid: String = ""
@@ -134,60 +95,28 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         ) {
             onCallAccept(peerIp)
         }
-        /**
-         * 振铃期的**逐档媒体协商**（任务单 2.5 / 方案 §4.3① 的「交换」）：对端把它当前档的
-         * 本端三元组带过来。默认实现什么都不做（老实现方不会因此漏掉任何通话事件）。
-         *
-         * @param msid 空 = 对端未声明（老端口径）⇒ 本端只能落带内档
-         * @param mport 0 且 msid 非空 = 对端已落带内档（第五档），本端不必再试后面几档
-         * @param mtier 对端当前档序号；⚠ 两端档位序列可能不同（安卓跳过两个 443 档），
-         *              只用于日志，**不是**连通性判据
-         */
+        /** 振铃期逐档媒体协商(§4.3①交换):对端把当前档本端三元组带过来;默认不做事 */
         fun onCallMedia(
             peerIp: String, mport: Int, mudp: Boolean, msid: String, mtier: Int
         ) {}
-        /**
-         * 收到一帧对端视频（**网络读线程**回调，实现方只能入队，禁止在这里初始化解码器 ——
-         * 那会阻塞读线程 → 对端 35s 判死掉线）。
-         *
-         * @param ts 与同通话音频帧同零点的**通话相对**毫秒（发送端侧）
-         */
+        /** 收到一帧对端视频(网络读线程回调):只许入队,禁止初始化解码器(阻塞读线程⇒35s判死) */
         fun onVideoFrame(peerIp: String, seq: Int, ts: Long, flag: Int, data: ByteArray, len: Int) {}
-        /**
-         * 编码参数变更（收到后必要时重建解码器）。
-         *
-         * @param front 对端摄像头是否**前置**（`video_cfg.cam`；老对端不带此键 = 后置）。
-         *   接收端据此决定「对方画面」的默认显示角（前置默认多 180°，见 ChatScreen）。
-         */
+        /** 编码参数变更(必要时重建解码器);front=对端前置镜头,据此定默认显示角 */
         fun onVideoCfg(
             peerIp: String, codec: String, w: Int, h: Int, fps: Int, br: Int, rot: Int,
             front: Boolean
         ) {}
-        /**
-         * 接收侧健康反馈（发送侧用于升降档）。
-         *
-         * @param lat      对端「入队→喂解码器」的排队时延 ms（真实值）
-         * @param dropping 对端此刻是否正处于丢帧期（任务单 1.3，与 PC 端同名同义）
-         */
+        /** 接收侧健康反馈(发送侧升降档用);lat=对端排队时延ms,dropping=对端丢帧期 */
         fun onVideoFb(peerIp: String, fps: Int, drop: Int, lat: Int, dropping: Boolean, kbps: Int) {}
         /** 接收端请求临时停/开视频；[key] = 请求立刻给一个 IDR（对端解码器刚重建，等不起 1s GOP） */
         fun onVideoReq(peerIp: String, on: Boolean, key: Boolean) {}
 
         // ==================== 数据流量确认（v2.7）====================
 
-        /**
-         * 对端请求「用数据流量发文件/语音/视频」。
-         *
-         * 实现方（AppCore）决定：本机不在数据网络 → 直接 [Link.replyDataAsk] 同意（不打扰用户）；
-         * 本机在数据网络 → 弹框问用户，用户点完再应答。
-         * **绝不能在读线程里阻塞等用户**（会把会话读循环卡死）。
-         */
+        /** 对端请求"用数据流量发":AppCore决定弹框或直接同意;绝不在读线程里阻塞等用户 */
         fun onDataAsk(peerIp: String, mid: String, kind: String, name: String, size: Long) {}
 
-        /**
-         * 一条消息在时间线上被移到「最新一条」（当前只有「数据流量拒绝后重试成功」这一条路径：
-         * 用户要求同意后把那条消息挪到最下面）。
-         */
+        /** 一条消息被移到"最新一条"(目前只有"数据流量拒绝后重试成功"这一条路径) */
         fun onMessageMoved(mid: String) {}
     }
 
@@ -196,28 +125,18 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         @Volatile var vid: Boolean = false,
         @Volatile var cam: Boolean = false,
         @Volatile var vcodec: List<String> = emptyList(),
-        /** 对端支持历史同步（hsync，v2.3 起）。老端不带该字段 → false → 不做历史补齐 */
+        /** 对端支持历史同步(hsync,v2.3);老端不带→false→不补齐 */
         @Volatile var hs: Boolean = false,
-        /** 对端支持「消息删除同步」（msg_del，v2.4 起）。老端不带该字段 → false → 删除不跨端 */
+        /** 对端支持消息删除同步(msg_del,v2.4);老端不带→false→删除不跨端 */
         @Volatile var hd: Boolean = false,
-        /**
-         * 对端支持「文件夹完整性校验」（dir_meta.list / dir_end / dir_missing，v2.6 起）。
-         * 老端不带该字段 → false → 不发这些帧、不做清单核对（保持老行为）
-         */
+        /** 对端支持文件夹完整性校验(dir_meta.list/dir_end/dir_missing,v2.6);老端→不做清单核对 */
         @Volatile var dl: Boolean = false,
 
-        /**
-         * 对端支持「数据流量确认」（data_ask / data_ans，v2.7 起）。
-         * 老端不带该字段 → false → 不发确认帧，沿用「对端不在局域网段就提醒本机用户」的老口径。
-         */
+        /** 对端支持数据流量确认(data_ask/data_ans,v2.7);老端→沿用"不在局域网段就提醒"老口径 */
         @Volatile var dm: Boolean = false
     )
 
-    /**
-     * 本端能力（由 AppCore 注入，握手时广播）。
-     *
-     * **必须在 link.start() 之前设置**（AppCore.init 里就设），否则第一轮握手会广播错误能力。
-     */
+    /** 本端能力(由AppCore注入,握手时广播);必须在link.start()之前设置,否则首轮握手广播错误能力 */
     @Volatile
     var localVidCap: Boolean = false
 
@@ -245,12 +164,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
     internal var serverSocket: ServerSocket? = null
     internal val sessions = CopyOnWriteArrayList<Session>()
 
-    /**
-     * 按对端 IP 索引的会话表 —— **多设备并发的核心**。
-     *
-     * 旧模型是一个 `active` 单活跃会话（同时只服务一个对端）；现在每台连上的设备各有一条
-     * 独立长连接：连着的多台同时在 `sessions` 里，互不干扰。
-     */
+    /** 按对端IP索引的会话表(多设备并发的核心);每台连上的设备各一条独立长连接,互不干扰 */
     internal val byPeer = ConcurrentHashMap<String, Session>()
 
     /** 当前对话（也是主动发送的唯一目标）设备 IP；空 = 未选中 */
@@ -263,33 +177,17 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
     var selectedLabel: String = ""
         internal set
 
-    /**
-     * 一次性连接请求**队列**（同一台设备的候选地址，按优先级排好）。
-     * 只在「用户点击设备」/「启动自动连接」时投递（见 connectTo）。
-     *
-     * 连接工人按顺序试：某个地址连上并握手成功 → 清空队列、不再试后面的；
-     * 全部失败 → 清空队列、**不重试**（要重试只能等对端被动连过来，或用户再点一次设备）。
-     */
+    /** 一次性连接请求队列(同设备候选地址按优先级排);只在点击设备/启动自动连接时投递 */
     @Volatile
     internal var pendingConnectIps: MutableList<String>? = null
 
-    /**
-     * 「点的那个地址连不上、同设备的另一个地址连上了」的回调（请求地址 → 实际连上的地址）。
-     *
-     * 上层据此把「当前对话地址」跟到真正连上的那个地址上（顶栏 / 地址菜单回显才不会错）。
-     * ⚠ 由 pp-connect 线程回调：**不得在这里做 UI 操作**，上层自行切线程。
-     */
+    /** "点的那个地址连不上、同设备另一地址连上了"的回调(请求地址→实际连上的地址) */
     @Volatile
     var onGroupFallback: ((requestedIp: String, actualIp: String) -> Unit)? = null
 
-    // ==================== 传输速率（2026-09-22，气泡显示用）====================
+    // ==================== 传输速率（气泡显示用）====================
 
-    /**
-     * 传输速率回调：`(mid, 字节/秒)`，**节流到最快 500ms 一次**（见 [SpeedMeter]）。
-     *
-     * ⚠ 回调在发送线程 / 接收读线程上执行，上层（AppCore）自己切主线程再写界面状态。
-     * 只上报「平滑后的正值」；停止/卡住不上报 —— 界面靠「样本新鲜度」自动隐藏（见 AppCore.speedBpsOf）。
-     */
+    /** 传输速率回调(mid,字节/秒),节流最快500ms一次;回调在发送/读线程,上层自切主线程 */
     @Volatile
     var onSpeed: ((mid: String, bps: Long) -> Unit)? = null
 
@@ -307,15 +205,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         if (mid.isNotEmpty()) speedMeters.remove(mid)
     }
 
-    /**
-     * 生成一台设备的**候选地址顺序**：
-     *  ① 传入的那个地址（用户点的 / 上次选中的）排第一；
-     *  ② 同设备（同组键 = 同一 deviceId）的其它地址，按最近在线时间倒序。
-     *
-     * 为什么要有 ②（2026-09-19）：一台设备可能有多个地址（WiFi / 热点 / 换网段），
-     * 用户点的（或记住的）可能正是它当前不在线的那个 —— 只试一个地址就直接判「连不上」，
-     * 而同设备的另一个地址此刻是通的。试通一个就停，绝不并发、绝不循环重试。
-     */
+    /** 生成一台设备的候选地址顺序:传入地址排第一,同设备其它地址按最近在线时间倒序 */
     internal fun groupCandidates(ip: String, tryGroup: Boolean = true): List<String> {
         val v = ip.trim()
         if (v.isEmpty()) return emptyList()
@@ -349,46 +239,23 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         }
     }
 
-    /**
-     * 出向连接闸门（由 AppCore 注入，返回 true=拒绝）：
-     * 「**后台只允许连已知设备**」的落点（策略在 AppCore，见 `link.outgoingGate = ...`）。
-     */
+    /** 出向连接闸门(AppCore注入,true=拒绝):"后台只允许连已知设备"的落点 */
     @Volatile
     var outgoingGate: ((ip: String) -> Boolean)? = null
 
-    /**
-     * 入向连接闸门（由 AppCore 注入，返回 true=拒绝）：
-     * 「**后台不接受陌生设备主动连入**」（2026-10-01 定稿，与出向闸门配对）。
-     * 命中即在 [adopt] 里直接 close，不发 hello、不进 sessions。
-     */
+    /** 入向连接闸门(AppCore注入,true=拒绝):后台不接受陌生设备主动连入;命中即close不发hello */
     @Volatile
     var incomingGate: ((ip: String) -> Boolean)? = null
 
-    /**
-     * 「本机当前是否走运营商数据网络」（由 AppCore 注入 = `LanGate.onCellular(prefs.forceLanEnabled)`）。
-     * 与对端 IP 的网段无关 —— 只有本机真的在花流量时才需要提醒本机用户。
-     */
+    /** "本机当前是否走运营商数据网络"(AppCore注入);只有本机真在花钱流量时才需提醒 */
     @Volatile
     var localOnCellular: (() -> Boolean)? = null
 
-    /**
-     * 本机「数据流量提醒」确认框（由 AppCore 注入）。
-     *
-     * **会阻塞**直到用户点「同意/取消」（实现内部把弹框投到主线程 + 闩锁等待），
-     * 因此只允许在**专用后台线程**里调用 —— 详见 [ensureDataConsent]。
-     * 返回 true = 同意本次使用数据流量。
-     */
+    /** 本机"数据流量提醒"确认框(AppCore注入);会阻塞到用户点按钮,只许专用后台线程调 */
     @Volatile
     var localDataConsent: ((peerIp: String, label: String) -> Boolean)? = null
 
-    /**
-     * 「已知设备」名单（由 AppCore 注入，同 [store] 的注入方式）。
-     *
-     * 打点时机（**只增不减**，与聊天记录解耦 —— 清空消息不影响判定）：
-     *  - 握手成功 [onHello] → 双方**连接过**
-     *  - 收到 / 发出 文本 [onFrame]/[sendText] → 有**消息**往来
-     *  - 收到 / 发出 文件（含文件夹成员）[onFileFrame]/[sendFile]/[sendFolder] → 有**文件**往来
-     */
+    /** "已知设备"名单(AppCore注入);只增不减,与聊天记录解耦(清空消息不影响判定) */
     @Volatile
     var trusted: com.phonepctransfer.data.TrustedPeers? = null
 
@@ -423,11 +290,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
     internal inner class Session(val socket: Socket, val outgoing: Boolean) {
         val input: InputStream = DataInputStream(BufferedInputStream(socket.getInputStream()))
         val output: OutputStream = BufferedOutputStream(socket.getOutputStream())
-        /**
-         * 写锁：保证帧不交错。用 ReentrantLock 而不是 synchronized ——
-         * 心跳线程需要 tryLock：写锁被文件传输占用时跳过本轮 ping，
-         * 否则一条阻塞的会话会把整个心跳循环（其他所有会话的判死）拖住。
-         */
+        /** 写锁:保证帧不交错;心跳用tryLock,写锁被文件传输占用时跳过本轮ping */
         internal val writeLock = ReentrantLock()
 
         /** 对端 IP，构造时定下（socket 关了也能读，用来做归属与状态判定） */
@@ -447,11 +310,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         @Volatile var pingOutstanding = false
         @Volatile var closed = false
 
-        /**
-         * 收到任何帧（pong / 数据分片 / 音视频帧 / 控制帧）时调用：刷新存活证据并**清掉 ping 未回标志**。
-         * 判死只看收包 —— PC 端 readLoop 一直这么做，Android 端此前漏了 `pingOutstanding = false`
-         * （2026-09-21 补对称：不清的话它一旦置位就永远是 true，判死条件被放宽一拍）。
-         */
+        /** 收到任何帧(pong/数据分片/音视频/控制)时调:刷新存活证据并清 ping 未回标志(判死只看收包) */
         internal fun touchRx() {
             lastRx = System.currentTimeMillis()
             pingOutstanding = false
@@ -462,8 +321,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
             runCatching {
                 socket.sendBufferSize = 1 shl 20
                 socket.receiveBufferSize = 1 shl 20
-                // 诊断（2026-10-30）：读回内核实际值。TCP 窗口缩放在握手时已按当时的缓冲定死，
-                // 这里再设只改缓冲、改不了缩放因子 —— 读回值仅供对照。
+                // 诊断:读回内核实际值;窗口缩放手握时已定死,这里再设只改缓冲,读回值仅供对照
                 log("[sock] $remoteIp snd=${socket.sendBufferSize}" +
                         " rcv=${socket.receiveBufferSize}" + (if (outgoing) " (主动)" else " (被动)"))
             }
@@ -494,11 +352,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
             }
         }
 
-        /**
-         * 语音音频帧：与 JSON 控制帧/文件分片共用写锁，保证帧不交错。
-         *
-         * @return 本次写入耗时（ms）—— 上层（语音码率自适应）据此判断链路是否拥塞。
-         */
+        /** 语音音频帧:与控制帧/文件分片共用写锁;返回写入耗时ms(上层判拥塞) */
         @Throws(Exception::class)
         fun sendAudio(seq: Int, ts: Long, buf: ByteArray, off: Int, len: Int): Long {
             writeLock.lock()
@@ -513,12 +367,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
             }
         }
 
-        /**
-         * 视频帧：与音频/文件分片共用写锁。
-         *
-         * @return 本次写入耗时（ms）—— 上层据此做「100ms 发送截止期」统计（§3.4.3），
-         *         超阈值只记 drop，**不重发**（TCP 已保证可靠有序，重发只会翻倍占用带宽）。
-         */
+        /** 视频帧:与音频/文件分片共用写锁;返回写入耗时ms;超阈值只记drop不重发 */
         @Throws(Exception::class)
         fun sendVideo(seq: Int, ts: Long, flag: Int, buf: ByteArray, off: Int, len: Int): Long {
             writeLock.lock()
@@ -533,11 +382,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
             }
         }
 
-        /**
-         * 心跳专用：**tryLock** 发 ping。返回 false = 写锁被文件传输占用
-         * （本端正在向对端发数据，链路显然活着，本轮跳过）；
-         * 返回 true = ping 已发出（或会话已关/发送异常转判死流程）。
-         */
+        /** 心跳专用tryLock发ping:false=写锁被文件传输占用(链路活着,跳过);发送异常转判死 */
         fun tryPing(): Boolean {
             if (!writeLock.tryLock()) return false
             return try {
@@ -563,14 +408,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         }
     }
 
-    /**
-     * 按 IP 找已握手且活着的会话。
-     *
-     * 同一个 IP 上可能同时挂着**两台**设备的会话（2026-10-05 同 IP 多设备：两台设备各自
-     * 连进来，或者一端连入一端连出）。此时「按 IP 找」天然有歧义 —— 必须优先返回**身份与
-     * 这个 IP 的组键一致**的那条（即 Prefs 认定的活动设备），否则会出现
-     * 「列表显示 A 在线、切过去却是 B 的会话」。
-     */
+    /** 按IP找已握手且活着的会话;同IP多台时优先返回组键一致那条(Prefs认定的活动设备) */
     internal fun sessionOf(ip: String?): Session? {
         if (ip.isNullOrEmpty()) return null
         val want = runCatching { prefs.convKeyOf(ip) }.getOrNull().orEmpty()
@@ -590,10 +428,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         return s.handshaked && !s.closed
     }
 
-    /**
-     * 该地址上正连着的、但**不是** keepDevId 这台设备的对端名（同 IP 多设备冲突判定用）。
-     * 没有冲突（该地址没会话、或仅 keepDevId 自己的会话）返回 null。
-     */
+    /** 该地址上正连着、但不是keepDevId这台设备的对端名(同IP多设备冲突判定用) */
     fun foreignPeerAt(ip: String, keepDevId: String): String? {
         val v = ip.trim()
         if (v.isEmpty()) return null
@@ -605,15 +440,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         return null
     }
 
-    /**
-     * 断开某个地址上的会话（同 IP 多设备冲突时「断开之前的连接」的落点）。
-     *
-     * 只断这个地址上的**旧设备**会话，别的设备（别的 IP）会话一条都不动 ——
-     * 多设备独立长连接的语义不能破。
-     *
-     * @param keepDevId 非空时保留这条设备身份的会话（通常是即将切换过去的那台）
-     * @return 实际断开的会话条数
-     */
+    /** 断开某地址上的会话(同IP多设备冲突时"断开之前的连接");只断旧设备会话,别的不许动 */
     fun disconnectAt(ip: String, keepDevId: String = ""): Int {
         val v = ip.trim()
         if (v.isEmpty()) return 0
@@ -634,18 +461,13 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         return n
     }
 
-    /** 当前会话（主动发送的目标）；未选中或未连接返回 null。
-     *  选中地址没会话时回落到**同设备的另一个地址**（见 [sessionByGroup]）——
-     *  设备分组的语义就是「这几个地址是同一台机器」。 */
+    /** 当前会话(主动发送目标);未选中/未连接返回null;选中地址没会话时回落同设备另一地址 */
     internal fun target(): Session? = sessionByGroup(selectedIp)
 
     /** 指定 IP 的设备当前是否已连接（设备列表打点用，与选中与否无关） */
     fun isConnectedIp(ip: String): Boolean = sessionOf(ip) != null
 
-    /**
-     * 指定**设备**是否可达：组内任意地址有健康会话即算（见 [sessionByGroup]）。
-     * 设备分组后「这台机器在不在线」不该取决于用户当前选了哪个地址。
-     */
+    /** 指定设备是否可达:组内任意地址有健康会话即算(不该取决于选了哪个地址) */
     fun isDeviceConnected(ip: String): Boolean = sessionByGroup(ip) != null
 
     /** 已经连上的设备 IP 集合 */
@@ -663,8 +485,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
     fun start() {
         if (running) return
         running = true
-        // 线程池是一次性的：stop() 会 shutdownNow，重启链路必须重建（否则 execute 抛
-        // RejectedExecutionException —— sendExec 在主线程 io{} 里被调，会直接崩进程）。
+        // 线程池是一次性的:stop()会shutdownNow,重启链路必须重建,否则execute抛RejectedExecutionException
         if (keepAliveExec.isShutdown) keepAliveExec = newKeepAliveExec()
         if (fileSendExec.isShutdown) fileSendExec = newFileSendExec()
         if (sendExec.isShutdown) sendExec = newSendExec()
@@ -694,8 +515,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         for (s in sessions) s.close()
         sessions.clear()
         byPeer.clear()
-        // 停止链路前取消的 mid 不会被发送循环处理到，清掉避免残留到进程结束
-        //（重启后不应再有「幽灵取消」命中新传输）
+        // 停止前取消的mid不会被发送循环处理到,清掉避免残留(重启后不应有"幽灵取消"命中新传输)
         cancelled.clear()
         pendingConnectIps = null
         connectingIp = null
@@ -707,10 +527,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
     /** 当前对话设备是否已连接 */
     fun isConnected(): Boolean = target() != null
 
-    /**
-     * 点选一台设备 → 设为当前对话目标。
-     * 只改目标、不碰别的会话：连着的其他设备**不受任何影响**（多设备互不干扰）。
-     */
+    /** 点选一台设备→设为当前对话目标;只改目标不碰别的会话(多设备互不干扰) */
     fun selectTarget(ip: String, label: String? = null) {
         val v = ip.trim()
         if (v.isEmpty()) return
@@ -719,32 +536,20 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         refreshState()
     }
 
-    /**
-     * 点选设备并按需连接：已连着就只是切过去（不动连接）；没连才发起**一次**连接尝试。
-     * 失败不重试 —— 要重试就再点一次设备（这是「只有点击才触发重连」的落点）。
-     */
+    /** 点选设备并按需连接:已连着只切过去,没连才发起一次尝试;失败不重试(只有点击才触发重连) */
     fun selectAndConnect(ip: String, label: String? = null) {
         selectTarget(ip, label)
         connectTo(ip)
     }
 
-    /**
-     * 发起一次连接尝试（**不重试**）。
-     * 若该设备已有健康会话则什么都不做。
-     * `quiet=true` 时不打「请求连接」类日志（保活重连用，避免阶梯重试刷屏）。
-     *
-     * @param tryGroup true = 该设备有多个地址时**依次**试（见 [groupCandidates]）：
-     *                 点的那个先试，连上并握手成功即停，后面的地址不再试；
-     *                 全试完仍失败 → 队列清空、不再重试，直到对端被动连过来或用户再点一次。
-     */
+    /** 发起一次连接尝试(不重试);已有健康会话则不做事;quiet=true不打"请求连接"日志(保活用) */
     fun connectTo(ip: String, quiet: Boolean = false, tryGroup: Boolean = true) {
         val v = ip.trim()
         if (v.isEmpty()) return
         val ex = sessionOf(v)
         if (ex != null) {
-            // 已有会话 ≠ 健康：TCP 半开（对端进程已死 / 网络切换）时 socket 仍“连着”，
-            // 但再也收不到任何帧 —— 表现为“点了没反应 / 连不上”。超过一轮心跳周期仍无
-            // 任何收包且我们发过 ping 未得 pong，就判失效、废弃旧会话并重连。
+            // 已有会话≠健康:TCP半开时对端进程死了socket仍"连着"但收不到帧;
+            // 超一轮心跳周期无收包且ping未回⇒判失效、废弃旧会话并重连
             val rxIdle = System.currentTimeMillis() - ex.lastRx
             if (!(ex.pingOutstanding && rxIdle > STALE_RX_MS)) {
                 if (!quiet) log("已连接 $v，无需重连")
@@ -763,9 +568,8 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
             refreshState()
             return
         }
-        // 硬规则：**后台只允许连「已知设备」**（连接过 + 有消息/文件往来，名单见 [trusted]）。
-        // 其余对端只能在前台由用户点击建立连接；未知设备一律拒绝。
-        // 入向同规则：后台陌生设备主动连入由 incomingGate 拒接（见 adopt）。
+        // 硬规则:后台只允许连"已知设备"(连接过+有消息/文件往来);其余只许前台点击建连;
+        // 入向同规则:后台陌生设备主动连入由incomingGate拒接(见adopt)
         if (outgoingGate?.invoke(v) == true) {
             stateNote = "后台不允许连接未知设备"
             log("后台建连被拒：$v 不在已知设备名单（需先前台连接并收发过消息/文件）")
@@ -784,16 +588,9 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         wakeUp()
     }
 
-    // ==================== 保活重连（2026-09-16） ====================
+    // ==================== 保活重连 ====================
 
-    /**
-     * 连接成功过就要**保持长连接**（用户定调）：通话 / 视频 / 文件传输结束后会话不能掉。
-     * 只对「本端主动发起成功」的会话自动重连 —— 能连上说明这个方向可达（对端可能
-     * 有防火墙只放行单向来连）；对端发起的入向会话不重试（本方向可能被挡，SYN
-     * 长时间悬挂），由对端的保活负责。
-     * 节奏（2026-10-01 定稿）：断开后 5s/10s/30s 各重试一次，仍不通**转纯被动**；
-     * 本端正在传文件/通话（[keepAliveBusy]）时除外，按 30s 继续重试。
-     */
+    /** 连接成功过就保持长连接;只对本端发起成功过的会话自动重连;断开后5s/10s/30s重试,仍不通转纯被动 */
     @Volatile
     internal var keepAliveExec: java.util.concurrent.ScheduledExecutorService =
         newKeepAliveExec()
@@ -805,25 +602,14 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
     internal val keepAliveJobs =
         java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ScheduledFuture<*>>()
 
-    /**
-     * 「本端正在传文件/通话」判据（由 AppCore 注入，true=正在忙）。
-     * 保活阶梯走完时用它决定：转纯被动，还是不降级继续重试（见 `runKeepAliveResolve`）。
-     */
+    /** "本端正在传文件/通话"判据(AppCore注入);保活阶梯走完时定转纯被动还是继续重试 */
     @Volatile
     var keepAliveBusy: (() -> Boolean)? = null
 
     // ==================== 2.12 / D16：文件发送的排他投票表 ====================
 
-    /**
-     * 文件与目录发送的**排他投票**，裁决 = 三票取最大值（任一为 1 即 1），与 PC 端
-     * `Link.fileGateBlocked()` 同口径。票号见 [VOTE_IN_CALL] / [VOTE_NO_NETWORK] / [VOTE_CONSENT_DENIED]。
-     *
-     * 1 的时候：新条目**不入网**、改走既有待发台账排队（[queuePending]）；
-     * 在传的那一条在下一个分片边界（单文件）或成员边界（文件夹）就地暂停（[pauseInFlight]）。
-     *
-     * ⚠ 与 2.11 的 `AvTransport.aggregationAllowed()` 是**两个不同的判据**（那条读媒体承载，
-     *   本条读通话与发送状态），不许共用读口 —— 用户点的 ② 里"通话中"这一票与五档无关，四档也投 1。
-     */
+    /** 文件/目录发送的排他投票:裁决=三票取最大(任一为1即1);1时新条目不入网改走待发队列,
+     *  在传那条在下一分片/成员边界就地暂停;与AvTransport.aggregationAllowed()是两个判据,不许共用读口 */
     fun fileGateBlocked(): Boolean = voteInCall || voteNoNetwork || voteConsentDenied
 
     @Volatile
@@ -835,16 +621,8 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
     @Volatile
     private var voteConsentDenied = false
 
-    /**
-     * 写一票。只在**裁决真的翻转**（有 1 ⇄ 全 0）时打一行日志（1.6 不周期打印），
-     * 并且在全 0 的那一刻自动触发一次续发（[flushPending]）—— 这就是"结束拦截状态后，
-     * 会自动触发一次续传请求"：`flushPendingNow → resendPendingFile → doSendFile` 顶部的
-     * [negotiateResume] 就是那**一次** `file_query`，对方应答就按回传的偏移续，
-     * 不应答就退回暂停等气泡上的手动「继续」。
-     *
-     * ⚠ [VOTE_NO_NETWORK] 的解除点就是握手完成，而那里**本来就有** `flushPending(ip)`（既有行为）
-     *   ⇒ 这一票解除时不再重复触发，免得同一条目排两次。
-     */
+    /** 写一票:只在校裁翻转(有1⇄全0)时打日志;全0那一刻自动触发一次续发;
+     *  VOTE_NO_NETWORK的解除点=握手完成(那里已有flushPending),不重复触发免得同条排两次 */
     @Synchronized
     fun setFileVote(which: Int, on: Boolean) {
         val before = fileGateBlocked()
@@ -863,18 +641,10 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         if (!after && which != VOTE_NO_NETWORK) flushPending()
     }
 
-    // ==================== 文件发送队列（2026-09-21） ====================
+    // ==================== 文件发送队列 ====================
 
-    /**
-     * 文件 / 文件夹发送队列：**单线程串行** —— 一次只传一个文件，前一个结束立刻上下一个。
-     *
-     * 为什么不共用 `sendExec`（pp-send 单线程）：那条线程要处理消息 / 剪贴板 / ack / 握手补发，
-     * 让一个几百 MB 的文件占住它，聊天消息就会排队卡住。这里独立一条线程，只干文件传输。
-     *
-     * 为什么不影响通话与消息：音频 / 视频帧由采集与编码线程直接调 `sendAudio` / `sendVideo`，
-     * 消息与 ack 走 `sendOrDrop` —— **都不进这条队列**，只按【帧粒度】抢同一个 socket 的写锁。
-     * 所以文件排队再长，也不会让语音 / 视频 / 消息"排在文件后面"。
-     */
+    /** 文件/文件夹发送队列:单线程串行,一次只传一个;不共用sendExec(消息/ack/剪贴板不能排队在文件后),
+     *  音视频/消息按帧粒度抢写锁,不进这条队列 */
     @Volatile
     internal var fileSendExec: java.util.concurrent.ExecutorService =
         newFileSendExec()
@@ -892,13 +662,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
 
     // ==================== 帧处理 ====================
 
-    /**
-     * 这条链路允许同步剪贴板吗 —— 只有局域网链路。
-     *
-     * 判据用 [LanGate.isLanPeerIp]（私网 v4 / 回环 / 169.254 / fe80::/10 / ULA），
-     * 但要先解掉 `::ffff:` 映射：那个 v6 分支不认映射写法，而 adb forward、本机代理
-     * 与部分 v4-over-v6 链路给出的正是 `::ffff:127.0.0.1` 这种形式。
-     */
+    /** 这条链路允许同步剪贴板吗——只有局域网;判据用LanGate.isLanPeerIp,先解掉::ffff:映射 */
     internal fun clipLinkAllowed(ip: String?): Boolean {
         val v = ip?.trim()?.substringBefore('%') ?: return false
         if (v.isEmpty()) return false
@@ -908,8 +672,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
 
     internal fun handleFrame(s: Session, j: JSONObject) {
         val type = j.optString("type")
-        // 剪贴板只走局域网链路：其余链路（公网 v4 / 全球单播 v6）收到就当没收到，
-        // 也不应答 clip_pull、不回 clip_state。文字/文件/通话一律不受影响。
+        // 剪贴板只走局域网链路:其余链路收到就当没收到,不答clip_pull/clip_state;文字/文件/通话不受影响
         if (type.startsWith("clip") && !clipLinkAllowed(s.remoteIp)) return
         when (type) {
             "hello" -> onHello(s, j)
@@ -917,8 +680,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
             "pong" -> Unit
             "text" -> {
                 val mid = j.optString("mid", newMid())
-                // 统一按 mid 查重（2026-09-16）：待发补发/hsync 补齐可能重放同一条，
-                // 历史里已有的 mid 不再生成第二个气泡，但 ack 照回（对端要靠它出队）
+                // 统一按mid查重:待发补发/hsync补齐可能重放同一条;已有mid不再生成第二气泡,ack照回
                 if (store?.hasMid(s.remoteIp, mid) == true) {
                     log("文本 mid=$mid 本机已有（重复投递），跳过")
                 } else {
@@ -935,8 +697,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
                 sendOrDrop(s, Protocol.ack(mid, true), "ack", quiet = true)
             }
             "clip" -> {
-                // 剪贴板同步不是「发消息」：直接写本机剪贴板，不生成气泡、不进聊天记录。
-                // isDuplicateClip 只用于避免重复写入同一份内容（不再是"要不要画气泡"的判断）。
+                // 剪贴板同步不是"发消息":直接写本机剪贴板,不生成气泡不进聊天记录
                 val text = j.optString("text", "")
                 if (text.isNotEmpty() && !isDuplicateClip(text)) {
                     listener?.onClipToClipboard(text)
@@ -950,8 +711,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
                         log("已接收对端剪贴板 ${text.length} 字")
                     }
                 } else {
-                    // 握手协商第二步：对端明说它缓冲为空 → 反过来把本机的推过去。
-                    // 本机也读不到内容时，AppCore 那边会自然什么都不做。
+                    // 对端明说缓冲为空→反过来把本机的推过去;本机也读不到时AppCore什么都不做
                     log("对端剪贴板为空，改为推送本机剪贴板")
                     listener?.onPeerClipEmpty()
                 }
@@ -961,10 +721,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
                 log("电脑剪贴板更新（${j.optInt("len", 0)} 字）")
             }
             "clip_pull" -> {
-                // 对端请求本机剪贴板缓冲内容。手机端原本只做「拉取方」、不应答任何 clip_pull，
-                // 于是手机↔手机互连时两边都收不到应答、日志一直刷「未知帧类型」。
-                // 补上应答：读得到就回正文，读不到（后台无焦点时 Android 10+ 会静默失败）回空，
-                // 由对端提示"缓冲为空"——如实反映，不假装成功。
+                // 对端请求本机剪贴板缓冲:读得到回正文,读不到(后台无焦点静默失败)回空,如实反映
                 val text = Clip(ctx).read() ?: ""
                 sendOrDrop(
                     s,
@@ -990,14 +747,11 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
                 val ackMid = j.optString("mid", "")
                 // 我方正在等这条文件的落盘回报 → 送达成立与否**由它决定**（出待发队列 + 记台账）
                 if (onSendAck(ackMid, j.optBoolean("ok", true))) return
-                // 其余 ack（文本 / 剪贴板 / 文件夹）：消息在本地成功路径（text 写出）已置 OK，
-                // 这里再走 markStatus 只会发一个 kind 默认 TEXT、fileSize=0 的裸帧 ——
-                // 把文件气泡污染成空白文本、还把 0B 写进历史（2026-09-13 实测）。故只记日志，不 emit。
+                // 其余ack(文本/剪贴板/文件夹):本地成功路径已置OK,再markStatus会发裸帧污染文件气泡,故只记日志
                 log("对端已确认收到 mid=$ackMid")
             }
             "call_invite" -> {
-                // 带视频协商（vid/lv）、语音帧长（af）与媒体通道三元组（mport/mudp/msid，任务单 2.4）。
-                // 三项**缺省即回退**：老端不带 ⇒ 0 / false / 空 ⇒ 本端只能落带内档（§4.2 / I11）。
+                // 带视频协商(vid/lv)、语音帧长(af)与媒体三元组(mport/mudp/msid);缺省即回退⇒只落带内档
                 listener?.onCallInviteVideo(
                     s.remoteIp, j.optString("name", ""),
                     j.optBoolean("vid", false), j.optInt("lv", 1), j.optInt("af", 0),
@@ -1009,7 +763,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
                 j.optInt("mport", 0), j.optBoolean("mudp", false), j.optString("msid", "")
             )
             "call_media" ->
-                // 振铃期逐档协商（任务单 2.5）。老对端不会发这条；本端读到缺省 = -1「未声明」。
+                // 振铃期逐档协商(任务单2.5);老对端不发;读到缺省=-1"未声明"
                 listener?.onCallMedia(
                     s.remoteIp, j.optInt("mport", 0), j.optBoolean("mudp", false),
                     j.optString("msid", ""), j.optInt("mtier", -1)
@@ -1036,8 +790,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
                 s.remoteIp, j.optBoolean("on", true), j.optBoolean("key", false)
             )
             // ==================== 数据流量确认（v2.7）====================
-            // data_ask 交上层（可能要弹框问本机用户）；data_ans 直接投进等待信箱 ——
-            // 它是「发起方阻塞等结果」的唤醒信号，绝不能过 ui{} 或任何可能被拖延的队列。
+            // data_ask交上层(可能弹框问本机用户);data_ans直接投进等待信箱(阻塞等结果的唤醒信号,不许过可能被拖延的队列)
             "data_ask" -> listener?.onDataAsk(
                 s.remoteIp, j.optString("mid", ""), j.optString("kind", DataConsentText.KIND_FILE),
                 j.optString("name", ""), j.optLong("size", 0L)
@@ -1047,8 +800,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
                 dataAnsBoxes[mid]?.offer(j.optBoolean("ok", false))
             }
             "busy" -> {
-                // 只可能来自**旧版本**对端：它还是"同一时刻只服务一个对端"。
-                // 新版本不再发这个帧，也不再做退避轮询 —— 本端本来就不自动重试。
+                // 只可能来自旧版本对端(同一时刻只服务一个对端);新版不发,本端也不自动重试
                 val holder = j.optString("holder", "")
                 log(
                     "对端（旧版本）返回忙" + (if (holder.isEmpty()) "" else "：正与 $holder 会话") +
@@ -1065,13 +817,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         }
     }
 
-    /**
-     * 握手完成：把这条会话并入会话集合。
-     *
-     * **不同设备一律照收**（多设备独立长连接）—— 不再回 busy 顶掉别人。
-     * 只对「同一台设备的双连接」去重：两端同时启动会各连一次，两端各自独立算出
-     * `preferOutgoing = (myId < peerId)` 得到同一结论，不会各留一条。
-     */
+    /** 握手完成:把会话并入集合;不同设备一律照收,只对同设备双连接去重(preferOutgoing=myId<peerId) */
     internal fun onHello(s: Session, j: JSONObject) {
         val pid = j.optString("id", "")
         if (pid.isEmpty()) {
@@ -1083,9 +829,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         s.peerName = j.optString("name", pid)
         s.handshaked = true
 
-        // ===== 能力协商（§4.3 兼容性闸门）=====
-        // 老版本对端不带这几个字段 → vid=false → 本端**永不**发视频帧
-        // （老端 readFrame 遇到未知二进制子类型 0x03 会 IOException 直接断链）
+        // ===== 能力协商(§4.3兼容性闸门):老端不带字段→vid=false→永不发视频帧(老端遇0x03会断链) =====
         s.caps.vid = j.optBoolean("vid", false)
         s.caps.cam = j.optBoolean("cam", false)
         val vc = mutableListOf<String>()
@@ -1107,27 +851,18 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
             "握手成功 ← ${s.peerName}($pid) ${s.remoteIp} ${if (s.outgoing) "出向" else "入向"}" +
                 " caps[vid=${s.caps.vid}, cam=${s.caps.cam}, vcodec=$vc, hs=${s.caps.hs}, hd=${s.caps.hd}, dl=${s.caps.dl}]"
         )
-        // 「双方连接过」到这里才成立 → 记进已知设备名单（消息/文件往来的那半边上限另计）。
-        // 放在去重逻辑之前：同设备双连接被丢弃的那条也是一次真实的连接。
+        // "双方连接过"在这里才成立→记进已知设备名单;放在去重之前(被丢弃那条也算真实连接)
         runCatching { trusted?.markConnected(s.remoteIp, s.peerName, pid) }
 
-        // ===== 设备身份绑定（2026-09-16）=====
-        // 对方每次握手都会带一次自己的 id → 本机把它绑到**当前这个 IP** 上。
-        // 同一 id 绑了多个 IP = 同一台设备有多个地址 → Prefs 那边自动成组
-        //（备注、聊天记录、旋转记忆都按设备共用一份）。
-        // 必须早于 hsync / flushPending：那两步都按「设备组键」读写历史与待发。
+        // ===== 设备身份绑定:对端id绑到当前IP;同id多IP=同一设备多地址⇒Prefs自动成组;
+        //  必须早于hsync/flushPending(那两步按设备组键读写) =====
         val bound = runCatching { prefs.bindDeviceIfFree(s.remoteIp, pid) }.getOrDefault(false)
         if (bound) {
             log("设备身份绑定：${prefs.describeDevice(s.remoteIp)}")
-            // 绑定变了 = 这台设备的组键可能从「IP」变成「deviceId」（新地址并进已有设备）：
-            // 通知界面重建设备列表，并由 AppCore 在组键真的变化时**重新打开该设备的聊天界面**
-            //（否则会停在旧组键读出来的空列表上，看着像记录丢了；2026-09-16 用户反馈的 bug）。
+            // 绑定变了=组键可能从"IP"变"deviceId":通知重建设备列表,组键真变时AppCore重开该设备聊天界面
             notifyPeers()
         }
-        // 入向连接且本机列表里还没有这个地址 → 登记一条（不覆盖用户备注）。
-        // 与 PC 端对称（PC 在 onHello 里 upsertPeer）：对端若能单向上连过来、
-        // 而广播收不到（防火墙/网段），握手就是本机拿到它身份的唯一来源，
-        // 不登记的话这台设备在抽屉里根本不出现。
+        // 入向且本机列表没有该地址→登记一条(不覆盖备注);握手是拿到其身份的唯一来源,不登记抽屉里不出现
         runCatching {
             if (prefs.peers.none { it.ip == s.remoteIp }) {
                 prefs.upsertPeer(
@@ -1164,20 +899,15 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         // 这台设备已可达 → 撤掉还没轮到的候选地址（可能是被动连上，也可能是对端抢先拨通）
         clearPendingFor(s.remoteIp)
 
-        // 第一台连上的设备默认成为当前对话目标；**当前选中目标没有健康会话时也跟过去**——
-        // 否则 selectedIp 停在旧 IP/旧设备上：状态恒显「未连接」、发消息进待发队列收不到
-        //（2026-09-16 修复：通话/传文件按会话工作、顶栏却显示未连接的根源）。
-        // 判据必须**按设备**（组内任意地址有健康会话），不能用精确 IP：同一台设备常有两个地址
-        //（换热点/多网卡，界面选 .13、会话建在 .210），sessionOf(.13)==null 会让**另一台**设备
-        // 的握手把当前对话抢走（与 PC 端 FileDrop「绿点亮着却说未连接」同一类 bug，2026-09-30）
+        // 第一台连上的设备默认成为当前对话目标;选中目标无健康会话时也跟过去;
+        // 判据按设备(组内任一地址健康)不能用精确IP,否则另一台设备的握手会抢走当前对话
         if (selectedIp.isEmpty() || sessionByGroup(selectedIp) == null) {
             selectedIp = s.remoteIp
             selectedLabel = s.peerName
         }
         notifyPeers()
         refreshState()
-        // 这台设备可达 → 撤掉"没网络"那一票；紧跟着下面那句既有的 flushPending 负责续发
-        //（setFileVote 对这一票**不**再自动 flush，避免同一条目排两次）
+        // 这台设备可达→撤掉"没网络"那一票;下面既有flushPending负责续发(这一票不再自动flush,免排两次)
         setFileVote(VOTE_NO_NETWORK, false)
         // 只补发**发给这台设备**的待发内容；剪贴板不做任何握手协商（读取只由焦点切换触发）
         flushPending(s.remoteIp)
@@ -1197,12 +927,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         listener?.onState(st, peer)
     }
 
-    /**
-     * 依据「会话集合 + 当前选中目标」重新算一次对外状态。
-     *
-     * 状态一律**推导**而不是命令式赋值：去重会主动关掉多余的那条连接，
-     * 若靠"关连接时顺手置位"，两条同 IP 的会话会互相踩。推导天然不受顺序影响。
-     */
+    /** 依据"会话集合+当前选中目标"推导对外状态;推导不命令式赋值,不受去重关连接顺序影响 */
     internal fun refreshState() {
         val st: State
         val label: String
@@ -1229,21 +954,12 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
 
     // ==================== 文件：接收（双 4MB 缓冲 + 断点续传） ====================
 
-    /**
-     * 一个正在接收的文件。
-     *
-     * 双缓冲：数据先进 [bufA]/[bufB]（各 4MB），一块填满就交给落盘线程、自己切到另一块继续填；
-     * 两块都未落完时才阻塞（天然背压）。[digest] 覆盖整个文件（含续传前缀），
-     * file_done 时与发送端整文件 sha256 比对。
-     */
+    /** 一个正在接收的文件:双缓冲(各4MB),一块填满交落盘线程自己切另一块;都未落完才阻塞(背压);
+     *  digest覆盖整个文件(含续传前缀),file_done时与整文件sha256比对 */
     internal val rxMap = HashMap<String, Rx>()
     internal val dirMap = HashMap<String, DirRx>()
 
-    /**
-     * 被停滞暂停的单文件 mid（v2.8）：下一个进度帧（file_meta 重到 / 续传首个 chunk）
-     * 到达时气泡回「发送中」并清掉标记。目录成员不用标记 —— 其首个续传 chunk 本来
-     * 就把目录气泡发成 SENDING。
-     */
+    /** 被停滞暂停的单文件mid(v2.8):下一个进度帧到达时气泡回"发送中"并清标记;目录成员不用标记 */
     internal val pausedMids = ConcurrentHashMap.newKeySet<String>()
 
     /** 保留多少条「已收尾」的目录记录（供同一 mid 重发时复用目录名，见 pruneDirs） */
@@ -1253,10 +969,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
     internal val resumeWaiters =
         ConcurrentHashMap<String, java.util.concurrent.ArrayBlockingQueue<Long>>()
 
-    /**
-     * 发起端等 `data_ans`（数据流量确认）应答用：mid → 容量为 1 的信箱。
-     * 与 [resumeWaiters] 同一套路：读完即从表里摘掉，不会随传输次数增长。
-     */
+    /** 发起端等data_ans应答用:mid→容量1的信箱;读完即摘,不随传输次数增长 */
     internal val dataAnsBoxes =
         ConcurrentHashMap<String, java.util.concurrent.ArrayBlockingQueue<Boolean>>()
 
@@ -1264,13 +977,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
 
     // ==================== 发送 ====================
 
-    /**
-     * 发送线程池（单线程，保序）。
-     *
-     * 关键：剪贴板推送的触发点是 onWindowFocusChanged / onPause / 前台 1s 轮询 / UI 按钮，
-     * 这些都在主线程上。socket 写必须离开主线程，否则抛 NetworkOnMainThreadException
-     * （Android 12 实测踩过）。所有对外发送入口统一经过这里。
-     */
+    /** 发送线程池(单线程保序);socket写必须离开主线程(否则NetworkOnMainThreadException),所有发送入口经过这里 */
     @Volatile
     internal var sendExec: java.util.concurrent.ExecutorService =
         newSendExec()
@@ -1288,10 +995,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         }
     }
 
-    /**
-     * 主动发文本。目标是**当前对话设备**；未连接或发送失败则入待发队列（队列里带着 peer，
-     * 只会补发回这台设备）。
-     */
+    /** 主动发文本:目标是当前对话设备;未连接/失败入待发队列(带peer,只补发回这台) */
     fun sendText(text: String) {
         io {
             val s = target()
@@ -1313,12 +1017,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         }
     }
 
-    /**
-     * 主动推送本机剪贴板内容。
-     *
-     * 剪贴板同步**不是「发消息」**：这里不发气泡、不进聊天记录，
-     * 对端收到后只是直接写进它自己的剪贴板（冲突时后写覆盖先写）。
-     */
+    /** 主动推送本机剪贴板:不发气泡不进聊天记录,对端直接写进自己剪贴板(冲突时后写覆盖) */
     fun sendClip(text: String, sha1: String) {
         io {
             // 记下这份内容：之后从对端回读到的同一份不必再处理（避免重复写剪贴板）
@@ -1362,22 +1061,15 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
     /** 供上层为一次确认生成 mid（确认帧与真正的传输共用同一个号，便于对账） */
     fun newConsentMid(): String = newMid()
 
-    /**
-     * 发起文件/语音/视频前统一过这道闸门。**会阻塞**：
-     *  - 本机在数据网络 → 弹框等本机用户点（每次使用都提醒，不记忆已同意的对端）
-     *  - 对端支持 `dm` → 发 `data_ask` 等对端回 `data_ans`（对端不在数据网络时立即自动同意）
-     *
-     * ⚠ **绝不能在主线程 / 网络读线程 / `io{}`（pp-send 单线程）里调用** ——
-     * 前者会 ANR，后两者会把整个发送队列或会话读循环卡住。调用点一律用专用线程。
-     */
+    /** 发文件/语音/视频前统一过这道闸门,会阻塞(本机数据网→弹框;对端dm→data_ask等data_ans);
+     *  绝不在主线程/读线程/io{}里调(ANR或卡死队列),调用点用专用线程 */
     fun ensureDataConsent(
         peerIp: String, mid: String, kind: String, label: String,
         name: String = "", size: Long = 0L
     ): DataConsent {
         val s = sessionByGroup(peerIp) ?: return DataConsent.NO_SESSION
         val peerDm = s.caps.dm
-        // ① 本机提醒：本机在运营商数据网络上；对端是老版本时退回改造前口径
-        //    （对端 IP 不在局域网段 = 这条链路没走局域网 → 老版本下仍提醒本机用户）
+        // ① 本机提醒:本机在数据网;对端老版本时退回改造前口径(对端IP不在局域网段⇒仍提醒)
         val onCellular = runCatching { localOnCellular?.invoke() == true }.getOrDefault(false)
         if (onCellular || (!peerDm && !LanGate.isLanPeerIp(s.remoteIp))) {
             val ok = runCatching { localDataConsent?.invoke(s.remoteIp, label) == true }
@@ -1387,7 +1079,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
                 return DataConsent.LOCAL_REFUSED
             }
         }
-        // ② 对端确认：对端在它自己的数据网络下会提醒它自己的用户；不在数据网络则立即回同意
+        // ② 对端确认:对端在自己数据网下会提醒其用户;不在数据网则立即回同意
         if (peerDm && !askPeerDataConsent(s, mid, kind, name, size)) {
             return DataConsent.REMOTE_REFUSED
         }
@@ -1418,10 +1110,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         }
     }
 
-    /**
-     * 应答对端的数据流量确认请求（AppCore 在用户点完按钮 / 判定本机非数据网络后调用）。
-     * 内部走 `io{}`，可从读线程与主线程安全调用。
-     */
+    /** 应答对端的数据流量确认(AppCore在用户点完/判定非数据网后调);内部走io{},读/主线程可调 */
     fun replyDataAsk(peerIp: String, mid: String, ok: Boolean) {
         if (mid.isEmpty()) return
         io {
@@ -1436,14 +1125,8 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
 
     // ==================== 主动发送 ====================
 
-    /**
-     * 主动发文件（发给当前对话设备）。
-     *
-     * v2.7 起把「数据流量确认」插在出气泡与真正开传之间：
-     *   出气泡(PENDING) → 本机提醒/对端确认 → 同意才 SENDING 开传；
-     *   任一侧拒绝 → 气泡留在聊天里置 [Status.DENIED]（红色叹号可点重试）。
-     * 确认框要等用户点按钮、还要等对端回帧，所以整段必须跑在**专用线程**上。
-     */
+    /** 主动发文件(发给当前对话设备);v2.7起"数据流量确认"插在出气泡与开传之间,
+     *  任一侧拒绝⇒气泡留在聊天里置DENIED(红色叹号可重试);整段跑在专用线程 */
     fun sendFile(uri: Uri, preGranted: Boolean = false) {
         val ip = selectedIp
         Thread({
@@ -1457,9 +1140,8 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
             )
             // 主动发文件 → 该设备有过文件往来（已知设备判定的一半）
             trustContent(item.peerIp, isFile = true)
-            // 2.12 / D16：投票为 1（通话中 / 没网络 / 被拒）⇒ 一律**不入网**，改走既有的待发台账排队，
-            //   拦截解除（全 0）那一刻由 setFileVote 自动触发一次续发。拦在**入口**而不是写者里
-            //   （写者里拦 = 字节已入队，等于没拦）。
+            // 2.12/D16:投票为1(通话中/没网络/被拒)⇒一律不入网,改走待发台账排队;
+            //   拦截解除(全0)那一刻setFileVote自动触发一次续发;拦在入口而不是写者里
             if (s == null || fileGateBlocked()) {
                 emit(item.copy(status = Status.PENDING))
                 queuePending(item)
@@ -1473,8 +1155,8 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
                 return@Thread
             }
             emit(item.copy(status = Status.PENDING))
-            // ⚠ 确认 + 传输整段进【串行队列】（2026-09-21 排队发送）：一次只传一个文件，
-            //   前一个完成立刻上下一个。排队期间气泡是 PENDING（等待中），真正开传才刷 SENDING。
+            // 确认+传输整段进【串行队列】:一次只传一个,前一个完成立刻上下一个;
+            //   排队期间气泡PENDING,真正开传才刷SENDING
             enqueueFileSend("发送文件 $name") {
                 val cs = sessionByGroup(item.peerIp)
                 if (cs == null) {
@@ -1508,12 +1190,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         }, "pp-send-file").apply { isDaemon = true }.start()
     }
 
-    /**
-     * 主动发文件夹（发给当前对话设备），空文件夹也照发（fileCount=0）。
-     *
-     * @param treeUri 两种来源都支持（见 [FileIO.scanTree]）：系统 SAF 选的目录树，
-     *   或**内置文件浏览器**长按选中的本机文件夹（`file://`，root 模式下为 /data/media/0 路径）。
-     */
+    /** 主动发文件夹(发给当前对话设备),空文件夹也照发;treeUri支持SAF目录树或本机file://路径 */
     fun sendFolder(treeUri: Uri, preGranted: Boolean = false) {
         val ip = selectedIp
         Thread({
@@ -1522,8 +1199,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
             if (scan.skipped > 0) {
                 log("注意：目录过深/过大或部分子树读取失败，${scan.skipped} 个分支未包含在传输中")
             }
-            // 一个文件都没读到、却又有整块读失败：这是「读不到」而不是「空的」。
-            // 老逻辑会照发一个 count=0 的文件夹，用户以为传成功了，实际什么都没传。
+            // 一个文件都没读到、却又有整块读失败:是"读不到"不是"空的",不照发count=0的假成功
             if (files.isEmpty() && scan.skipped > 0) {
                 log("文件夹内容读取失败（${scan.skipped} 个分支未读到），已中止发送 —— 请确认该文件夹仍可访问")
                 return@Thread
@@ -1589,39 +1265,26 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
     /** 本机拒绝用数据流量时的备注（气泡上那一行，只在 [Status.DENIED] 时显示） */
     internal val LOCAL_DENY_TEXT get() = "未同意使用数据流量"
 
-    /**
-     * 把一条文件消息置为「数据流量未同意」：气泡**留在聊天里**，末尾显示红色叹号（可点重试）。
-     * 备注写进 `text` —— 文件消息的 text 从不参与协议与 hsync（只有 TEXT/图片会同步），
-     * 界面也只在 DENIED 状态下才渲染它，因此不会污染其它场景。
-     *
-     * @param voteDenied 2.12 / D16：**只有真的"被拒"才投第三票**（全局闸门）。
-     *   本方法同时是所有失败出口的共用出口（"设备未连接"、"文件夹已不可读"、
-     *   "重试要重新选目录"都从这儿走），那些**不是**用户拒绝，绝不能投 1 ——
-     *   否则一次偶发的会话断开就会把整条文件管线锁到用户下一次手动重试。
-     *   这类出口请显式传 false，并把原因归到 [VOTE_NO_NETWORK]（握手完成自动清）。
-     */
+    /** 把文件消息置为"数据流量未同意":气泡留在聊天里,红色叹号可重试;备注写进text(只DENIED时渲染);
+     *  只有真的"被拒"才投第三票,偶发失败出口(未连接/不可读)显式传false归到VOTE_NO_NETWORK */
     internal fun denyFileByData(item: MsgItem, note: String, voteDenied: Boolean = true) {
         store?.removePending(item.mid)
         okUpdate(item.copy(status = Status.DENIED, progress = -1, text = note))
         log("文件「${item.fileName}」未发送：$note")
         if (voteDenied) {
-            // 2.12 / D16：被拒 = 全局票，清零点只有一个 = 用户在气泡上手动重试（retryFileSend 入口）
+            // 2.12/D16:被拒=全局票,清零点只有一个=用户在气泡上手动重试(retryFileSend入口)
             setFileVote(VOTE_CONSENT_DENIED, true)
         }
     }
 
-    /**
-     * 重试一条「数据流量未同意」的文件（气泡末尾的红色叹号触发）。
-     * 重新完整走一遍提醒流程；同意 → 由 [Listener.onMessageMoved] 通知界面把这条挪到最新位置，
-     * 然后开始发送；再次拒绝 → 保持 DENIED（与第一次拒绝后的表现完全一致）。
-     */
+    /** 重试一条"数据流量未同意"的文件(红色叹号触发):重新完整走提醒流程;
+     *  同意→onMessageMoved挪到最新再发送;再拒→保持DENIED */
     fun retryFileSend(
         mid: String, uri: Uri, name: String, size: Long, isDir: Boolean, peerIp: String
     ) {
         enqueueFileSend("重试发送 $name") {
-            // 2.12 / D16（用户点的 ⑬-2）：手动重试就是"被拒"这一票的清零点。
-            // 放在入口而不是成功后 ⇒ 重试若再次被拒，denyFileByData 会重新投 1
-            //（与今天"每次拒绝都回 DENIED"一致）。
+            // 2.12/D16:手动重试就是"被拒"这一票的清零点;放入口而不是成功后,
+            // 再被拒时denyFileByData会重新投1
             setFileVote(VOTE_CONSENT_DENIED, false)
             val s = sessionByGroup(peerIp)
             if (s == null) {
@@ -1679,30 +1342,16 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         }
     }
 
-    /**
-     * 待发队列的自动补发（重连后 [flushPendingNow] 甩到这条专用线程跑）。
-     * 与手动重试（[retryFileSend]）走**同一道数据流量闸门** —— 对端在线且在数据网络时同样会
-     * 收到 data_ask 弹窗，本机在数据网络同样会弹本机确认；「每次使用都提醒一次」对补发同样成立。
-     * 拒绝 → 条目移出待发队列、气泡置 DENIED（红色叹号可再手动重试），不会反复骚扰。
-     */
+    /** 待发队列自动补发(重连后flushPendingNow甩到专用线程):与手动重试同一道数据流量闸门;
+     *  拒绝→移出待发队列、气泡置DENIED,不反复骚扰 */
 
-    /**
-     * 待发条目的目的会话：优先按条目自带的 [MsgItem.peerIp]（断线前记下的目标设备），
-     * 为空时（旧版本写下的条目没有 peer 字段）才回落到当前对话设备。
-     * 绝不"随便找一台连着就发" —— 那正是内容串台。
-     */
+    /** 待发条目的目的会话:优先条目自带的peerIp(断线前记下的目标),为空才回落当前对话设备;
+     *  绝不"随便找一台连着就发"(那正是内容串台) */
     internal fun sessionForPending(peerIp: String): Session? =
         sessionByGroup(peerIp) ?: if (peerIp.isEmpty()) target() else null
 
-    /**
-     * 取「某台设备」的会话：先按 IP 精确匹配，找不到时回落到**同设备（同组键）**的
-     * 任意健康会话。
-     *
-     * 为什么需要回落（2026-09-16 设备分组）：一台设备可能有多个地址，用户在顶栏
-     * 切到其中一个（比如切到热点地址）而会话实际建在另一个地址（WiFi）上时，
-     * 按 IP 精确找会「找不到会话」→ 消息进待发、通话发不出去，
-     * 明明同一台设备就在线。组键相等即视为同一台设备。
-     */
+    /** 取"某台设备"的会话:先按IP精确匹配,找不到回落同设备(同组键)任意健康会话;
+     *  一台设备可能有多个地址,选中的和会话建在的不同时按组键相等视为同一台 */
     internal fun sessionByGroup(ip: String): Session? {
         sessionOf(ip)?.let { return it }
         val v = ip.trim()
@@ -1740,13 +1389,8 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
     internal val verifyTimeoutMs = 120_000L
 
 
-    /**
-     * 取消一个正在发送 / 待发送的文件或文件夹。两端同步：
-     * ① 本端把该条从界面移除，并从待发队列与历史里删掉；
-     * ② 发一帧 `file_cancel`，对端收到后中止接收、删除半成品、同样移除展示。
-     *
-     * 发送循环会在下一轮读到 `cancelled` 并自行中断（不再发 `file_done`）。
-     */
+    /** 取消正在发送/待发送的文件或文件夹(两端同步):本端移除并删待发/历史,发file_cancel让对端中止;
+     *  发送循环下轮读到cancelled自行中断(不再发file_done) */
     fun cancelFile(mid: String) {
         if (mid.isEmpty()) return
         io {
@@ -1766,11 +1410,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
 
     // ==================== 语音通话发送 ====================
 
-    /**
-     * 向指定 IP 的设备发一帧音频。会话不存在/发送失败只记日志（通话层自行兜底静音跳过）。
-     *
-     * @return 写入耗时 ms；-1 = 未发送（无会话 / 异常）—— 语音码率自适应用
-     */
+    /** 向指定IP发一帧音频;会话不存在/失败只记日志(通话层兜底静音);返回写入耗时ms,-1=未发送 */
     fun sendAudioTo(ip: String, seq: Int, ts: Long, data: ByteArray, len: Int): Long {
         val s = sessionOf(ip) ?: return -1L
         return try {
@@ -1781,17 +1421,8 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         }
     }
 
-    /**
-     * 语音通话控制帧（invite / accept / reject / busy / end / cancel）。
-     *
-     * ⚠ 这六个入口**全部由 UI 回调（主线程）调用**，必须走 io{}：
-     * 直接在主线程写 socket 会抛 NetworkOnMainThreadException，而 sendOrDrop 的语义是
-     * 「任何异常都判该会话失效」→ 点一下通话按钮就把连接关掉，用户感知就是
-     * **「点击立即断线 / 设备未连接」**（2026-09-15 a16 logcat 实测定位：
-     * `call_invite 发送失败(NetworkOnMainThreadException) → 会话结束 → 无法发起通话`）。
-     *
-     * 返回「有没有可用会话」而不是「是否已写出」：写操作已投递到 pp-send 线程，尽力而为。
-     */
+    /** 通话控制帧:六个入口全部由UI回调(主线程)调,必须走io{}(主线程写socket抛NetworkOnMainThreadException,
+     *  sendOrDrop会把该会话判失效⇒"点击立即断线");返回"有没有可用会话",写出尽力而为 */
     fun sendCallInvite(
         name: String, ip: String, vid: Boolean = false, lv: Int = 1, af: Int = 0,
         mport: Int = 0, mudp: Boolean = false, msid: String = ""
@@ -1805,7 +1436,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         return true
     }
 
-    /** 同意接听（发给指定 IP 的设备）。vid=是否接受视频，lv=可接受档位（两端取 min），af=期望语音帧长；末三项=本端媒体通道三元组，语义同 [sendCallInvite]。 */
+    /** 同意接听:vid=是否接受视频,lv=可接受档位(两端取min),af=期望语音帧长;末三项=本端媒体三元组,语义同sendCallInvite */
     fun sendCallAccept(
         ip: String, vid: Boolean = false, lv: Int = 1, af: Int = 0,
         mport: Int = 0, mudp: Boolean = false, msid: String = ""
@@ -1818,15 +1449,8 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
             }
         }
 
-    /**
-     * 振铃期逐档交换本端媒体三元组（任务单 2.5 / 方案 §4.3①）。
-     * 字段语义见 [Protocol.callMedia]。
-     *
-     * ⚠ 由 **pp-av-negotiate 线程**调用（振铃期的定档时序），不是主线程；仍走 [io] 的 pp-send
-     *   队列 —— 与上面 [sendCallInvite] 那条实测教训同一条：任何通话控制帧都不能在调用线程上写 socket。
-     *
-     * @return 有没有可用会话（写出已入队，尽力而为）；false = 主 TCP 已无会话 ⇒ 调用方按 ⑦ 处置
-     */
+    /** 振铃期逐档交换本端媒体三元组(§4.3①);由pp-av-negotiate线程调,仍走io{}队列(控制帧不许在调用线程写socket);
+     *  返回有没有可用会话;false=主TCP已无会话⇒调用方按⑦处置 */
     fun sendCallMedia(ip: String, mport: Int, mudp: Boolean, msid: String, tierOrdinal: Int): Boolean {
         val s = sessionOf(ip) ?: return false
         io { sendOrDrop(s, Protocol.callMedia(mport, mudp, msid, tierOrdinal), "call_media", quiet = true) }
@@ -1850,10 +1474,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
     /** 该设备的对端能力（未握手/未连接返回 null）。按**设备**找会话（见 [sessionByGroup]） */
     fun peerCapsOf(ip: String?): PeerCaps? = sessionByGroup(ip.orEmpty())?.caps
 
-    /**
-     * 本端能力晚到（如解码器枚举在后台线程完成）时，把所有已握手会话的
-     * `hello` 重发一次，让对端及时看到最新能力。
-     */
+    /** 本端能力晚到(如解码器枚举在后台完成)时,把所有已握手会话的hello重发一次 */
     fun resendHello() {
         io {
             val j = Protocol.hello(
@@ -1870,20 +1491,12 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
     /** 对端是否声明可接收视频（**发任何视频帧前的硬闸门**） */
     fun peerVidCap(ip: String?): Boolean = peerCapsOf(ip)?.vid == true
 
-    /**
-     * 向指定 IP 的设备发一帧视频。
-     *
-     * **闸门**：对端未广播 `vid=1` 时直接丢弃 —— 老端 readFrame 遇到 0x03 会
-     * 抛 IOException 断链，这是向后兼容的关键（见 §4.3）。
-     *
-     * @param flag VIDEO_FLAG_KEYFRAME / VIDEO_FLAG_CONFIG / 0
-     * @return 写入耗时 ms；-1 = 未发送（无会话 / 对端无能力 / 超 128KB 闸门）
-     */
+    /** 向指定IP发一帧视频;闸门:对端未广播vid=1直接丢弃(老端遇0x03会断链);超128KB也丢;
+     *  返回写入耗时ms,-1=未发送(无会话/无能力/超闸门) */
     fun sendVideoTo(ip: String, seq: Int, ts: Long, flag: Int, data: ByteArray, len: Int): Long {
         if (len > Protocol.MAX_VIDEO_FRAME) {
             log("视频帧超 128KB 闸门（${len}B），丢弃以免长时间独占写锁")
-            // 计数器口径（CallCounters 文件头）：被单帧闸门拦下**必须**计数并上报，
-            // 否则这条静默丢就是下一个"lat 恒 0"——建了名字没人加。
+            // 计数器口径:被单帧闸门拦下必须计数并上报,否则这条静默丢就是下一个"lat恒0"
             com.phonepctransfer.util.CallCounters.videoDroppedByGate.inc()
             return -1L
         }
@@ -1897,11 +1510,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         }
     }
 
-    /**
-     * 编码参数变更通知（控制帧，主线程安全）。
-     *
-     * @param front 本端摄像头是否前置（`video_cfg.cam`），接收端据此选默认显示角
-     */
+    /** 编码参数变更通知(控制帧,主线程安全);front=本端摄像头是否前置(video_cfg.cam),接收端据此选默认显示角 */
     fun sendVideoCfg(
         ip: String, codec: String, w: Int, h: Int, fps: Int, br: Int, rot: Int, front: Boolean
     ) = io {
@@ -1928,14 +1537,8 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
             }
         }
 
-    /**
-     * 当前对话**实际可达**的对端地址（通话呼叫目标）；未选中返回空串。
-     *
-     * 为什么优先返回会话的 remoteIp 而不是 selectedIp：设备分组之后，用户在顶栏
-     * 把当前地址切到组内另一个（比如切到热点地址）而会话仍建在原地址上时，
-     * 消息仍会走原会话；此时若把 selectedIp 报给 CallManager，通话应答帧的源地址
-     * 与它记的 peerIp 对不上 → 呼叫会卡在「正在呼叫」永不接通。
-     */
+    /** 当前对话实际可达的对端地址(通话呼叫目标);优先会话remoteIp而非selectedIp:
+     *  切到组内另一地址后会话仍建在原地址,报selectedIp会让呼叫卡在"正在呼叫" */
     fun currentPeerIp(): String = target()?.remoteIp ?: selectedIp
 
     /** 手动同步：只对当前对话设备冲刷待发内容（点一次试一次，不重连其他设备；剪贴板纯被动不拉） */
@@ -1971,12 +1574,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
 
     // ==================== 消息删除同步（v2.4，仅双方 hd=1 时使用）====================
 
-    /**
-     * 本机删除一条文本/图片后通知对端同步移除。
-     * 只发帧，不碰本地数据（界面/历史/待发由 AppCore 统一清理）。
-     * 对端不在线或老版本（hd=0）时静默跳过 —— 此时删除只影响本机，
-     * 这条内容下次连接会被 hsync 自动补回来（对端历史里还在，属预期行为）。
-     */
+    /** 本机删除一条文本/图片后通知对端同步移除;只发帧不碰本地数据;对端不在线/老端静默跳过(hsync下次补回) */
     fun deleteMessage(peerIp: String, mid: String) {
         if (mid.isEmpty()) return
         // 按设备找会话：删除通知要发给「那台设备」，它可能挂在同组的另一个地址上
@@ -1986,23 +1584,14 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         log("已通知对端删除消息 mid=$mid")
     }
 
-    /** 这台设备现在收得到 `msg_del` 吗（在线 + 握手完成 + 对端支持删除同步 hd）。
-     *  界面要在**确认之前**给出「对方在线/不在线」的口径，不能等发完了再猜。 */
+    /** 这台设备现在收得到msg_del吗(在线+握手完成+对端hd);界面要在确认之前给出在线口径 */
     fun canSendMsgDel(peerIp: String): Boolean {
         val s = if (peerIp.isEmpty()) null else sessionByGroup(peerIp)
         return s != null && s.handshaked && !s.closed && s.caps.hd
     }
 
-    /**
-     * 批量删除通知（「清空会话」逐条删除用）：把**参与同步**的 mid（文本 + 图片）
-     * 分片发 `msg_del`。只发帧 —— 本地历史/待发/界面由 AppCore 一次清完
-     * （见 [AppCore.clearHistory]），别在这里逐条调 [deleteMessage] 又读又写一遍磁盘。
-     *
-     * 分片：单帧塞几千个 mid 会撞上帧长上限，故每 [MSG_DEL_CHUNK] 条一帧。
-     *
-     * @return 实际请求对端删除的条数（**0 = 对端不在线/不支持 hd**，本次只清了本机）。
-     *         帧走 `io{}` 投递（UI 主线程禁写 socket），能返回非 0 就代表已入列。
-     */
+    /** 批量删除通知(清空会话用):把参与同步的mid(文本+图片)分片发msg_del;只发帧,本地由AppCore一次清完;
+     *  返回实际请求对端删除的条数,0=对端不在线/不支持hd */
     fun deleteMessages(peerIp: String, mids: List<String>): Int {
         if (mids.isEmpty()) return 0
         val s = sessionByGroup(peerIp) ?: return 0
@@ -2019,12 +1608,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         return mids.size
     }
 
-    /**
-     * 这台设备名下**还有传输在途**吗（正在收 / 正在发）。
-     *
-     * 「清空」要在这种情况下拒绝执行 —— 枚举出来的 mid 里就有正在传的那条，
-     * 清掉会让落地流程找不到自己的注册项。判据按**设备组键**比对（同一台设备换地址也算它）。
-     */
+    /** 这台设备名下还有传输在途吗(正在收/正在发);"清空"要在此拒绝(清掉会丢落地注册项);按设备组键比对 */
     fun hasActiveTransfer(ip: String): Boolean {
         if (ip.isEmpty()) return false
         val k = runCatching { prefs.convKeyOf(ip) }.getOrNull().orEmpty()
@@ -2086,10 +1670,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         synchronized(reconnectLock) { runCatching { reconnectLock.notifyAll() } }
     }
 
-    /**
-     * 统一消息 id（2026-09-16 定版）：两端同构的 32 位十六进制全局唯一串。
-     * 接收查重、待发队列、历史合并、hsync 补齐**全部以它为唯一判据**。
-     */
+    /** 统一消息id:两端同构的32位十六进制全局唯一串;接收查重/待发/历史合并/hsync补齐都以它为唯一判据 */
     internal fun newMid(): String = UUID.randomUUID().toString().replace("-", "")
 
     internal fun hex(b: ByteArray): String = b.joinToString("") { "%02x".format(it) }
@@ -2108,10 +1689,7 @@ class Link(internal val ctx: Context, internal val prefs: Prefs) {
         /** 判「假连接（半开）」的收包空闲阈值：超过一轮心跳周期（5s）仍无收包才算 */
         internal const val STALE_RX_MS = 20_000L
 
-        /**
-         * 接收/发送停滞判定阈值：30s 无任何真实进度（对端半死但 TCP 心跳仍正常）。
-         * 心跳仍正常是因为对端进程活着、只是发送线程卡死/被杀 —— 心跳帧保不了业务帧。
-         */
+        /** 接收/发送停滞判定阈值:30s无任何真实进度;对端进程活着但发送线程卡死时心跳帧保不了业务帧 */
         internal const val STALL_TIMEOUT_MS = 30_000L
 
         /** 停滞看门狗扫描周期（= 心跳周期）：心跳线程每 5s 顺带扫一次，不新开线程 */

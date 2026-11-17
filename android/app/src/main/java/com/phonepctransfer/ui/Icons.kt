@@ -24,23 +24,10 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 /**
- * 应用内**矢量图标**（2026-09-19 用户定调：两端去 emoji，改用等价 SVG 图标）。
- *
- * 为什么必须换：原来界面上写的是 `📋 📁 📄 ✅ 🖼 ⚠ ✕ ▼` 这类字符。
- *  - emoji（📋📁📄✅🖼）在不同 ROM / 字体下**宽度、颜色、基线全不一样**，ColorOS 上是彩色
- *    贴图、某些精简字体下直接是**方框**（tofu）；
- *  - `✕ ▼` 这类几何符号虽然覆盖率高，但字号一变就与旁边的文字**对不齐**（不在同一视觉中线）。
- *
- * 这里的做法与 PC 端 [com.phonepctransfer.pc.CallIcons] 同构：**全部用 Canvas 手绘**
- *（等价于一张 SVG），不引 drawable 资源、不依赖任何字体覆盖 —— 缩放无损、颜色由参数给、
- * 与文字用 `Row(verticalAlignment = CenterVertically)` 对齐，彻底摆脱「显示问题」。
- *
- * 设计稿坐标系固定 **24×24**，实际绘制时统一乘 `u = minDimension / 24`，因此任何尺寸都清晰。
- *
- * @param kind 图标种类
- * @param size 图标边长（正方形）。建议与相邻文字的字号同量级（labelSmall ≈ 11~13dp）
- * @param color 着色；**默认取 `LocalContentColor`**（跟随按钮/气泡的当前文字色），
- *              需要语义色（绿√ / 红⚠ / 白✕）时显式传入
+ * 应用内**矢量图标**（与 PC 端 [com.phonepctransfer.pc.CallIcons] 同构：全部 Canvas 手绘，不引 drawable 资源、不依赖字体覆盖，缩放无损）。
+ * 替代 emoji/符号的原因：emoji 在不同 ROM/字体下宽度、颜色、基线不一致（某些字体下是方框）；`✕ ▼` 这类符号字号一变就与文字对不齐。与文字用 `Row(CenterVertically)` 对齐。
+ * 设计坐标系固定 24×24，绘制时统一乘 `u = minDimension / 24`。
+ * kind=图标种类；size=图标边长（正方形），建议与相邻文字字号同量级；color=默认取 `LocalContentColor`（跟随当前文字色），需要语义色时显式传入。
  */
 internal enum class Glyph {
     /** 剪贴板（剪贴板气泡标签） */
@@ -85,8 +72,7 @@ internal enum class Glyph {
 
 /**
  * 画一枚矢量图标。
- *
- * 用法（与文字同行时**必须**用 Row 居中对齐，不要塞进字符串）：
+ * 用法（与文字同行时必须用 Row 居中对齐，不要塞进字符串）：
  * ```
  * Row(verticalAlignment = Alignment.CenterVertically) {
  *     GlyphIcon(Glyph.FILE, 14.dp)
@@ -195,11 +181,8 @@ private fun DrawScope.drawCheck(u: Float, c: Color) {
 }
 
 /**
- * 警示三角（= 原「⚠」）：实心三角 + **镂空**叹号。
- *
- * 镂空靠 `PathFillType.EvenOdd`：三角与叹号两个子路径重叠的部分被挖空，
- * 于是叹号呈现为底色（气泡/横幅的背景色），不需要知道背景具体是什么颜色 —— 这是
- * 「drawPath 组合挖孔」的标准写法，比画两遍（先画三角再画一个背景色的叹号）稳。
+ * 警示三角（= 原「⚠」）：实心三角 + 镂空叹号。
+ * 镂空靠 `PathFillType.EvenOdd`：三角与叹号两个子路径重叠的部分被挖空，于是叹号呈现为底色（不需要知道背景具体是什么颜色）——「drawPath 组合挖孔」的标准写法，比画两遍（先画三角再画一个背景色的叹号）稳。
  */
 private fun DrawScope.drawWarn(u: Float, c: Color) {
     val p = Path().apply {
@@ -251,8 +234,7 @@ private fun DrawScope.drawClose(u: Float, c: Color) {
 }
 
 /**
- * 向上箭头（内置文件浏览器的「返回上级目录」）。
- * 竖线 + 两撇斜线，与 [drawClose] 同一套线宽口径，放进 24×24 网格不会与旁边的字错位。
+ * 向上箭头（内置文件浏览器的「返回上级目录」）：竖线 + 两撇斜线，与 [drawClose] 同一套线宽口径，放进 24×24 网格不会与旁边的字错位。
  */
 private fun DrawScope.drawArrowUp(u: Float, c: Color) {
     val w = 2.2f * u
@@ -280,11 +262,8 @@ private fun DrawScope.drawTriangleDown(u: Float, c: Color) {
 }
 
 /**
- * 齿轮（= 设置入口）。
- *
- * 齿形用极坐标逐点算：一圈 8 个齿，每个齿是「齿根宽、齿顶窄」的梯形，
- * 齿与齿之间沿**齿根圆**用 6 段折线近似圆弧（不依赖 `arcTo` 的隐式连线语义，结果稳定）。
- * 中心孔同样是 EvenOdd 挖出来的 —— 所以它画在任何底色上都对。
+ * 齿轮（= 设置入口）：齿形用极坐标逐点算，一圈 8 个齿，每个齿是「齿根宽、齿顶窄」的梯形，
+ * 齿与齿之间沿齿根圆用 6 段折线近似圆弧（不依赖 `arcTo` 的隐式连线语义）；中心孔同样是 EvenOdd 挖出来的，画在任何底色上都对。
  */
 private fun DrawScope.drawGear(u: Float, c: Color) {
     val c0 = Offset(12f * u, 12f * u)
@@ -341,7 +320,7 @@ private fun DrawScope.drawPause(u: Float, c: Color) {
 /** 齿轮图标的推荐尺寸（左侧面板底部「设置」行用） */
 internal val SETTINGS_GEAR_SIZE = 16.dp
 
-/** 太阳（= 主题按钮「浅色」态）：**空心**圆环 + 8 根放射线（2026-10-01 用户定空心） */
+/** 太阳（= 主题按钮「浅色」态）：空心圆环 + 8 根放射线（空心风格） */
 private fun DrawScope.drawSun(u: Float, c: Color) {
     val center = Offset(12f * u, 12f * u)
     drawCircle(
@@ -363,11 +342,8 @@ private fun DrawScope.drawSun(u: Float, c: Color) {
 }
 
 /**
- * 月亮（= 主题按钮「深色」态）：**空心**月牙轮廓。
- *
- * 用两段圆弧围成：外圆（r9.5，圆心 12,12）走左下长弧到两个尖角，
- * 再沿「挖除圆」（r9，圆心 15,7）的弧折回 —— 两圆交点 (6.41,4.32) 与
- * (21.41,13.32) 是解出来的精确值，弧与弧在尖角处无缝闭合。
+ * 月亮（= 主题按钮「深色」态）：空心月牙轮廓。
+ * 用两段圆弧围成：外圆（r9.5，圆心 12,12）走左下长弧到两个尖角，再沿「挖除圆」（r9，圆心 15,7）的弧折回；两圆交点 (6.41,4.32)/(21.41,13.32) 是解出来的精确值，弧与弧在尖角处无缝闭合。
  * 描边（Round join）而非填充，与太阳同为空心风格。
  */
 private fun DrawScope.drawMoon(u: Float, c: Color) {

@@ -1,30 +1,23 @@
 package com.phonepctransfer.pc;
 
 /**
- * **纯语音通话**的 Opus 码率自适应（64k ⇄ 32k，2026-09-15）。
- *
- * 与 Android 端 voice/VoiceBitrate.kt 严格同构（降档激进、升档保守），只有两档：
- *
+ * **纯语音通话**的 Opus 码率自适应（64k ⇄ 32k），与 Android 端 voice/VoiceBitrate.kt 严格同构。
  * <pre>
- * 64k（默认，VoiceEngine.BITRATE_VOICE）
+ * 64k（默认）
  *   ↓ 拥塞连续 2 次采样（≈4s），且距上次降档 ≥3s
- * 32k（VoiceEngine.BITRATE_VOICE_LO）
+ * 32k
  *   ↓ 健康窗口连续 15s，且距上次升/降档分别 ≥30s / ≥60s
  * 64k
  * </pre>
- *
- * 判据（三者任一成立即判拥塞；全部宽松达标才算健康）：
+ * 判据（任一成立即拥塞；全部宽松达标才健康）：
  * <ol>
- *   <li>发送阻塞：写 socket 的耗时 2s 均值 &gt;120ms（TCP 发送缓冲被占满）；</li>
- *   <li>播放侧积压（毫秒口径，任务单 4）：队列 + 线内未播 &gt;max(160, 2×帧长)ms。
- *       <b>原来这里是「≥2 帧」</b>——200ms 帧时代 2 帧 = 400ms 的门槛，20ms 帧下变成 40ms，
- *       比接收端的水位目标（VoiceEngine.PLAY_TARGET_MS=80ms）还低，稳态就会持续误判拥塞、
- *       接通 4s 即钉在 32k（10-05 两次 PC↔PC 通话实测）。阈值改成毫秒并按帧长放大，
- *       旧版 200ms 帧对端仍是 400ms 口径，不会因为换帧长而反向变松；</li>
+ *   <li>发送阻塞：写 socket 耗时 2s 均值 &gt;120ms；</li>
+ *   <li>播放侧积压（毫秒口径）：队列 + 线内未播 &gt;max(160, 2×帧长)ms —— 原「≥2 帧」在 20ms 帧下
+ *       仅 40ms，低于接收端目标 80ms，稳态误判拥塞（实测接通 4s 钉死 32k）；改毫秒并按帧长放大后，
+ *       旧版 200ms 帧对端仍是 400ms 口径，不会反向变松；</li>
  *   <li>缺帧率：播放端被迫补静音跳过的比例 &gt;15%。</li>
  * </ol>
- *
- * ⚠ 只在纯语音通话启用：视频通话的音频码率跟随视频档位（L0 32k / L1~L3 64k）。
+ * ⚠ 只在纯语音通话启用：视频通话音频码率跟随视频档位（L0 32k / L1~L3 64k）。
  */
 public final class VoiceBitrateController {
 

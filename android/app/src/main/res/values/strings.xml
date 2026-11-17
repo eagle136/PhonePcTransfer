@@ -16,7 +16,7 @@
     <string name="clip_capture_label">手机电脑互传·后台保活</string>
     <string name="clip_capture_desc">仅用于后台保活：让本应用在后台更稳定地保持文件传输与语音通话连接，不读取任何屏幕内容，也不读取剪贴板，不上传不联网。</string>
 
-    <!-- ===== 「复制链接」入口（2026-10-05）=====
+    <!-- ===== 「复制链接」入口 =====
          出现在系统「用浏览器打开」的选择框里，选中后把链接复制到剪贴板即关闭。
          这个名字**直接显示在选择框里**（Activity 的 android:label），所以用独立字符串便于改。 -->
     <string name="copy_link_label">复制链接</string>

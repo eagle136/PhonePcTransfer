@@ -3,9 +3,8 @@ package com.phonepctransfer.net;
 import java.util.Locale;
 
 // 由 tools/ipdata/GenBlocklist.java 生成，勿手工编辑（词表在 GenBlocklist.WORDS 里维护）。
-// 判定口径（写死，顺序不可调）：命中词表 且 codePointCount < 30 且
-// 去掉「数字与数字之间」的空格（含全角）后最长连续数字段 >= 12。
-// 只作用于接收侧文本消息；剪贴板、文件备注、通话不过滤。
+// 判定口径（写死，顺序不可调）：命中词表 且 codePointCount < 30 且 去掉数字间空格（含全角）后最长连续数字段 >= 12；
+// 只作用于接收侧文本消息（剪贴板、文件备注、通话不过滤）。
 
 public final class TransferKeywords {
 

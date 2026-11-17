@@ -29,17 +29,15 @@ import javax.swing.SwingUtilities;
 
 /**
  * 现代窗口外壳（离屏渲染）：去原生标题栏 + 圆角内容区 + 柔和阴影 + 自绘标题栏。
- *
  * <p>「老土感」的最大来源是 JFrame 自带的 Windows 原生标题栏和直角边框。这里：
  * <ol>
  *   <li>{@link JFrame#setUndecorated(true)} 去掉原生装饰；</li>
  *   <li>{@link JFrame#setBackground(Color)} 设为全透明，让窗口四周边角可见；</li>
- *   <li>根面板四周留出 {@link #SHADOW} 的透明边，在那里用多层半透明圆角矩形模拟柔和投影；</li>
- *   <li>中间一个 {@link RoundedContent} 面板，paintComponent 里画白色圆角底，
- *       paintChildren 用 {@link RoundRectangle2D} 做裁剪，子组件不会溢出圆角；</li>
+ *   <li>根面板四周留出 {@link #SHADOW} 的透明边，用多层半透明圆角矩形模拟柔和投影；</li>
+ *   <li>中间一个 {@link RoundedContent} 面板，paintComponent 画白色圆角底，
+ *       paintChildren 用 {@link RoundRectangle2D} 裁剪，子组件不会溢出圆角；</li>
  *   <li>内容区顶部叠一条 {@link TitleBar}：图标 + 标题 + 最小化/关闭按钮，整条可拖动。</li>
  * </ol>
- *
  * <p>必须在窗口 {@code setVisible(true)} 之前装好（{@code setUndecorated} 的硬约束）。
  */
 final class WindowChrome {
@@ -93,16 +91,14 @@ final class WindowChrome {
     }
 
     /**
-     * 画窗口最外圈 1px 细线（2026-09-29 新增）。
-     *
-     * <p>为什么要它：深色 SURFACE = 纯黑、浅色 SURFACE = 纯白，窗口四边与桌面/阴影
-     * 亮度差太小，用户看不出"界面到哪儿为止"。这里沿圆角路径画一圈 WIN_BORDER 细线。
-     *
+     * 画窗口最外圈 1px 细线。
+     * <p>为什么：深色 SURFACE = 纯黑、浅色 SURFACE = 纯白，窗口四边与桌面/阴影亮度差
+     * 太小，用户看不出"界面到哪儿为止"，故沿圆角路径画一圈 WIN_BORDER 细线。
      * <p>两个关键实现点：
      * <ol>
      *   <li><b>坐标内缩 0.5px</b>：BasicStroke(1f) 以路径为中心线，画在 (0,0) 会有一半落在
-     *       组件外并被裁掉（看起来只有 0.5px、发虚）。用 (0.5, 0.5, w-1, h-1) 让整条线贴在
-     *       组件内部，1px 完整、锐利。</li>
+     *       组件外并被裁掉（只剩 0.5px、发虚）。用 (0.5, 0.5, w-1, h-1) 让整条线贴在组件
+     *       内部，1px 完整、锐利。</li>
      *   <li><b>corner &lt;= 0 时直接返回</b>：全屏态圆角已被归零，满屏再描一圈边等于屏幕上
      *       多出一条黑线，属回归。</li>
      * </ol>
@@ -120,7 +116,7 @@ final class WindowChrome {
     }
 
     /**
-     * 弹窗/通话窗外壳（Q5 = 只要圆角不要阴影）：圆角 SURFACE 底 + 圆角裁剪子组件 + 顶部自绘标题栏。
+     * 弹窗/通话窗外壳（只要圆角不要阴影）：圆角 SURFACE 底 + 圆角裁剪子组件 + 顶部自绘标题栏。
      *
      * <p>与主窗 {@link RoundedContent} 的区别：没有 SHADOW 投影层；圆角半径可运行时归零
      *（VideoWindow 全屏：满屏矩形不能四角透明透出桌面）。
@@ -141,8 +137,7 @@ final class WindowChrome {
          * 进全屏圆角归零 / 退出恢复 {@link #RADIUS}。
          *
          * <p>必须同步给标题栏：它自绘的深灰底也带 RADIUS 圆角，全屏（corner=0）时不同步
-         * 就会在满屏顶角露出两块 SURFACE 色的圆弧缺口（2026-10-03 标题栏不再随全屏隐藏，
-         * 这条路径第一次真的会画到屏幕上）。
+         * 就会在满屏顶角露出两块 SURFACE 色的圆弧缺口。
          */
         void setCornerRadius(int r) {
             corner = r;
@@ -190,7 +185,7 @@ final class WindowChrome {
                     RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
             g2.setClip(new RoundRectangle2D.Float(0, 0, getWidth(), getHeight(), corner, corner));
             super.paintChildren(g2);
-            // 外框细线（2026-09-29）：主窗与弹窗/通话窗同一套视觉；corner=0（全屏）自动跳过
+            // 外框细线：主窗与弹窗/通话窗同一套视觉；corner=0（全屏）自动跳过
             g2.setClip(null);
             paintWindowBorder(g2, getWidth(), getHeight(), corner);
             g2.dispose();
@@ -198,7 +193,7 @@ final class WindowChrome {
     }
 
     /**
-     * 给弹窗 JDialog 装自绘外壳（Q5 = 只要圆角不要阴影，无 SHADOW 层）。
+     * 给弹窗 JDialog 装自绘外壳（只要圆角不要阴影，无 SHADOW 层）。
      *
      * <p><b>必须在 {@code setVisible(true)} 之前调用</b>（setUndecorated 的硬约束）。
      * 设备不支持逐像素透明时自动退化为不透明直角窗（深灰标题栏仍在，只丢圆角）。
@@ -219,10 +214,10 @@ final class WindowChrome {
     }
 
     /**
-     * 同上，再加一个**最大化/还原**钮（VideoWindow 用，2026-10-03）。
+     * 同上，再加一个**最大化/还原**钮（VideoWindow 用）。
      *
-     * <p>为什么放标题栏而不是画面上：画面浮动圆钮默认隐藏、5s 自动收起，用户三轮都报告
-     * 「视频窗上没有全屏按钮」；普通窗口的放大钮在右上角，一眼就在那里。
+     * <p>为什么放标题栏而不是画面上：画面浮动圆钮默认隐藏、5s 自动收起，不好找；
+     * 普通窗口的放大钮在右上角，一眼就在那里。
      *
      * @param onMaximize 点击钮的回调（全屏/还原由调用方决定；本类只负责字形跟着
      *                   {@link DialogChrome#setMaximized(boolean)} 换）
@@ -295,7 +290,7 @@ final class WindowChrome {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
                     RenderingHints.VALUE_ANTIALIAS_ON);
-            // 圆角内容区底色跟主题走（深色 = 纯黑，2026-09-27）；读动态字段，repaint 自动换色
+            // 圆角内容区底色跟主题走；读动态字段，repaint 自动换色
             g2.setColor(Ui.SURFACE);
             g2.fillRoundRect(0, 0, getWidth(), getHeight(), RADIUS, RADIUS);
             g2.dispose();
@@ -484,7 +479,7 @@ final class WindowChrome {
             this.kind = kind;
             this.onClick = onClick;
             setPreferredSize(new Dimension(46, h));
-            // 放大钮带 hover 提示（新文案一律英文，2026-09-16 定调）；字形之外再多一层「认得出」
+            // 放大钮带 hover 提示（新文案一律英文）；字形之外再多一层「认得出」
             if (kind == Kind.MAXIMIZE) {
                 setToolTipText("Fullscreen");
             }
@@ -562,7 +557,7 @@ final class WindowChrome {
                 g2.fillRect(cx - 6, cy - 1, 12, 1);
             } else if (kind == Kind.MAXIMIZE) {
                 // 照 Windows 11 的「放大/还原」字形画：边长 10.5 的**圆角**方块、描边 1.2px、
-                // 还原态两框沿对角错开 2.5px（用户 2026-10-03 给的系统截图就是这个样式）。
+                // 还原态两框沿对角错开 2.5px（与系统样式一致）。
                 // 这里**开**形状 AA：圆角关 AA 会锯齿成阶梯；1px 直线的发虚问题只有方角直角框才有，
                 // 圆角描边本来就要靠 AA 才顺。
                 final float s = 10.5f, arc = 3f, off = 2.5f;

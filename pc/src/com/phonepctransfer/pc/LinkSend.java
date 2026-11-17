@@ -41,7 +41,7 @@ final class LinkSend {
         m.filePath = f.getAbsolutePath();
         m.progress = 0;
         Session s = L.sessionByGroup(L.selectedIp());
-        // 2.12 / D16：投票为 1（通话中 / 没网络 / 被拒）⇒ 一律**不入网**，改走既有的待发台账排队，
+        // 投票为 1（通话中 / 没网络 / 被拒）⇒ 一律**不入网**，改走既有的待发台账排队，
         //   拦截解除（全 0）那一刻由 setFileVote 自动触发一次续发。拦在**入口**而不是写者里
         //   （写者里拦＝字节已入队，等于没拦）。
         if (s == null || L.fileGateBlocked()) {
@@ -64,7 +64,7 @@ final class LinkSend {
         L.emit(m);
         final Msg item = m;
         final File file = f;
-        // ⚠ 整段（确认 + 传输）进**串行队列**（2026-09-21 排队发送）：一次只传一个文件，
+        // ⚠ 整段（确认 + 传输）进**串行队列**：一次只传一个文件，
         //   前一个完成立刻进入下一个 —— 批量拖入几十个文件时按入队顺序逐个传，
         //   不再几十条线程同时抢写锁、一有异常各自关会话。
         L.enqueueFileSend("发送文件 " + item.fileName, () -> {
@@ -94,7 +94,7 @@ final class LinkSend {
     }
 
     /**
-     * @param voteDenied 2.12 / D16：这一条要不要替"被拒绝"那一票投 1（全局闸住文件管线）。
+     * @param voteDenied 这一条要不要替"被拒绝"那一票投 1（全局闸住文件管线）。
      *   只有**数据流量确认被拒**（含对端拒、本端拒）才投；"设备未连接"归票 ②（握手完成自动清）、
      *   "文件夹重试要重新选目录"归 UI 限制，两者都不该把整条管线闸到下一次手动重试为止。
      */
@@ -108,7 +108,7 @@ final class LinkSend {
         L.emit(m);
         L.log("文件「" + m.fileName + "」未发送：" + note);
         if (voteDenied) {
-            // 2.12 / D16（你点的 ⑬-2"全局暂停，手动重试时清 0"）：被拒 ⇒ 这一票投 1，
+            // 被拒 ⇒ 这一票投 1（全局暂停，手动重试时清 0），
             //   于是**整条文件管线**都闸住（新条目排队、在传的暂停），清零点 = 手动重试那一条。
             //   ⚠ 不改 DENIED 本体：条目仍然**移出**待发队列、仍然要人手动重试
             //     ⇒ resendPendingFile 那条"不会反复骚扰"的既有注释依旧成立（被拒的条目不在待发队列里，
@@ -157,7 +157,7 @@ final class LinkSend {
         if (m == null || m.mid == null || m.mid.isEmpty()) {
             return;
         }
-        // 2.12 / D16（你点的 ⑬-2）：手动重试就是"被拒"这一票的清零点。
+        // 手动重试就是"被拒"这一票的清零点。
         // 放在入口而不是成功后 ⇒ 重试若再次被拒，denyFileByData 会重新投 1（与今天"每次拒绝都回 DENIED"一致）。
         L.setFileVote(Link.VOTE_CONSENT_DENIED, false);
         String ip = (m.peerIp == null || m.peerIp.isEmpty()) ? L.selectedIp() : m.peerIp;
@@ -244,19 +244,17 @@ final class LinkSend {
      * （{@code dir_missing}）→ 有缺失就**只补发缺失项**（最多 {@link #L.DIR_RESEND_ROUNDS} 轮）→
      * 仍有缺件则如实标失败并把缺的文件名列进日志。
      *
-     * 为什么必须这么改（2026-09-16 用户报「传文件夹会漏掉部分文件」）：
-     *  - 老流程发送端只要 {@code file_done} 写进 socket 就当成功，**完全不等对端确认**。
-     *    对端建文件失败 / 落盘失败 / 校验失败时只是本地记一行日志，发送端照样报
-     *    「文件夹发送完成」→ 用户永远不知道少了哪些。
-     *  - 成员失败即中止整目录：一个读不了的文件就能让**后面所有成员**一个都发不出去。
-     *    现在本地源不可读只跳过该成员并继续，最后统一汇报。
+     * 为什么要有完整性闭环：
+     *  - 只要 {@code file_done} 写进 socket 就当成功、**完全不等对端确认**的话，对端落盘/校验失败时
+     *    发送端照样报「完成」，用户永远不知道少了哪些。
+     *  - 成员失败即中止整目录会让一个读不了的文件挡住后面所有成员，所以本地源不可读只跳过该成员并继续，最后统一汇报。
      */
     void doSendFolderInner(File dir, Msg item, List<File> files, List<String> emptyDirs,
                                    int skipped) {
         // 目的设备在创建这条消息时就定死了（item.peerIp），切换会话不会改变归属
         Session s = L.sessionOf(item.peerIp);
         if (s == null) {
-            L.setFileVote(Link.VOTE_NO_NETWORK, true);   // 2.12："原本没网络"那一票（文件夹同一条口径）
+            L.setFileVote(Link.VOTE_NO_NETWORK, true);   // 「原本没网络」那一票（文件夹同一条口径）
             if (L.store != null) {
                 L.store.addPending(item);
             }
@@ -299,7 +297,7 @@ final class LinkSend {
                         return;
                     }
                     if (L.fileGateBlocked()) {
-                        // 2.12 / D16：文件夹在**成员边界**暂停（整目录条目本来就已入待发台账，
+                        // 文件夹在**成员边界**暂停（整目录条目本来就已入待发台账，
                         // dirSendState 里"已完成的成员"不清 ⇒ 续发时跳过它们，只补没发完的）
                         pauseInFlight(item, "", null);
                         return;
@@ -323,7 +321,7 @@ final class LinkSend {
                         doSendFile(f, member, rel, item.mid, agg, true);
                     } catch (SourceException se) {
                         // 本地读不了（文件被删 / 被占用 / 无权限）：
-                        // **只跳过这一个成员**继续发其余 —— 老逻辑会让整目录就此停摆
+                        // **只跳过这一个成员**继续发其余（老逻辑会让整目录就此停摆）
                         unreadable.add(rel);
                         L.log("成员本地不可读，跳过继续：" + rel + "（" + se.getMessage() + "）");
                     }
@@ -427,7 +425,7 @@ final class LinkSend {
             if (L.store != null) {
                 L.store.removePending(item.mid);
             }
-            // 整目录收尾：同步丢掉本 mid 的发送状态表（防 dirSendState 无界增长，2026-09-28）
+            // 整目录收尾：同步丢掉本 mid 的发送状态表（防 dirSendState 无界增长）
             L.dirSendState.remove(item.mid);
         } catch (Throwable t) {
             if (L.cancelled.contains(item.mid)) {
@@ -448,7 +446,7 @@ final class LinkSend {
                 L.listener.onMessageUpdated(u);
             }
         } finally {
-            // 整目录速率采样器统一收尾（2026-09-29）：覆盖 while 内取消 / 循环后取消 /
+            // 整目录速率采样器统一收尾：覆盖 while 内取消 / 循环后取消 /
             // 失败定稿 / catch 失败；成功定稿那次 end 保留，重入幂等。
             Speeds.end(item.mid);
         }
@@ -456,9 +454,9 @@ final class LinkSend {
 
     /**
      * 断点续传协商：一问（file_query）一答（file_resume），3s 等不到就算无应答。
-     * 返回值口径（2.12 起）：<b>&gt;0</b> = 对端已有这么多字节（按 CHUNK_SIZE 对齐后从这儿续）；
+     * 返回值口径：<b>&gt;0</b> = 对端已有这么多字节（按 CHUNK_SIZE 对齐后从这儿续）；
      * <b>0</b> = 对端答了"没有半成品"（从头发）；<b>-1</b> = **没发出问题或没收到应答**
-     *（⇒ 调用方保持暂停，不许退化成从头重发 —— 你点的"没收到就暂停，手动点继续才重试"）。
+     *（⇒ 调用方保持暂停，不许退化成从头重发）。
      */
     long negotiateResume(Session s, String mid, String name, long size) {
         ArrayBlockingQueue<Long> q = new ArrayBlockingQueue<Long>(1);
@@ -484,7 +482,7 @@ final class LinkSend {
     }
 
     /**
-     * 2.12 / D16：把一条**在传的**条目就地暂停 —— 结束本次尝试（不抛错、不进 cancelled、
+     * 把一条**在传的**条目就地暂停 —— 结束本次尝试（不抛错、不进 cancelled、
      * 不把已入队的字节劈开），状态转 PAUSED 并留在/登入待发台账。
      * 拦截解除（投票全 0）那一刻 {@code setFileVote} 自动触发一次续发：
      * {@code flushPending → resendPendingFile → doSendFile} 顶部的 {@code negotiateResume}
@@ -542,7 +540,7 @@ final class LinkSend {
             L.inFlight.remove(item.mid);
             L.inFlightPeer.remove(item.mid);
             L.sendLastAt.remove(item.mid);
-            // 速率采样器统一收尾（2026-09-29）：一处覆盖 取消/失败/成功（含文件夹成员），
+            // 速率采样器统一收尾：一处覆盖 取消/失败/成功（含文件夹成员），
             // 成功路径里那次 end 只是提前收尾，这里重入幂等。
             Speeds.end(item.mid);
         }
@@ -572,8 +570,8 @@ final class LinkSend {
             if (item.fileSize > 0) {
                 offset = negotiateResume(s, item.mid, item.fileName, item.fileSize);
                 if (offset < 0) {
-                    // 2.12 / D16：这是"解除拦截后自动发的那**一次**续传请求"没得到应答
-                    // ⇒ 不从头重发、保持暂停，等气泡上的"继续"或下次握手（你点的"没收到就暂停，手动才重试"）
+                    // 这是"解除拦截后自动发的那**一次**续传请求"没得到应答
+                    // ⇒ 不从头重发、保持暂停，等气泡上的"继续"或下次握手
                     pauseInFlight(item, dirId, agg);
                     return;
                 }
@@ -613,7 +611,7 @@ final class LinkSend {
                             return;
                         }
                         if (L.fileGateBlocked()) {
-                            // 2.12 / D16：在传的遇到投票=1 ⇒ 在**下一个分片边界**就地结束本次尝试
+                            // 在传的遇到投票=1 ⇒ 在**下一个分片边界**就地结束本次尝试
                             //   （不在已入队的字节中间动手 ⇒ 线上一条帧都不会被劈开）
                             pauseInFlight(item, dirId, agg);
                             return;
@@ -644,7 +642,7 @@ final class LinkSend {
                             sent += len;
                             // 发送停滞看门狗（v2.8）：每写出一块刷新「最近进度时刻」
                             L.sendLastAt.put(item.mid, System.currentTimeMillis());
-                            // 速率采样（字节级，2026-09-22）：进度是整数百分比，大文件太粗 → 气泡速率靠这里
+                            // 速率采样（字节级）：进度是整数百分比，大文件太粗 → 气泡速率靠这里
                             Speeds.sample(item.mid, sent);
                             if (agg != null) {
                                 agg.add(len);
@@ -669,7 +667,7 @@ final class LinkSend {
                         }
                         // 这块发完了：**必须归还**给 free 队列，读线程才能继续填下一块。
                         // 只有 2 块缓冲，不还的话发完 2×4MB 后读线程永远阻塞在 free.take()，
-                        // 消费端卡死在 ready.take() —— 大文件必然卡住（2026-09-13 实测踩坑）。
+                        // 消费端卡死在 ready.take() —— 大文件必然卡住。
                         reader.recycle(e.buf);
                     }
                 } finally {
@@ -723,7 +721,7 @@ final class LinkSend {
             L.cancelled.remove(item.mid);
             if (t instanceof SourceException) {
                 // **本地**读不了源文件（被删 / 被占用 / 无权限）：链路本身是好的，
-                // 因此绝不关连接（老逻辑在这里误杀连接，把后续所有传输一起带走），
+                // 因此绝不关连接（误杀连接会把后续所有传输一起带走），
                 // 也不进待发队列（重试同样是失败，只会无限循环）。
                 L.log("文件发送失败（本地源不可读）" + item.fileName + "：" + t.getMessage());
                 // 对端可能已建好半成品：通知它删掉，免得留下残缺文件在「已接收」里
@@ -731,7 +729,7 @@ final class LinkSend {
                 if (throwOnFail) {
                     throw (SourceException) t;
                 }
-                // ⚠ 必须**出队**（2026-09-21）：doSendFile 入口已 addPending，不清掉的话
+                // ⚠ 必须**出队**：doSendFile 入口已 addPending，不清掉的话
                 //   每次握手补发都会重放这条读不了的文件；几十条积压时就是反复雪崩。
                 if ((dirId == null || dirId.isEmpty()) && agg == null && L.store != null) {
                     L.store.removePending(item.mid);

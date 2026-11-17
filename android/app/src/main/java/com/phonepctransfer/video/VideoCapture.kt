@@ -20,12 +20,9 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
- * Camera2 封装：枚举 / 打开 / 关闭 / 切换摄像头 / 方向 / 镜像（计划 §5.2 / §5.4）。
- *
- * 一期（方案 B）链路：`captureSession ──► encoderInputSurface`（+ 可选的本地预览 Surface）。
- * 二期（2026-09-22）：encoderInputSurface 换成 [GlRotatePipe] 的 GL 输入 ST —— 相机帧先转正
- * 再进编码器，发出的数据方向就是正的；本地预览仍直喂预览 Surface（路径保持一期原样）。
- *
+ * Camera2 封装：枚举 / 打开 / 关闭 / 切换摄像头 / 方向 / 镜像。
+ * 链路：`captureSession ──► encoderInputSurface`（+ 可选的本地预览 Surface）；encoderInputSurface 是 [GlRotatePipe] 的 GL 输入 ST——
+ * 相机帧先转正再进编码器，发出的数据方向就是正的；本地预览仍直喂预览 Surface。
  * ⚠ 线程红线：openCamera / createCaptureSession 都是异步回调，全部跑在私有
  * `pp-video-cam` HandlerThread 上；**绝不在网络读线程里调用本类任何方法**。
  */
@@ -136,15 +133,11 @@ class VideoCapture(
     val cameraLabel: String get() = if (isFront) "前置" else "后置"
 
     /**
-     * 把本机传感器原生方向的画面**转正**所需的顺时针角度（0/90/180/270）。
-     *
-     * 二期（2026-09-22）：这个角喂给 [GlRotatePipe] 在发送端 GL 里旋转——
-     * **发出的数据方向就是正的**，接收端默认零旋转。
-     *
+     * 把本机传感器原生方向的画面**转正**所需的顺时针角度（0/90/180/270）：
+     * 这个角喂给 [GlRotatePipe] 在发送端 GL 里旋转——**发出的数据方向就是正的**，接收端默认零旋转。
      * 自动值 = `SENSOR_ORIENTATION ∓ display.rotation`，即「设备**当前**握姿」下的补偿：
-     * 竖持返回 sensor 值、横持会差 90°。**必须读到真实的 display.rotation**——
-     * 2026-09-15 实测缺陷：原实现用 `ctx.display`（应用上下文恒抛异常 → 回落 0），
-     * 于是**永远按竖持算**，横持时对端画面恒定歪 90°（用户报「需向左转 90 才正」）。
+     * 竖持返回 sensor 值、横持会差 90°。**必须读到真实的 display.rotation**（用 `ctx.display` 会恒抛异常回落 0，
+     * 永远按竖持算，横持时对端画面恒定歪 90°）。
      */
     fun rotationDegrees(): Int {
         val display = displayRotationDegrees()
@@ -156,10 +149,8 @@ class VideoCapture(
     }
 
     /**
-     * 读真实 display 旋转。
-     *
-     * ⚠ **不能用 `Context.getDisplay()`**：本类是应用上下文（`CallManager(link, app)`），
-     * 非可视上下文在 API 30+ 上恒抛 UnsupportedOperationException → 只能靠 DisplayManager
+     * 读真实 display 旋转：⚠ **不能用 `Context.getDisplay()`**（本类是应用上下文（`CallManager(link, app)`），
+     * 非可视上下文在 API 30+ 上恒抛 UnsupportedOperationException）→ 只能靠 DisplayManager
      * 取默认显示（任意上下文可用，且返回的是窗口管理器当前的实际旋转）。
      */
     private fun displayRotationDegrees(): Int {
@@ -182,11 +173,9 @@ class VideoCapture(
     }
 
     /**
-     * 握姿变化回调（旋转角变了才会触发，已去重）。
-     *
-     * 上层（[com.phonepctransfer.video.VideoCall]）收到后要**重发一次 `video_cfg`**：
-     * 采集画面本身没变（一期不做 GL），变的是「对端该怎么转」，只有重发 cfg 才能生效。
-     * 回调跑在 `pp-video-cam` 线程上。
+     * 握姿变化回调（旋转角变了才会触发，已去重；跑在 `pp-video-cam` 线程上）：
+     * 上层（[com.phonepctransfer.video.VideoCall]）收到后要**重发一次 `video_cfg`**——
+     * 采集画面本身没变，变的是「对端该怎么转」，只有重发 cfg 才能生效。
      */
     @Volatile
     var onRotationChanged: ((Int) -> Unit)? = null
@@ -198,15 +187,11 @@ class VideoCapture(
     // ==================== 开 / 关 ====================
 
     /**
-     * 把想要的预览流尺寸**吸附到本机相机真正支持的 SurfaceTexture 输出尺寸**。
-     *
-     * 背景（2026-09-16 a12 实锤）：`setDefaultBufferSize` 钉的尺寸 = Camera2 给该
-     * target 配流的尺寸，HAL **不支持的尺寸会建会话失败/不出帧**（854x480 在
-     * a12/a16 的 StreamConfigurationMap 里都不存在 → 480P 档黑屏）。
-     *
+     * 把想要的预览流尺寸**吸附到本机相机真正支持的 SurfaceTexture 输出尺寸**：
+     * `setDefaultBufferSize` 钉的尺寸 = Camera2 给该 target 配流的尺寸，HAL **不支持的尺寸会建会话失败/不出帧**
+     *（854x480 在 a12/a16 的 StreamConfigurationMap 里都不存在 → 480P 档黑屏）。
      * 吸附策略：完全一致 → 原样；否则优先**同宽高比（±2%）**里面积最接近的，
      * 没有同比例的就全表面积最接近的。查询失败一律原样返回（老路径兜底）。
-     *
      * @return [width, height]（可能是吸附后的值）
      */
     fun pickPreviewSize(w: Int, h: Int): IntArray {
@@ -244,10 +229,8 @@ class VideoCapture(
     }
 
     /**
-     * 打开摄像头并建立会话。
-     *
-     * @param surfaces 采集目标（**第一个必须是编码器输入 Surface**，其后可跟预览 Surface）
-     * @return false = 无摄像头 / 参数不合法（真正打开是异步的，失败走 [onError]）
+     * 打开摄像头并建立会话：surfaces=采集目标（**第一个必须是编码器输入 Surface**，其后可跟预览 Surface）；
+     * false = 无摄像头 / 参数不合法（真正打开是异步的，失败走 [onError]）。
      */
     fun start(surfaces: List<Surface>, fps: Int = 30): Boolean {
         // 新一轮采集开始：清掉上一轮 stop() 留下的 stopping 标志
@@ -265,7 +248,7 @@ class VideoCapture(
         fpsRange = Range(fps, fps)
 
         // 握姿监听：横竖持切换 → display.rotation 变 → 重算旋转角并让上层重发 video_cfg。
-        // 一期画面不做 GL 旋转，**只有重发 cfg 才能纠正对端**，所以这一步是必需的。
+        // 采集画面本身没变，变的是「对端该怎么转」，**只有重发 cfg 才能纠正对端**，所以这一步是必需的。
         reportedRot = -1
         runCatching { displayMgr?.registerDisplayListener(displayListener, ensureThread()) }
 
@@ -448,9 +431,7 @@ class VideoCapture(
     }
 
     /**
-     * 切换前后摄（R8）。
-     *
-     * **复用同一个编码输入 Surface**：只换相机 + 重建 captureSession，
+     * 切换前后摄（R8）：**复用同一个编码输入 Surface**，只换相机 + 重建 captureSession，
      * `MediaCodec` 不重建、码流不中断（切完由上层发一条 video_cfg 通知新的 rot）。
      */
     fun switchCamera(): Boolean {

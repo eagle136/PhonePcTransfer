@@ -5,8 +5,8 @@ rem  Compile with Android Studio JBR, target Java 17, then run
 rem  make-msi.sh via Git Bash to produce the MSI in out\.
 rem  NOTE: keep this file ASCII-only (no Chinese).
 rem  Usage: run from project root (sources live in pc\src).
-rem    build.bat            jar + MSI (APP_VER defaults to 1.0.1)
-rem    build.bat 1.0.8      jar + MSI, override APP_VER
+rem    build.bat            jar + MSI (APP_VER defaults to 1.2)
+rem    build.bat 1.3        jar + MSI, override APP_VER
 rem  For jar-only build use build-jar.bat instead.
 rem ============================================================
 setlocal enabledelayedexpansion

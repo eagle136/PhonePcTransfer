@@ -38,14 +38,10 @@ import java.util.concurrent.locks.ReentrantLock
 
 import com.phonepctransfer.net.Link.Session
 
-// ======================================================================
-// 接收管线（v2.7 拆分自 Link.kt）：Rx/DirRx 状态、文件/文件夹接收、落盘与校验。全部为 Link 的扩展函数。
-// ======================================================================
+// 接收管线(拆分自 Link.kt):Rx/DirRx 状态、文件/文件夹接收、落盘与校验;全部为 Link 扩展函数
 
 /**
- * 接收进度帧的界面限流窗口（毫秒），与 PC 端 `LinkReceive.UI_THROTTLE_MS` 同值同口径。
- * 局域网传大文件时「整百分之一」一帧可一秒上百帧，每帧都要过一遍 ui{} + Compose 重组，
- * 界面会长时间停在旧百分比上；5Hz 刷新对进度条完全够用。终态帧（完成/失败/暂停）不受限流影响。
+ * 接收进度帧的界面限流窗口(毫秒,与 PC 端同值):局域网传大文件时进度帧可一秒上百帧,5Hz 刷新对进度条足够;终态帧(完成/失败/暂停)不受限流
  */
 internal const val UI_THROTTLE_MS = 200L
 
@@ -57,10 +53,7 @@ internal class Rx(
         val peerIp: String,
         /** 所属目录气泡 mid；空 = 普通单文件 */
         val dirId: String,
-        /**
-         * 文件夹成员在目录内的相对路径（普通单文件为空）。
-         * 接收端用它回答「哪个成员没到」—— dir_end 核对时与对端清单求差集。
-         */
+        /** 文件夹成员在目录内的相对路径(普通单文件为空);dir_end 核对时与对端清单求差集判「哪个成员没到」 */
         val relPath: String,
         /** 落盘位置描述（人看的文案） */
         var desc: String,
@@ -90,19 +83,14 @@ internal class Rx(
         var pendingLen = 0
         @Volatile var writerAlive = true
         /**
-         * 落盘线程**正在**写盘：缓冲已被取走（pending=null）但 sink.write() 还没返回。
-         * ⚠️ 收尾判据必须是「pending 为空 **且** writeBusy 为假」—— 只看 pending 会在最后一块
-         * 还握在写盘线程手里时就关流，落出 0 字节/截断文件，而 digest 只校验收到的字节，
-         * 照样报「校验通过」（2026-09-17 实测 75 个文件里有 3 个被这样写坏）。
+         * 落盘线程正在写盘:缓冲已被取走(pending=null)但 sink.write() 还没返回。
+         * 收尾判据必须是「pending 为空且 writeBusy 为假」,否则会在 sink.write() 中途关流落出 0 字节/截断文件,而 digest 照样判校验通过
          */
         var writeBusy = false
         /** 已成功写进 sink 的字节数（诊断用） */
         @Volatile var writtenBytes = 0L
         var writer: Thread? = null
-        /**
-         * 最近一次收到真实进度（分片追加成功 / 写盘成功）的时刻 —— 接收停滞看门狗的依据。
-         * 更新点两处：onChunk 成功 appendToRx 后、写盘线程 sink.write 成功后。
-         */
+        /** 最近一次收到真实进度(分片追加成功/写盘成功)的时刻——接收停滞看门狗的依据;成功 append 后、写盘成功后各更新 */
         @Volatile var lastProgressAt = System.currentTimeMillis()
     }
 
@@ -142,10 +130,7 @@ internal class DirRx(
         var finished = false
         /** 收尾时刻（回收最旧的成品目录用） */
         var finishedAt = 0L
-        /**
-         * 最近一次活动（dir_meta / 成员 chunk / 成员 file_done / 成员被中止）。
-         * 未完成目录闲置 10 分钟即回收（防「没走到 dir_end 的目录永留」，见 pruneDirs）。
-         */
+        /** 最近一次活动(dir_meta/成员 chunk/成员 file_done/成员被中止);未完成目录闲置 10 分钟即回收(见 pruneDirs) */
         var lastActivity: Long = System.currentTimeMillis()
 
         /** 本轮还没到的成员（expect 有清单时精确到项；无清单时用空串占位表示「差 N 项」） */
@@ -304,8 +289,7 @@ internal fun Link.abortRx(rx: Rx) {
     }
 
     /**
-     * 会话断开：中止该对端名下所有活动接收。文件与 partials 注册表原样保留 ——
-     * 对端重连后 file_query 仍可命中续传；若对端永久放弃，过期清理会兜底回收。
+     * 会话断开:中止该对端名下所有活动接收;文件与 partials 注册表原样保留(对端重连后 file_query 仍可命中续传,永久放弃则由过期清理兜底回收)
      */
 internal fun Link.abortRxsFor(peerIp: String) {
         val aborted = mutableListOf<Rx>()
@@ -329,23 +313,15 @@ internal fun Link.abortRxsFor(peerIp: String) {
         if (aborted.isNotEmpty()) {
             log("会话断开，中止 ${aborted.size} 路接收（半成品保留，重传自动续传）")
         }
-        // 顺带回收目录记录（未完成目录闲置 10 分钟兜底 / 成品超限量）——
-        // 平时心跳线程每 5s 也会跑，断链此刻立即跑一次，不等下一个心跳（plan 03）
+        // 顺带回收目录记录(未完成目录闲置 10 分钟兜底/成品超限量),此刻立即跑一次不等下个心跳;
+        // 顺带回收超龄半成品(只回收 ts 超 3 天的条目,不碰为续传/停滞保留的新鲜半成品)
         pruneDirs()
-        // 顺带回收超龄半成品（plan 07）：「取消帧丢失/中途废弃」的孤儿条目不必等到下次启动；
-        // purge 只回收 ts 超 3 天的条目，不碰为续传/停滞保留的新鲜半成品，语义不冲突
         store?.purgeStalePartials(Link.PARTIAL_MAX_AGE_MS)
     }
 
     /**
-     * 接收停滞看门狗：某路接收 30s 无任何进度（对端半死但 TCP 心跳仍正常）时中止该路。
-     * 由心跳线程每 [Link.STALL_SCAN_MS] 顺带调用（不新开线程）。
-     *
-     * 触发条件（全部满足）：
-     *  1. now - lastProgressAt > 30s；
-     *  2. pending == null && !writeBusy（写盘线程手里没有缓冲，磁盘是活的）；
-     *  3. 在 rxMap 锁内二次确认并**先摘通道** —— 之后的 file_done/file_cancel/onChunk
-     *     都查不到这条 rx，不会与收尾竞态。
+     * 接收停滞看门狗:某路接收 30s 无任何进度(对端半死但 TCP 心跳仍正常)时中止该路(心跳线程每 5s 顺带调用)。
+     * 触发条件:now-lastProgressAt>30s 且 pending==null 且 !writeBusy;在 rxMap 锁内二次确认并先摘通道,避免与收尾竞态
      */
     internal fun Link.scanStalledRx() {
         val now = System.currentTimeMillis()
@@ -366,21 +342,18 @@ internal fun Link.abortRxsFor(peerIp: String) {
     }
 
     /**
-     * 停滞中止：断链 abortRx 的超时触发版，**不删文件、不清 partials** ——
-     * 半成品保留，对端重连后 file_query 命中注册表自动续传。
-     * 调用方（scanStalledRx）已在锁内把 mid 从 rxMap 摘掉。
+     * 停滞中止:断链 abortRx 的超时触发版(不删文件、不清 partials,半成品保留供对端重连续传);
+     * 调用方已在锁内把 mid 从 rxMap 摘掉
      */
     internal fun Link.stallAbort(rx: Rx) {
-        // 1. 把双缓冲中已完整收到的字节全部落盘，进度最大化。
-        //    正确性：发送按 CHUNK_SIZE 切片、seq 严格顺序，停滞时缓冲内容必为 CHUNK 对齐
-        //    （只有文件最后一块才可能非对齐，而那会立刻 file_done）→ 落盘量满足 onFileQuery
-        //    的 aligned 判定，续传 offset 有效。
+        // 1. 把双缓冲中已完整收到的字节全部落盘,进度最大化;缓冲内容必为 CHUNK 对齐
+        //    (发送按 CHUNK_SIZE 切片、seq 严格顺序)→ 落盘量满足 aligned 判定,续传 offset 有效
         try {
             flushRxNow(rx)
         } catch (_: InterruptedException) {
         }
-        // 等最后一块写完再关流（writeBusy 时关流会在 sink.write() 中途截断）。
-        // 加 10s 上限：万一磁盘恰好卡死，不让心跳线程被永久拖住（拖住会停掉断链检测）。
+        // 等最后一块写完再关流(writeBusy 时关流会在 sink.write() 中途截断);
+        // 加 10s 上限:万一磁盘恰好卡死,不让心跳线程被永久拖住(拖住会停掉断链检测)
         synchronized(rx.flushLock) {
             val deadline = System.currentTimeMillis() + 10_000L
             while (rx.pending != null || rx.writeBusy) {
@@ -391,8 +364,8 @@ internal fun Link.abortRxsFor(peerIp: String) {
         }
         // 2. 停写线程、关流（不删文件、不清注册表）
         abortRx(rx)
-        // 单文件：记「暂停过」标记 —— 下一个进度帧（file_meta 重到 / 续传首 chunk）
-        // 到达时气泡回「发送中」。目录成员不需要：首个续传 chunk 本就把目录气泡发成 SENDING。
+        // 单文件:记「暂停过」标记,下一个进度帧(file_meta 重到/续传首 chunk)到达时气泡回「发送中」;
+        // 目录成员不需要(首个续传 chunk 本就把目录气泡发成 SENDING)
         if (rx.dirId.isEmpty()) pausedMids.add(rx.mid)
         // 3. 注册表最后补一次，确保 received 与磁盘一致
         store?.putPartial(rx.mid, rx.uri, rx.name, rx.size, rx.received)
@@ -427,8 +400,7 @@ internal fun Link.abortRxsFor(peerIp: String) {
 
     /**
      * 新建接收通道。dirId 非空时按「文件夹名/相对路径」落盘。
-     *
-     * @param peerIp 发起这次传输的对端 IP —— 收到的气泡挂到它名下（归属由会话决定）
+     * peerIp = 发起这次传输的对端 IP(收到的气泡挂到它名下,归属由会话决定)
      */
 internal fun Link.createRx(
         mid: String, name: String, size: Long, peerIp: String, mime: String,
@@ -463,11 +435,9 @@ internal fun Link.createRx(
     }
 
     /**
-     * 对端开传前问本端有没有半成品。三种情况：
-     *  1. 活动通道还在（上次会话刚断）→ 冲掉未落盘缓冲，原地续传（sink/digest 都还热着）；
-     *  2. 这条 mid 本端**已经存好一份完整的** → 直接答「收全了」，让对方一个字节都不发；
-     *  3. 注册表里有半成品（对端重启过）→ 追加打开、重算前缀摘要，准备好续传通道；
-     *  4. 都没有 → 从头传。
+     * 对端开传前问本端有没有半成品:
+     *  1. 活动通道还在(上次会话刚断)→ 冲掉未落盘缓冲,原地续传; 2. 本端已存好完整一份 → 直接答「收全了」;
+     *  3. 注册表里有半成品(对端重启过)→ 追加打开、重算前缀摘要,准备好续传通道; 4. 都没有 → 从头传
      */
 internal fun Link.onFileQuery(s: Session, j: JSONObject) {
         val mid = j.optString("mid")
@@ -525,10 +495,8 @@ internal fun Link.partialSize(uri: String): Long = if (uri.isEmpty()) 0L
     else runCatching { File(uri).length() }.getOrDefault(0L)
 
     /**
-     * 这条 mid 本端是否已经存成过一份**完整**的收讫文件；是 → 返回磁盘上的实际字节数，否 → 0。
-     *
-     * 历史里标 OK 还不够，必须文件真的还在、字节数与对端声明值对得上（与 PC 端
-     * `dupSavedPath` 同一套判据）。用户删掉收到的文件后想重收，这里就判不出来 → 照常收。
+     * 这条 mid 本端是否已存成过一份完整的收讫文件(是→返回磁盘实际字节数,否→0);
+     * 文件必须真的还在、字节数与对端声明值对得上(与 PC 端 dupSavedPath 同判据);用户删掉文件后重收则照常收
      */
 internal fun Link.savedCompleteSize(peerIp: String, mid: String, declaredSize: Long): Long {
         if (mid.isEmpty()) return 0L
@@ -606,10 +574,8 @@ internal fun Link.onFileFrame(s: Session, j: JSONObject) {
                 runCatching {
                     var rx = synchronized(rxMap) { rxMap[mid] }
                     if (rx == null) {
-                        // 重复投递闸门：同一条 mid 本端已经存好一份完整的了（对端重启丢了
-                        // 送达台账、或它自己那条补发路径又跑了一遍）→ 回 ack、绝不建第二个
-                        // 接收通道，否则 createRx 会另起一个唯一名 → 落盘多出一份 (1)。
-                        // 文件夹成员不判：成员 mid 不进本端 FILE 历史，判了会误拦 dir_missing 补发。
+                        // 重复投递闸门:同一条 mid 本端已存好一份完整的 → 回 ack、绝不建第二个接收通道
+                        // (否则 createRx 会另起唯一名,落盘多出一份 (1));文件夹成员不判(成员 mid 不进 FILE 历史,判了会误拦 dir_missing 补发)
                         if (dirId.isEmpty()) {
                             val saved = savedCompleteSize(s.remoteIp, mid, size)
                             if (saved > 0L) {
@@ -645,10 +611,8 @@ internal fun Link.onFileFrame(s: Session, j: JSONObject) {
                                 mid = mid, dir = Dir.PEER, kind = Kind.FILE, fileName = name,
                                 fileSize = size, filePath = "", localUri = r.uri, progress = 0,
                                 ts = j.optLong("ts", System.currentTimeMillis()), peerIp = r.peerIp,
-                                // 一个字节都还没收 → 在途就是 SENDING。旧代码标 OK 的后果（与 PC 端
-                                // 2026-09-30 修的同源）：AppCore.updateMessage 把 OK 当终态补写历史，
-                                // 每个 1% 进度帧都 append 一行（历史文件被灌爆、每次切会话全量重读），
-                                // addMessage 的 clearSpeed 又把速率采样器提前回收 → 传输中看不到速率。
+                                // 在途进度帧一律 SENDING(旧代码标 OK 的后果:AppCore.updateMessage
+                                // 把每个 1% 都当终态补写历史,历史文件被灌爆、速率采样器又被提前回收)
                                 status = Status.SENDING
                             )
                         )
@@ -668,17 +632,16 @@ internal fun Link.onFileFrame(s: Session, j: JSONObject) {
                     ioOk = false
                     log("落盘收尾失败 ${rx.name}: ${it.message}")
                 }
-                // 落盘实测：rx.digest 校的是「网络收到的字节」，磁盘被写空/截断它照样判通过，
-                // 所以关流后必须再量一次磁盘真实字节数（修完 writeBusy 后这里应当恒等）
+                // 落盘实测:digest 校的是「网络收到的字节」,磁盘被写空/截断它照样判通过,
+                // 所以关流后再量一次磁盘真实字节数
                 val diskSize = diskSizeOf(rx)
                 val sizeOk = diskSize < 0 || diskSize == rx.received
                 if (!sizeOk) {
                     ioOk = false
                     log("落盘字节数不符 ${rx.name}：磁盘 ${diskSize}B ≠ 应收 ${rx.received}B")
                 }
-                // 再和「对端声明的文件大小」比一次：发送端源被截断（SAF 读到底、传中被改小）时，
-                // sha256 算的是**实际发出的那些字节**，照样判通过 → 半截文件会被标成已保存。
-                // 只判「收少了」；声明值偏小（个别提供器估报大小）不判失败，免得把能用的传输判死。
+                // 再和「对端声明的文件大小」比一次:源被截断时 sha256 算的是实际发出的字节,照样判通过;
+                // 只判「收少了」,声明值偏小(提供器估报大小)不判失败,免得把能用的传输判死
                 if (rx.size > 0 && rx.received < rx.size) {
                     ioOk = false
                     log("实收字节少于声明 ${rx.name}：实收 ${rx.received}B < 声明 ${rx.size}B")
@@ -730,10 +693,8 @@ internal fun Link.onFileFrame(s: Session, j: JSONObject) {
                                 peerIp = dir.peerIp
                             )
                         )
-                        // 数量收齐只是**兜底**判据（老发送端不发 dir_end）；新发送端一律以 dir_end 核对为准。
-                        // 目录**不从 dirMap 移除**：成品目录保留给「重发 / 补发」复用 —— 否则同一
-                        // 文件夹重传会另建「文件夹 (1)」，用户看到的正是「原文件夹里少了文件」。
-                        // 保留态由 pruneDirs() 限量回收（会话断开时清空）。
+                        // 数量收齐只是兜底判据(老发送端不发 dir_end),新发送端一律以 dir_end 核对为准;
+                        // 目录不从 dirMap 移除:成品目录保留给重发/补发复用,保留态由 pruneDirs() 限量回收
                         if (allDone) dir.finished = true
                     }
                     log("文件夹成员完成 ${rx.name}（${dir.doneFiles}/${dir.count}）校验=${if (okSha) "通过" else "失败"}")
@@ -752,8 +713,7 @@ internal fun Link.onFileFrame(s: Session, j: JSONObject) {
                     log("文件接收完成 ${rx.name} ${rx.received} B 校验=${if (okSha) "通过" else "失败"}")
                 }
                 sendOrDrop(s, Protocol.ack(mid, ioOk && okSha), "ack")
-                // 触发过续传的普通单文件：后台算落盘文件的 MD5 回发对端核对
-                //（异步不阻塞接收线程；发送端有超时兜底，这边算不完对端只记超时日志）
+                // 触发过续传的普通单文件:后台算落盘文件的 MD5 回发对端核对(异步不阻塞接收线程;这边算不完对端只记超时日志)
                 if (ioOk && okSha && rx.startAt > 0 && rx.dirId.isEmpty()) {
                     Thread({
                         val md5 = md5Of(openSource(Uri.parse(rx.uri)))
@@ -841,9 +801,8 @@ internal fun Link.onChunk(s: Session, mid: String, seq: Int, data: ByteArray, le
                     rx.lastUiAt = nowUi
                     // 从「已暂停」恢复：续传首个 chunk → 气泡回「发送中」（清标记）
                     pausedMids.remove(mid)
-                    // 在途进度帧一律 SENDING（与 PC 端同口径）：以前非续传帧标 OK，
-                    // AppCore.updateMessage 会把每个 1% 都当终态补写进历史（磁盘灌爆），
-                    // 传输中气泡还显示成完成态、速率数字被 clearSpeed 提前回收。
+                    // 在途进度帧一律 SENDING(以前非续传帧标 OK,AppCore.updateMessage 会把每个 1%
+                    // 都当终态补写进历史(磁盘灌爆)、传输中气泡显示成完成态、速率数字被提前回收)
                     listener?.onMessageUpdated(
                         MsgItem(
                             mid = mid, dir = Dir.PEER, kind = Kind.FILE, fileName = rx.name,
@@ -886,8 +845,8 @@ internal fun Link.onDirMeta(s: Session, j: JSONObject) {
                 dir.total = total
                 dir.skipped = skipped
                 dir.lastActivity = System.currentTimeMillis()
-                // 同一 mid 又来一轮 dir_meta = 对端重发整个文件夹（断链后从待发队列补发）。
-                // 上一轮已收尾 → 计数与清单清零重算，目录**就地复用**（不新建「文件夹 (1)」）。
+                // 同一 mid 又来一轮 dir_meta = 对端重发整个文件夹(断链后从待发队列补发):
+                // 上一轮已收尾 → 计数与清单清零重算,目录就地复用(不新建「文件夹 (1)」)
                 if (dir.finished) {
                     dir.doneFiles = 0
                     dir.doneBytes = 0L
@@ -896,8 +855,8 @@ internal fun Link.onDirMeta(s: Session, j: JSONObject) {
                     dir.got.clear()
                     dir.bad.clear()
                 }
-                // 有清单用新清单；没有（对端老端 / 清单超限被丢弃）必须**清空旧清单** ——
-                // 否则同一 mid 重发时残留的上一轮清单会用来核对，误报一堆「缺失」
+                // 有清单用新清单;没有(对端老端/清单超限被丢弃)必须清空旧清单
+                // —— 否则同一 mid 重发时残留的上一轮清单会用来核对,误报一堆「缺失」
                 dir.expect = if (hasList) HashSet(list) else HashSet()
                 dir.finished = false
             }
@@ -927,12 +886,8 @@ internal fun Link.onDirMeta(s: Session, j: JSONObject) {
     }
 
     /**
-     * 文件夹收尾（v2.6，对端 dl=1 时才有）。
-     *
-     * 老流程接收端没有「对端发完了」这个信号，只能靠 `doneFiles >= count` 猜；成员在发送端
-     * 被跳过或发送失败时永远等不到 → **静默缺文件**。新流程由 dir_end 明确收尾：
-     *  ① 有清单：与实收清单求差集，缺失项回发 dir_missing 让对端补发；
-     *  ② last=1（对端不再补发）：无论是否缺件都定稿，缺件则明确标失败并逐项列出。
+     * 文件夹收尾(对端 dl=1 时才有):由 dir_end 明确收尾(老流程只能靠数量猜,会静默缺文件)。
+     * ① 有清单:与实收清单求差集,缺失项回发 dir_missing 让对端补发;② last=1(对端不再补发):无论是否缺件都定稿,缺件则明确标失败并逐项列出
      */
 internal fun Link.onDirEnd(s: Session, j: JSONObject) {
         val mid = j.optString("mid")
@@ -953,8 +908,8 @@ internal fun Link.onDirEnd(s: Session, j: JSONObject) {
         }
         val stamp = System.currentTimeMillis()
         if (!hasList) {
-            // 无清单 → 无法用回执表达「缺哪些」（空回执只能表示收齐，会误导对端）。
-            // 本端仍如实定稿：缺件就明确标失败；发送端那边等一拍超时后自行定稿。
+            // 无清单→无法用回执表达「缺哪些」(空回执只能表示收齐,会误导对端);
+            // 本端仍如实定稿(缺件标失败),发送端那边等一拍超时后自行定稿
             synchronized(dir) { dir.finished = true; dir.finishedAt = stamp }
             finishDirReceiving(dir, emptyList(), lack)
             return
@@ -1023,17 +978,9 @@ internal fun Link.finishDirReceiving(dir: DirRx, missing: List<String>, lack: In
     }
 
     /**
-     * 回收成品目录记录。**刻意保留**最近若干条成品目录：同一 mid 重发（断链后从待发
-     * 队列补发整目录）时复用它，才不会另建「文件夹 (1)」——那正是用户看到的「原文件夹
-     * 里少了文件」。
-     */
-    /**
-     * 回收目录记录：
-     *  ① **未收尾且闲置 10 分钟**（且无活动成员）→ 回收。防「没走到 dir_end 的 DirRx 永留」
-     *     （成员被停滞中止 / 会话断开后对端永不重连的场景）。
-     *  ② 成品目录超出 [MAX_KEEP_DIRS] → 回收最旧的。**刻意保留**最近若干条：同一 mid 重发
-     *     （断链后从待发队列补发整目录）时复用它，才不会另建「文件夹 (1)」。
-     * 由心跳线程每 [Link.STALL_SCAN_MS] 顺带调用 + 每次目录定稿时调用。
+     * 回收目录记录:① 未收尾且闲置 10 分钟(且无活动成员)→ 回收,防没走到 dir_end 的 DirRx 永留;
+     * ② 成品目录超出 [MAX_KEEP_DIRS] → 回收最旧的(刻意保留最近若干条:同一 mid 重发时复用,不另建「文件夹 (1)」)。
+     * 由心跳线程每 [Link.STALL_SCAN_MS] 顺带调用 + 每次目录定稿时调用
      */
 internal fun Link.pruneDirs() {
         val now = System.currentTimeMillis()

@@ -10,9 +10,8 @@ data class SharedItem(val uri: Uri, val name: String, val size: Long)
 
 /**
  * 一次分享的内容。文件与纯文本二选一（两者都没有时 [ShareIn.parse] 返回 null）。
- *
- * 注意：分享给的读权限是**临时**的（跟着收到 Intent 的 Activity 走，不是持久授权），
- * 所以 [uri] 只在本次应用存活期内可读 —— 详见 AppCore.shareTo 里对「没连上就先落盘」的处理。
+ * 分享给的读权限是**临时**的（跟着收到 Intent 的 Activity 走，不是持久授权），
+ * 所以 [uri] 只在本次应用存活期内可读——详见 AppCore.shareTo 里对「没连上就先落盘」的处理。
  */
 data class SharedPayload(val items: List<SharedItem>, val text: String?) {
 
@@ -32,10 +31,8 @@ data class SharedPayload(val items: List<SharedItem>, val text: String?) {
 }
 
 /**
- * 解析系统「分享」Intent（ACTION_SEND / ACTION_SEND_MULTIPLE，manifest 里注册的是全部 MIME 类型）。
- *
- * 取数优先级：EXTRA_STREAM（文件/图片/视频/音频…）> EXTRA_TEXT（纯文本分享）。
- * 两者都为空就返回 null（比如某些应用只发一个空 Intent），调用方直接忽略。
+ * 解析系统「分享」Intent（ACTION_SEND / ACTION_SEND_MULTIPLE，manifest 里注册的是全部 MIME 类型）：
+ * 取数优先级 EXTRA_STREAM（文件/图片/视频/音频…）> EXTRA_TEXT（纯文本分享）；两者都为空就返回 null（比如某些应用只发一个空 Intent），调用方直接忽略。
  */
 object ShareIn {
 

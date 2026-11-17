@@ -3,8 +3,7 @@ package com.phonepctransfer.pc;
 import java.util.Locale;
 
 /**
- * 接收管线分阶段计时（诊断用，2026-10-30 加）。
- *
+ * 接收管线分阶段计时（诊断用）。
  * <p>每秒汇总一行 ASCII，写进 pc.log：
  * <pre>
  * [xfer] rx=131.2MB/s blk=31 read=412 copy=8 digest=0 wait=96 write=530 part=12 ms/s
@@ -18,7 +17,7 @@ import java.util.Locale;
  *   <li>write  落盘线程 sink.write()</li>
  *   <li>part   落盘线程重写 partials.json</li>
  * </ul>
- * <p>read 与 write/wait 分属两个线程，所以同一行加起来可能超过 1000ms —— 这是正常的。
+ * <p>read 与 write/wait 分属两个线程，所以同一行加起来可能超过 1000ms —— 正常。
  * 判定口径：read 接近 1000 = 网络侧封顶；wait+write 大 = 磁盘侧封顶；
  * digest+copy 大 = CPU 侧封顶。
  */

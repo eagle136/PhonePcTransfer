@@ -4,7 +4,7 @@
 #    （裸 `bash` 会解析到 system32\bash.exe 即 WSL，PATH/路径全不对）
 # 内部版本号按构建时刻（YYMMDDHHMM）编码递增 —— Windows Installer 相同 ProductVersion 不做
 # 覆盖安装、低版本直接拒装，所以每次构建都必须比上一次大，jpackage 生成的 MSI 自带
-# MajorUpgrade 会自动卸旧装新。对外版本号由 APP_VER 控制（默认 1.0.1）。
+# MajorUpgrade 会自动卸旧装新。对外版本号由 APP_VER 控制（默认 1.2）。
 # 用法：先把最新 jar 放好（pc/dist/PhonePcTransfer-PC.jar），再跑本脚本；产物拷进根目录 out/。
 set -e
 # 自动适配执行环境：Git Bash 下 pwd=/c/...，WSL bash 下 pwd=/mnt/c/...（bash 命令可能解析到 WSL）
@@ -24,9 +24,9 @@ WIX_DIR="${PP_WIX_DIR:-$PCROOT/tools/wix311}"
 export PATH="$WIX_DIR:$PATH"
 
 # ===== 版本号（2026-09-21 改版）=====
-# 对外版本（交付口径 / 文件名）：APP_VER，默认 1.0.1。
-#   覆盖：APP_VER=1.0.2 /usr/bin/bash make-msi.sh
-APP_VER="${APP_VER:-1.0.1}"
+# 对外版本（交付口径 / 文件名）：APP_VER，默认 1.2（2026-11-17 与安卓端统一口径）。
+#   覆盖：APP_VER=1.3 /usr/bin/bash make-msi.sh
+APP_VER="${APP_VER:-1.2}"
 
 # 内部 ProductVersion 必须严格递增（Windows Installer 同版本不覆盖安装、低版本直接拒装），
 # 而三段都有限制：major/minor <= 255、build <= 65535 —— 10 位时刻戳「YYMMDDHHMM」
@@ -61,11 +61,11 @@ if [ "$lastA" -gt "$PY" ] \
   echo "已有最大版本 $lastA.$lastB.$lastC 不低于本次时刻号 $PY.$PM.$PB → 递增"
   PY=$lastA; PM=$lastB; PB=$(( lastC + 1 ))
 fi
-# ⚠️ INTERNAL_VER：强制内部 ProductVersion 与对外版本号同号（如 1.1），
-#   仅在交付要求「内外一致」时用：APP_VER=1.1 INTERNAL_VER=1.1 bash make-msi.sh
+# ⚠️ INTERNAL_VER：强制内部 ProductVersion 与对外版本号同号（如 1.2），
+#   仅在交付要求「内外一致」时用：APP_VER=1.2 INTERNAL_VER=1.2 bash make-msi.sh
 #   代价 —— Windows Installer 认的是内部号：同号不覆盖安装、低版本直接拒装，
-#   所以固定成 1.1 之后 ① 下次改版必须换更大的内部号，
-#   ② 装过「内部 26.x」那版 1.1 的机器会被当成降级拒装，需先卸载。
+#   所以固定成 1.2 之后 ① 下次改版必须换更大的内部号，
+#   ② 装过「内部 26.x」那版 1.2 的机器会被当成降级拒装，需先卸载。
 VER="${INTERNAL_VER:-$PY.$PM.$PB}"
 echo "对外版本: $APP_VER    MSI ProductVersion: $VER（构建时刻 $ts）"
 

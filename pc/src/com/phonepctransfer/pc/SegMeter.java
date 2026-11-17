@@ -3,8 +3,7 @@ package com.phonepctransfer.pc;
 import java.util.Arrays;
 
 // ==================================================================
-// 分段延迟计量（任务单 1.2）——M1 / M9 的唯一证据来源（I12：不接受"听起来还行"）。
-//
+// 分段延迟计量 ——M1 / M9 的唯一证据来源（不接受"听起来还行"）。
 // 段名双端一致（改一处必须同时改 pc/SegMeter.java 与 android util/SegMeter.kt）：
 //   aEnc  本轮采集开始（含打包等待）→ Opus 编码完
 //   aTx   编码完 → sendAudioTo 返回（已交给传输）
@@ -14,13 +13,11 @@ import java.util.Arrays;
 //   vTx   编码输出回调 → sendVideoTo 返回
 //   vIn   读线程回调入口 → 解码队列入队完成
 //   vOut  解码队列出队 → 一帧交付 UI（PC：ffmpeg 输出一帧并回调返回）
-//
 // 首尾相接：发送侧 aEnc→aTx、接收侧 aIn→aBuf→aOut 各自无隙无叠。
 // **有意不计**的三段：采集线缓冲里已在飞的 2 帧（§1 归硬件/驱动段，单独报）、
 // write 返回后的播放缓冲（同上）、网络段（两端零点不同，测不了单程）。
 // PC 端 vOut 少算了 EDT 异步重绘（VideoWindow 用 repaintPending 合帧），
-// 上屏真实间隔由任务单 5 的 renderGapMs 交叉核对。
-//
+// 上屏真实间隔由 renderGapMs 交叉核对。
 // 热路径约束：record() 只做「一次无竞争锁 + 一次 int 写」，不拼字符串、不装箱；
 // 排序与拼行只在本类的 pp-seg-meter 线程里做（每秒一次）。
 // ==================================================================

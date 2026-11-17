@@ -5,7 +5,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 传输速率采样（2026-09-22 新增）：气泡里显示 `87%  0.95M/s`。
+ * 传输速率采样：气泡里显示 `87%  0.95M/s`。
  *
  * **与安卓端 `net/SpeedMeter.kt` + `data/MsgItem.kt TextUtil.speed` 同口径**，两端读到的数字
  * 必须能对上（同一个文件两端各算一次，采样点都是「本机已处理的字节数」）：

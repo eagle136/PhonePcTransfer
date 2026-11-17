@@ -36,21 +36,14 @@ import com.phonepctransfer.voice.CallManager
 import com.phonepctransfer.video.VideoLevel
 import java.io.File
 
-// ==================================================================
-// 剪贴板联动 + 语音/视频通话操作（v2.7 拆分自 AppCore.kt）。全部为 AppCore 的扩展函数。
-// ==================================================================
+// 剪贴板联动 + 语音/视频通话操作（均为 AppCore 的扩展函数）
 
-    /**
-     * onResume：应用可见了。焦点随后由 onWindowFocus(true) 触发读取。
-     * 两个入口都会调 pushClipIfChanged()，靠 sha1 去重 + 2s 去抖保证只同步一次。
-     */
+    /** onResume：应用可见（焦点读取由 onWindowFocus 触发）；两入口都走 pushClipIfChanged，sha1 去重 + 2s 去抖 */
 internal fun AppCore.onAppResumed() {
         appVisible = true
         refreshLan()
         link.flushPending()
-        // 回前台自愈：选定的那台设备没有**健康会话**（被系统冻结 / 息屏掐断 socket 后
-        // 会话已死，readLoop 判死会摘掉它）→ 重扫一轮，扫描末尾会自动连回「上次设备」
-        // （autoConnectLast；已知设备即便在后台也放行）。只认选定过的那台，不做盲目重连。
+        // 回前台自愈：选定设备无健康会话（被冻结/息屏掐断）→ 重扫一轮，扫描末尾自动连回上次设备
         if (running && selectedPeerIp != null && !link.isConnected()) {
             appendLog("回前台自愈：$selectedPeerIp 无健康会话，重新扫描并尝试连接")
             startScan()
@@ -70,10 +63,7 @@ internal fun AppCore.onAppPaused() {
         foregroundActive = false
     }
 
-    /**
-     * 窗口焦点变化 —— **这是剪贴板读取的唯一触发点**。
-     * 拿到焦点的这一刻才能读剪贴板（Android 10+ 焦点闸门）：读一次并同步。
-     */
+    /** 窗口焦点变化 —— 剪贴板读取的唯一触发点（Android 10+ 只有拿到焦点这一刻能读） */
 internal fun AppCore.onWindowFocus(hasFocus: Boolean) {
         if (hasFocus) {
             foregroundActive = true
@@ -83,25 +73,11 @@ internal fun AppCore.onWindowFocus(hasFocus: Boolean) {
         }
     }
 
-    /**
-     * 用户主动离开应用（HOME / 最近任务 / 切换应用）时调用。
-     * 新语义下不做任何读取：离开不触发同步，内容等下次焦点切回时再推。
-     */
+    /** 用户主动离开应用：不读不推（空实现，供 MainActivity 生命周期挂钩） */
 internal fun AppCore.onUserLeaveHint() {
-        // 纯被动模型：离开应用不读剪贴板（保留空实现，MainActivity 生命周期挂钩用）
     }
 
-    /**
-     * 读本机剪贴板，与上次推送哈希不同才推送。读不到（无焦点/后台）直接返回，不报错。
-     *
-     * 读取只发生在「应用可见/持有焦点」时：前台轮询 + 系统剪贴板变化回调都走这里。
-     * 后台读剪贴板（无障碍焦点 overlay、Shizuku 等）已全部移除，本函数只依赖进程内的
-     * ClipboardManager，后台返回 null 即代表读不到。
-     *
-     * @param force 忽略"已经推过 / 刚从对端拉回来"的去重判断，无条件推一次。
-     *   用于握手协商的第二步：对端明说它缓冲为空，本机就该把内容补上去，
-     *   哪怕这份内容此前已经推过（对端可能是重启后缓冲丢了）。
-     */
+    /** 读本机剪贴板，哈希与上次推送不同才推（仅可见/持焦点时能读到）；force 忽略去重无条件推一次，用于握手时对方明说缓冲为空 */
 internal fun AppCore.pushClipIfChanged(force: Boolean = false) {
         val text = clip.read() ?: return
         if (text.isBlank()) return
@@ -120,12 +96,7 @@ internal fun AppCore.pushClipIfChanged(force: Boolean = false) {
         if (link.isConnected()) link.sendClip(text, sha)
     }
 
-    /**
-     * 把对端发来的剪贴板内容直接写进本机剪贴板。
-     *
-     * 剪贴板同步**不是「发消息」**：这里只写剪贴板 + 打日志，不生成任何聊天气泡
-     * （气泡留给文本/文件）。冲突策略是简单后写覆盖——后到的那次写入直接生效。
-     */
+    /** 把对端剪贴板内容写入本机（非「发消息」：不生成气泡），冲突后写覆盖 */
 internal fun AppCore.writeClipboard(text: String) {
         val sha = Clip.sha1(text)
         if (sha == clip.lastPulledSha1) return
@@ -145,14 +116,13 @@ internal fun AppCore.startCall() {
             toast("已有通话进行中")
             return
         }
-        // 未选定设备：先提示，避免无声失败（之前只写日志，看起来像「点了没反应」）
+        // 未选定设备：先提示，避免无声失败
         val ip = link.currentPeerIp()
         if (ip.isEmpty()) {
             toast("请先选择并连接一台设备")
             return
         }
-        // 选中了但当前没有健康会话（未连上 / 半开假连接）：先触发一次（重）连接再提示，
-        // 而不是直接报「设备未连接」—— 否则用户感知就是「点了通话按钮就掉线」。
+        // 选中但无健康会话：先触发（重）连接再提示，避免「点了通话按钮就掉线」的感知
         if (!link.isConnected()) {
             link.connectTo(ip)
             toast("设备未连接，正在尝试连接，请稍后重试")
@@ -168,14 +138,7 @@ internal fun AppCore.startCall() {
         startCallWithConsent(ip, video = false, levelIdx = VideoLevel.DEFAULT.idx)
     }
 
-    /**
-     * 通话发起前的**数据流量确认**（v2.7，每次发起都问一次，不记忆）：
-     * 本机在数据网络 → 先问本机用户；对端在数据网络 → 由 data_ask 让对端问它自己的用户。
-     * 任一环节拒绝 → 不发起，并记一条通话消息（「未发起（未同意使用数据流量）」/
-     * 「对方拒绝了使用数据流量」）。
-     *
-     * ⚠ 必须跑在**专用线程**：Link 要弹框等用户点按钮、还要等对端回帧，会阻塞。
-     */
+    /** 通话发起前的数据流量确认（每次问、不记忆）：本机在数据网问本机、对端在数据网由对端问；任一拒绝不发起并记通话消息。须跑专用线程（Link 弹框+等对端帧会阻塞） */
 internal fun AppCore.startCallWithConsent(ip: String, video: Boolean, levelIdx: Int) {
         val label = if (video) "视频通话" else "语音通话"
         val kind = if (video) DataConsentText.KIND_VIDEO else DataConsentText.KIND_VOICE
@@ -203,8 +166,7 @@ internal fun AppCore.startCallWithConsent(ip: String, video: Boolean, levelIdx: 
     }
 
 internal fun AppCore.acceptCall() {
-        // 视频来电：先确保拿到相机权限再同意 —— 没有相机权限就无法解码显示远端画面，
-        // 而接听后立刻 TALKING 会错过授权时机（表现为"接了但一片黑"）。
+        // 视频来电：先确保拿到相机权限再同意（否则无法解码远端画面，且立刻 TALKING 会错过授权时机）
         val videoIncoming = incomingCall?.third == true
         if (videoIncoming &&
             app.checkSelfPermission(android.Manifest.permission.CAMERA) !=
@@ -222,16 +184,7 @@ internal fun AppCore.hangupCall() = call.hangup()
 
 internal fun AppCore.cancelCall() = call.cancelOutgoing()
 
-    /**
-     * 记一条**通话记录消息**（v2.7，用户定调「语音、视频以消息方式记录」）。
-     *
-     * 文本两种形态：
-     *  - 通过话 → 「语音通话 00:12」/「视频通话 01:02:03」
-     *  - 没接通 → 「语音通话 对方拒绝」/「视频通话 无人接听」/
-     *             「语音通话 未发起（未同意使用数据流量）」/「视频通话 对方拒绝了使用数据流量」
-     *
-     * 只记在本机（hsync 只对账文本与图片，通话记录不跨端同步）。
-     */
+    /** 记一条通话记录消息（通过话→时长，未接通→原因）；只记本机，不跨端同步 */
 internal fun AppCore.addCallRecord(
         peerIp: String, video: Boolean, durationMs: Long, reason: String, outgoing: Boolean
     ) {
@@ -282,20 +235,7 @@ internal fun AppCore.toggleCallChannel(): Boolean {
         return media
     }
 
-    /**
-     * 「旋转对方画面」钮：在当前显示角上 +90°（跨 360 回绕），返回新角供 UI 提示。
-     * 按**当前显示角**算而不是叠加量 —— 未手调过时当前显示 = 自适应基线，第一次
-     * 按下即把基线位置 +90 记为绝对角，此后钉死。
-     *
-     * 归属（R5，2026-09-16）：写进**当前通话/对话那台设备**的记忆里 ——
-     * 每台设备各记各的，切设备不会串味，卸载前一直沿用。
-     * 归属优先取「通话对端」（通话中切设备也不该改到别的设备身上），否则取当前对话设备。
-     *
-     * 归属再分一层（2026-09-19）：**按对端摄像头朝向分两套**（前置/后置各记各的）——
-     * 对端切摄像头时默认显示角不同（前置默认多 180°），两套混在一起必然互相打架。
-     *
-     * @param peerFront 对端此刻用的是不是前置摄像头
-     */
+    /** 「旋转对方画面」钮：当前显示角 +90°（360 回绕）并钉为绝对角，返回新角；记忆归属通话对端（否则当前对话设备），按对端摄像头朝向分两套 */
 internal fun AppCore.setVideoRemoteRot(deg: Int, peerFront: Boolean = false): Int {
         videoRemoteRot = ((deg % 360) + 360) % 360
         prefs.setRotRemoteOf(rotOwnerKey(), videoRemoteRot, peerFront)
@@ -323,30 +263,14 @@ internal fun AppCore.rotOwnerKey(): String {
         return prefs.convKeyOf(ip)
     }
 
-    /**
-     * 对端是否支持视频接收（「视频」按钮据此置灰）。
-     *
-     * ⚠ 必须先读一次 [peerCapsTick]：能力来自 `link.sessions[].caps`（普通字段），
-     * 握手完成不会自动触发重组 —— 不读它，按钮会永久停在「未连接时」算出的
-     * 那个 false 上（2026-09-15 实测：手机互打按不出视频通话，与 PC 却正常）。
-     * 读一下就建立了 Compose 订阅，握手后（onPeersChanged）自动重新求值。
-     */
+    /** 对端是否支持视频接收（「视频」按钮据此置灰）；先读 peerCapsTick 建立 Compose 订阅，否则停在「未连接时」的 false */
 internal fun AppCore.peerSupportsVideo(): Boolean {
         @Suppress("UNUSED_EXPRESSION") peerCapsTick
         val ip = link.currentPeerIp()
         return ip.isNotEmpty() && link.peerVidCap(ip)
     }
 
-    /**
-     * 发起视频通话（「视频」按钮 → 画质选择框 → 这里）。
-     *
-     * 失败前置全部给出明确 toast —— 避免用户感知「点了没反应」。
-     *
-     * @param levelIdx 本次通话的**画质上限**：0 = 流畅 480P，1 = 标清 720P，
-     *                 2 = 高清 1080P/2M，3 = 超清 1080P/5M（默认取 [VideoLevel.DEFAULT] = 2）。
-     *                 网络变差时自动逐级降档（1080P → 720P → 480P），恢复后逐级升回，
-     *                 但**升不过这里选的档**；选 3 也先按 2M 出帧（见 `CallManager.startVideo`）。
-     */
+    /** 发起视频通话（各失败前置都给明确 toast）；levelIdx 为本次画质上限：网络变差自动降档、恢复升回但不超过此档 */
 internal fun AppCore.startVideoCall(levelIdx: Int = VideoLevel.DEFAULT.idx) {
         if (!prefs.videoEnabled) {
             toast("视频通话已在设置中关闭")
@@ -391,13 +315,7 @@ internal fun AppCore.startVideoCall(levelIdx: Int = VideoLevel.DEFAULT.idx) {
         startCallWithConsent(ip, video = true, levelIdx = levelIdx)
     }
 
-    /**
-     * 切换前后摄（R8）。
-     *
-     * 成功后 bump [AppCore.selfCamTick]：`VideoCapture.open()` 里 facing 是**同步**更新的，
-     * 此刻读 `capture.isFront` 已是新朝向 → 通话界面立刻把本地小窗切到新朝向的旋转槽位
-     * （不等 500ms 界面心跳）。
-     */
+    /** 切换前后摄；成功后 bump selfCamTick（facing 同步更新，本地小窗立即切到新朝向旋转槽位） */
 internal fun AppCore.switchCamera() {
         if (!call.switchCamera()) {
             toast("无法切换摄像头（仅一个可用或无视频通话）")
