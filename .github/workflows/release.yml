@@ -179,9 +179,8 @@ jobs:
           cat > notes.md <<EOF
           ## 更新日志
 
-          修复了一些问题，提高了稳定性。
-
-          局域网内手机 ⇄ 电脑的文件 / 文本 / 文件夹互传，自动识别对方客户端；支持局域网视频与语音通话。
+          - 修复了一些问题，提高了稳定性
+          - 断网重装，联网会自动同步数据
 
           | 平台 | 文件 | 说明 |
           |---|---|---|
@@ -189,9 +188,7 @@ jobs:
           | Windows | PhonePcTransfer-$APP_VERSION.msi | 一键安装，含运行时与 ffmpeg |
           | 任意桌面 | PhonePcTransfer-PC.jar | 免安装，需 JDK 17+ |
 
-          本次构建由提交 ${GITHUB_SHA:0:7} 自动生成。
-
-          注意：CI 构建使用独立签名证书，与本地开发包签名不同，首次安装请先卸载旧版；之后各 Release 之间可直接覆盖升级。
+          CI 使用独立签名证书，装 Release 版前请先卸载本地开发包。
           EOF
           TAG="v$APP_VERSION"
           if [ "${{ github.event_name }}" = "push" ]; then
