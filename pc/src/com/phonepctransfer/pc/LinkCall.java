@@ -66,7 +66,7 @@ final class LinkCall {
 
     /** 发起呼叫（带视频协商 + 语音帧长协商）。af 语义见 {@link Protocol#callInvite}。 */
     public boolean sendCallInvite(String name, String ip, boolean vid, int lv, int af) {
-        return sendCallInvite(name, ip, vid, lv, af, 0, false, "");
+        return sendCallInvite(name, ip, L.currentPeerIp(), vid, lv, af, 0, false, "");
     }
 
     /**
@@ -75,10 +75,14 @@ final class LinkCall {
      * mport / mudp / msid 是本端已 bind 的媒体端口与本通 token，语义与缺省回退口径见
      * {@link Protocol#callInvite(String, String, boolean, int, int, int, boolean, String)}；
      * 0 / false / 空 = 本端未声明 ⇒ 对端只能落带内档。
+     *
+     * ip = 帧内**主叫自己的地址**（对端用它回 accept/end）；peerIp = **被叫地址**，只用于找会话。
+     * P3-8 同步：按被叫 ip 精确找会话（与 sendCallAccept 同口径），不再用 target()——
+     * 多设备在线/点击与执行之间切换对话时，target() 会把电话打到另一台设备上。
      */
-    public boolean sendCallInvite(String name, String ip, boolean vid, int lv, int af,
+    public boolean sendCallInvite(String name, String ip, String peerIp, boolean vid, int lv, int af,
                                   int mport, boolean mudp, String msid) {
-        Session s = L.target();
+        Session s = L.sessionOf(peerIp);
         if (s == null) {
             return false;
         }

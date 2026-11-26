@@ -12,17 +12,16 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * UDP 广播发现（**低噪声版**）。
+ * UDP 广播发现（低噪声版）。
  * 发包策略：
- *  - **启动只广播一次**（`sendLoop`），告诉局域网「我在这儿」；此后线程待命，无周期性网络行为。
+ *  - 启动广播一次，之后每 20s 补一次（一个几十字节的包；兜住「谁先开机 / 广播被 AP 丢掉」的漏设备）。
  *  - 常驻 `recvLoop` 纯被动接收对端 beacon，收到谁就把谁回调给上层（自动进设备列表）。
- *  - 唯一例外是 `scanOnce()`：启动时那一次有界扫描。它发的 beacon 带 `q:"1"`（query 标记），
- *    **收到的对端会回一次自己的 beacon** —— "被动方"不需要周期广播也能被扫到；
+ *  - `scanOnce()`：广播询问 + **本机每个私网 /24** 逐地址单播询问；带 `q:"1"` 的帧，
+ *    收到的一方**单播回一次**自己的 beacon —— 被动方不需要周期广播也能被扫到；
  *    回应带每设备 2s 限频，且回应帧不带 q，不会来回反弹。
  * 一次 `scanOnce()` 里有**两条路径**：
  *  ① **广播询问** —— 发 `q:1` 的 beacon 到各网卡广播地址 + `255.255.255.255`；
- *  ② **网段扫描** —— 只扫**本机地址所在的 /24**，逐地址单播同一个询问帧
- *     （本机 `10.1.2.3` → 只扫 `10.1.2.1` ~ `10.1.2.254`）。
+ *  ② **网段扫描** —— 本机每一块网卡的私网 /24 都扫（本机 `10.1.2.3` → 扫 `10.1.2.1`~`10.1.2.254`）。
  *     广播在 AP 隔离 / 交换机组播抑制 / 大子网（如 /16）里常常到不了对端，逐地址单播能直接命中。
  */
 public final class Discovery {
@@ -43,6 +42,17 @@ public final class Discovery {
 
     /** 扫描窗口内补发广播询问的间隔 */
     private static final long RESEND_TICK_MS = 800L;
+
+    /**
+     * 周期广播间隔（ms）。
+     * <p>「只广播一次、之后纯被动」在真机上会漏设备：两端谁先开、谁的启动广播被 AP 丢掉，
+     * 结果就是「手机看得见 PC、PC 看不见手机」。现在保留启动广播，再每 20s 补一次 ——
+     * 一个几十字节的 UDP 包，代价可以忽略，换来「后开机的一方最迟 20s 出现在对方列表里」。
+     */
+    private static final long ANNOUNCE_INTERVAL_MS = 20_000L;
+
+    /** 一轮扫描最多扫几个网段 /24（多网卡/热点时避免把 254×N 个包全打出去） */
+    private static final int MAX_SWEEP_PREFIXES = 3;
 
     /** 限频表清扫阈值：超过 1h 的条目直接删（见 sweepStaleReplies） */
     private static final long REPLY_TTL_MS = 3_600_000L;
@@ -98,6 +108,11 @@ public final class Discovery {
         recvSocket = null;
     }
 
+    /** 发现是否在跑（界面唤回补扫前先问一句，没启动就别报「无新设备」误导用户） */
+    public boolean isRunning() {
+        return running;
+    }
+
     private byte[] beacon() {
         return beacon(false);
     }
@@ -117,20 +132,29 @@ public final class Discovery {
     }
 
     /**
-     * 启动广播线程：**只发一次**（这是本端唯一的主动广播）。
+     * 广播线程：启动先广播一次（让已在线的对端立刻看到本机），之后**每 20s** 补一次。
      *
-     * 发完就待命 —— 没有周期广播，没有轮询，局域网里只有对端开口时我们才回应（见 recvLoop）。
-     * 线程本身留着只是让 stop() 的语义保持统一（daemon 线程，随进程退出）。
+     * <p>早期版本「只发一次、之后纯被动」，实测有漏：两端谁先开机、或者启动那个广播被 AP/无线侧
+     * 的广播抑制丢掉，就会出现「手机看得见 PC、PC 一直看不见手机」。周期广播是最便宜的兜底 ——
+     * 每 20s 一个几十字节的包，不轮询、不建立连接。
      */
     private void sendLoop() {
         try {
             sendBeaconOnce(false);
-            Log.i("启动广播已发出（仅此一次，之后纯被动接收对端广播）");
+            Log.i("启动广播已发出（此后每 " + (ANNOUNCE_INTERVAL_MS / 1000) + "s 补发一次）");
         } catch (Throwable t) {
             Log.w("启动广播发送失败: " + t);
         }
         while (running) {
-            sleep(60000);
+            sleep(ANNOUNCE_INTERVAL_MS);
+            if (!running) {
+                break;
+            }
+            try {
+                sendBeaconOnce(false);
+            } catch (Throwable t) {
+                Log.w("周期广播发送失败: " + t);
+            }
         }
     }
 
@@ -155,6 +179,33 @@ public final class Discovery {
                 }
             } catch (Throwable t) {
                 Log.w("广播发送失败: " + t);
+            } finally {
+                if (s != null) {
+                    s.close();
+                }
+            }
+        }
+    }
+
+    /**
+     * 单播回应对端的扫描询问（直接打回询问方地址的发现端口 28766）。
+     *
+     * <p>为什么不再用广播回应：PC 扫手机时，手机往往收得到单播询问、却因为 AP 隔离 /
+     * 无线侧广播抑制 / 路由器把 255.255.255.255 拦掉，回应帧到不了 PC —— 表现就是
+     * 「手机看得见 PC，PC 扫不到手机」。单播走三层路由原路返回，命中率和扫描一样。
+     */
+    private void sendBeaconTo(InetAddress target) {
+        if (target == null) {
+            return;
+        }
+        synchronized (sendLock) {
+            DatagramSocket s = null;
+            try {
+                byte[] payload = beacon(false);
+                s = new DatagramSocket();
+                s.send(new DatagramPacket(payload, payload.length, target, udpPort));
+            } catch (Throwable t) {
+                Log.w("单播回应失败（" + target + "）: " + t);
             } finally {
                 if (s != null) {
                     s.close();
@@ -201,14 +252,35 @@ public final class Discovery {
                 Log.w("扫描广播失败: " + t);
             }
 
-            // ② 网段扫描：只扫本网段 /24
-            String prefix = subnetPrefixOf(ownIpv4);
-            java.util.List<String> targets =
-                    prefix == null ? new java.util.ArrayList<String>() : subnetTargets(prefix, ownIpv4);
+            // ② 网段扫描：本机所有私网网段的 /24（多网卡/热点时可能不止一个）
+            java.util.List<String> ownIps = localIpv4s();
+            if (ownIpv4 != null && !ownIpv4.trim().isEmpty() && !ownIps.contains(ownIpv4)) {
+                ownIps.add(ownIpv4);
+            }
+            java.util.List<String> prefixes = new java.util.ArrayList<String>();
+            String primaryPrefix = subnetPrefixOf(ownIpv4);
+            if (primaryPrefix != null) {
+                prefixes.add(primaryPrefix);
+            }
+            for (String ip : ownIps) {
+                String p = subnetPrefixOf(ip);
+                if (p != null && !prefixes.contains(p)) {
+                    prefixes.add(p);
+                }
+            }
+            if (prefixes.size() > MAX_SWEEP_PREFIXES) {
+                prefixes = new java.util.ArrayList<String>(prefixes.subList(0, MAX_SWEEP_PREFIXES));
+            }
+            java.util.List<String> targets = new java.util.ArrayList<String>();
+            java.util.List<String> prefixLabels = new java.util.ArrayList<String>();
+            for (String p : prefixes) {
+                prefixLabels.add(p);
+                targets.addAll(subnetTargets(p, ownIps));
+            }
             boolean retryDone = targets.isEmpty();
             if (!targets.isEmpty()) {
-                Log.i("网段扫描 " + prefix + ".1-254（" + targets.size() + " 个地址，跳过本机 "
-                        + ownIpv4 + "）");
+                Log.i("网段扫描 " + textJoin(prefixLabels) + ".1-254（" + targets.size()
+                        + " 个地址，跳过本机 " + textJoin(ownIps) + "）");
                 sweepSubnet(targets);
             }
 
@@ -284,17 +356,32 @@ public final class Discovery {
         }
     }
 
-    /** 本网段 /24 的候选地址（`.1`~`.254`，跳过自己；`.0` 网络号与 `.255` 广播不发） */
-    private static java.util.List<String> subnetTargets(String prefix, String ownIpv4) {
+    /** 本网段 /24 的候选地址（`.1`~`.254`，跳过本机全部地址；`.0` 网络号与 `.255` 广播不发） */
+    private static java.util.List<String> subnetTargets(String prefix, java.util.Collection<String> own) {
         java.util.List<String> out = new java.util.ArrayList<String>(254);
         for (int i = SWEEP_MIN; i <= SWEEP_MAX; i++) {
             String h = prefix + "." + i;
-            if (h.equals(ownIpv4)) {
+            if (own != null && own.contains(h)) {
                 continue;
             }
             out.add(h);
         }
         return out;
+    }
+
+    /** 日志用：把若干项用「 + 」拼起来（空集合给「无」） */
+    private static String textJoin(java.util.Collection<String> items) {
+        if (items == null || items.isEmpty()) {
+            return "无";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String s : items) {
+            if (sb.length() > 0) {
+                sb.append(" + ");
+            }
+            sb.append(s);
+        }
+        return sb.toString();
     }
 
     /**
@@ -339,7 +426,22 @@ public final class Discovery {
 
     /** 本机用于判定网段的 IPv4：优先返回 192.168.*，否则回退到任何站点本地地址 */
     public static String localIpv4() {
-        String fallback = "";
+        java.util.List<String> all = localIpv4s();
+        for (String host : all) {
+            if (host.startsWith("192.168.")) {
+                return host;
+            }
+        }
+        return all.isEmpty() ? "" : all.get(0);
+    }
+
+    /**
+     * 本机**全部**可用 IPv4（网卡可能不止一块：有线 + 无线 + 热点）。
+     * <p>扫描要按每个网段各扫一遍 —— 只取「一个地址」时，多网卡机器会挑到错误那张网卡的 /24
+     * （日志里的典型现场：本机同时有 192.168.1.14 和 192.168.5.12，手机在另一段上，扫谁都是空）。
+     */
+    public static java.util.List<String> localIpv4s() {
+        java.util.List<String> out = new java.util.ArrayList<String>();
         try {
             java.util.Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
             while (ifaces != null && ifaces.hasMoreElements()) {
@@ -357,21 +459,17 @@ public final class Discovery {
                         continue;
                     }
                     String host = a.getHostAddress();
-                    if (host == null || host.startsWith("169.254.")) {
+                    if (host == null || host.startsWith("169.254.") || host.startsWith("127.")) {
                         continue;
                     }
-                    // 优先 192.168.*（正是要扫的网段），其次任意可用地址
-                    if (host.startsWith("192.168.")) {
-                        return host;
-                    }
-                    if (fallback.isEmpty()) {
-                        fallback = host;
+                    if (!out.contains(host)) {
+                        out.add(host);
                     }
                 }
             }
         } catch (Throwable ignore) {
         }
-        return fallback;
+        return out;
     }
 
     private List<InetAddress> broadcastAddresses() {
@@ -399,54 +497,85 @@ public final class Discovery {
         return out;
     }
 
+    /**
+     * 收包循环（S30）：单次嗅探异常不再让发现能力永久停摆。
+     * 老写法把整段 while 包在一个 try/catch 里，任何一次 IOException（网卡切换 / 绑端口瞬时冲突）
+     * 就直接结束线程，之后再也发现不了新设备；PC 常驻进程下影响更大。
+     * 现在：出错 → 关旧 socket、退避 2s→30s 重建重来；{@link #running}=false 才真退出。
+     */
     private void recvLoop() {
-        try {
-            DatagramSocket s = new DatagramSocket(null);
-            s.setReuseAddress(true);
-            s.bind(new InetSocketAddress(udpPort));
-            recvSocket = s;
-            byte[] buf = new byte[2048];
-            while (running) {
-                DatagramPacket pkt = new DatagramPacket(buf, buf.length);
-                s.receive(pkt);
-                String text = new String(pkt.getData(), 0, pkt.getLength(),
-                        java.nio.charset.StandardCharsets.UTF_8);
-                Map<String, Object> m;
-                try {
-                    m = Json.parseObject(text);
-                } catch (Exception e) {
-                    continue;
+        long backoff = 0L;
+        while (running) {
+            DatagramSocket s = null;
+            try {
+                s = new DatagramSocket(null);
+                s.setReuseAddress(true);
+                s.bind(new InetSocketAddress(udpPort));
+                recvSocket = s;
+                backoff = 0L;
+                byte[] buf = new byte[2048];
+                while (running) {
+                    DatagramPacket pkt = new DatagramPacket(buf, buf.length);
+                    s.receive(pkt);
+                    String text = new String(pkt.getData(), 0, pkt.getLength(),
+                            java.nio.charset.StandardCharsets.UTF_8);
+                    Map<String, Object> m;
+                    try {
+                        m = Json.parseObject(text);
+                    } catch (Exception e) {
+                        continue;
+                    }
+                    if (!Protocol.APP_TAG.equals(Json.str(m, "app", ""))) {
+                        continue;
+                    }
+                    String id = Json.str(m, "id", "");
+                    if (id.isEmpty() || id.equals(deviceId)) {
+                        continue;
+                    }
+                    String ip = pkt.getAddress() == null ? null : pkt.getAddress().getHostAddress();
+                    if (ip == null || ip.startsWith("127.")) {
+                        continue;
+                    }
+                    // 正在主动扫描时，把这个"回应"记进本轮结果
+                    java.util.Set<String> col = scanCollector;
+                    if (col != null) {
+                        col.add(ip);
+                    }
+                    if (listener != null) {
+                        listener.onPeer(ip, Json.str(m, "name", ip), id,
+                                Json.integer(m, "port", Protocol.DEFAULT_TCP_PORT));
+                    }
+                    // 对方在扫描（带了 q）→ 回一次自己的 beacon，让它不用等我们周期广播也能发现我们。
+                    // **单播回给询问方**：广播回应在 AP 隔离/无线广播抑制下会被丢掉（PC 因此「扫不到手机」）。
+                    // 回应帧不带 q，所以不会互相反弹；并且按 IP 2s 限频，被反复唤醒也不会刷屏。
+                    if (Json.integer(m, "q", 0) == 1 && shouldReply(ip)) {
+                        Log.i("回应 " + ip + " 的扫描询问（单播）");
+                        sendBeaconTo(pkt.getAddress());
+                    }
                 }
-                if (!Protocol.APP_TAG.equals(Json.str(m, "app", ""))) {
-                    continue;
+            } catch (Throwable t) {
+                if (!running) {
+                    break;
                 }
-                String id = Json.str(m, "id", "");
-                if (id.isEmpty() || id.equals(deviceId)) {
-                    continue;
+                Log.w("广播监听异常: " + t + "，" + (backoff / 1000) + "s 后重建 socket");
+            } finally {
+                if (s != null) {
+                    try {
+                        s.close();
+                    } catch (Exception ignore) {
+                    }
                 }
-                String ip = pkt.getAddress() == null ? null : pkt.getAddress().getHostAddress();
-                if (ip == null || ip.startsWith("127.")) {
-                    continue;
-                }
-                // 正在主动扫描时，把这个"回应"记进本轮结果
-                java.util.Set<String> col = scanCollector;
-                if (col != null) {
-                    col.add(ip);
-                }
-                if (listener != null) {
-                    listener.onPeer(ip, Json.str(m, "name", ip), id, Json.integer(m, "port", Protocol.DEFAULT_TCP_PORT));
-                }
-                // 对方在扫描（带了 q）→ 回一次自己的 beacon，让它不用等我们周期广播也能发现我们。
-                // 回应帧不带 q，所以不会互相反弹；并且按 IP 2s 限频，被反复唤醒也不会刷屏。
-                if (Json.integer(m, "q", 0) == 1 && shouldReply(ip)) {
-                    Log.i("回应 " + ip + " 的扫描询问");
-                    sendBeaconOnce(false);
-                }
+                recvSocket = null;
             }
-        } catch (Throwable t) {
-            if (running) {
-                Log.w("广播监听退出: " + t);
+            if (!running) {
+                break;
             }
+            try {
+                Thread.sleep(backoff);
+            } catch (InterruptedException e) {
+                break;
+            }
+            backoff = (backoff <= 0L) ? 2000L : Math.min(backoff * 2, 30_000L);
         }
     }
 

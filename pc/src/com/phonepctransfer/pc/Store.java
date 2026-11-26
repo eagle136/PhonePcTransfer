@@ -2,9 +2,11 @@ package com.phonepctransfer.pc;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -133,16 +135,212 @@ public final class Store {
 
     private final Object histLock = new Object();
 
+    // ==================== 历史写入异步化 ====================
+    // 背景：批量传输时每条消息都在调用线程里 Files.write，偶发还要整文件重写（trim/cap）；
+    // 而 UI 线程重载会话时要拿同一把 histLock ⇒ 传文件期间主界面会被锁在别人的磁盘 I/O 上（白屏卡死）。
+    // 现在 appendHistory 只入队，由单条守护线程批量落盘；读路径不再与写线程争同一段 I/O。
+
+    /** 一条待写历史（peerIp 决定落到哪个会话文件） */
+    private static final class HistWrite {
+        final String peerIp;
+        final String mid;
+        final String line;
+
+        HistWrite(String peerIp, String mid, String line) {
+            this.peerIp = peerIp;
+            this.mid = mid;
+            this.line = line;
+        }
+    }
+
+    private final java.util.concurrent.ConcurrentLinkedQueue<HistWrite> histQueue =
+            new java.util.concurrent.ConcurrentLinkedQueue<HistWrite>();
+    /** 落盘串行锁：写线程与 flushHistory 都在这把锁内批量写，保证同一行不会被写两次 */
+    private final Object histIoLock = new Object();
+    private volatile Thread histWriterThread = null;
+    private volatile boolean histWriterHookAdded = false;
+
+    /** P4-5：已配对设备（deviceId → 32 字节共享 token），独立文件，与 config/历史解耦 */
+    private final Path pairedFile;
+    private final java.util.concurrent.ConcurrentHashMap<String, String> pairedTokens =
+            new java.util.concurrent.ConcurrentHashMap<String, String>();
+    private final java.util.concurrent.ConcurrentHashMap<String, String> pairedNames =
+            new java.util.concurrent.ConcurrentHashMap<String, String>();
+    /** deviceId → 最近一次配对时的 IP：发起连接时还不知道对端 id，先按 IP 取 token */
+    private final java.util.concurrent.ConcurrentHashMap<String, String> pairedIps =
+            new java.util.concurrent.ConcurrentHashMap<String, String>();
+    private final Object pairedLock = new Object();
+
     public Store(Path root) throws IOException {
         this.root = root;
         this.defaultReceivedDir = root.resolve("received");
         this.logDir = root.resolve("logs");
         this.configFile = root.resolve("config.json");
         this.historyDir = root.resolve("history");
+        this.pairedFile = root.resolve("paired.json");
         Files.createDirectories(defaultReceivedDir);
         Files.createDirectories(logDir);
         Files.createDirectories(historyDir);
         migrateLegacyHistory();
+        loadPaired();
+    }
+
+    // ==================== P4-5 设备配对库 ====================
+
+    /** 已配对设备的共享 token；未配对返回空串 */
+    public String pairedTokenOf(String deviceId) {
+        if (deviceId == null || deviceId.isEmpty()) {
+            return "";
+        }
+        String t = pairedTokens.get(deviceId);
+        return t == null ? "" : t;
+    }
+
+    public String pairedNameOf(String deviceId) {
+        String n = pairedNames.get(deviceId);
+        return n == null ? "" : n;
+    }
+
+    public boolean isPaired(String deviceId) {
+        return !pairedTokenOf(deviceId).isEmpty();
+    }
+
+    /** 拨号前按 IP 取上次配对留下的 token；没有返回空串（P4-5，hello 里带过去可跳过 6 位码） */
+    public String pairedTokenForIp(String ip) {
+        String v = ip == null ? "" : ip.trim();
+        if (v.isEmpty()) {
+            return "";
+        }
+        // 同一 IP 后面对过多台设备（DHCP 复用 / 换机）时不能猜：猜错 token 会一路撞到配对失败，
+        // 宁可返回空串走一次正常配对码握手
+        String hit = "";
+        for (Map.Entry<String, String> e : pairedIps.entrySet()) {
+            if (v.equals(e.getValue())) {
+                String t = pairedTokens.get(e.getKey());
+                if (t != null && !t.isEmpty()) {
+                    if (!hit.isEmpty() && !hit.equals(t)) {
+                        return "";
+                    }
+                    hit = t;
+                }
+            }
+        }
+        return hit;
+    }
+
+    /**
+     * 拨号前取 token：**先按设备身份（deviceId），再按地址兜底**（与安卓端 pairedTokenFor 同口径）。
+     *
+     * <p>设备身份 = deviceId + token（配对码即授权），地址只是这台设备当下的一个接入点。
+     * 重启 / 换 WiFi / DHCP 续租后 IP 一变，只按 IP 查就查空 → hello 不带 token → 对端被拖回配对流程。
+     * 按组键（{@link #convKeyOf}：已识别身份时就是 deviceId）查完全不受地址变化影响。
+     */
+    public String pairedTokenFor(String ipOrId) {
+        String v = ipOrId == null ? "" : ipOrId.trim();
+        if (v.isEmpty()) {
+            return "";
+        }
+        String t = pairedTokenOf(convKeyOf(v));
+        if (t != null && !t.isEmpty()) {
+            return t;
+        }
+        return pairedTokenForIp(v);
+    }
+
+
+    /** 配对成功：登记/覆盖该设备的 token（重装或重新配对时覆盖旧 token） */
+    public void markPaired(String deviceId, String name, String token) {
+        markPaired(deviceId, name, token, "");
+    }
+
+    public void markPaired(String deviceId, String name, String token, String ip) {
+        if (deviceId == null || deviceId.isEmpty() || token == null || token.isEmpty()) {
+            return;
+        }
+        String v = ip == null ? "" : ip.trim();
+        // 什么都没变就别落盘（每次重连都会走这里）
+        String name0 = name == null ? "" : name;
+        if (token.equals(pairedTokenOf(deviceId))
+                && (name0.isEmpty() || name0.equals(pairedNameOf(deviceId)))
+                && (v.isEmpty() || v.equals(pairedIps.get(deviceId)))) {
+            return;
+        }
+        synchronized (pairedLock) {
+            pairedTokens.put(deviceId, token);
+            if (name != null && !name.isEmpty()) {
+                pairedNames.put(deviceId, name);
+            }
+            if (!v.isEmpty()) {
+                pairedIps.put(deviceId, v);
+            }
+            savePairedLocked();
+        }
+    }
+
+    public void unpair(String deviceId) {
+        if (deviceId == null || deviceId.isEmpty()) {
+            return;
+        }
+        synchronized (pairedLock) {
+            pairedTokens.remove(deviceId);
+            pairedNames.remove(deviceId);
+            pairedIps.remove(deviceId);
+            savePairedLocked();
+        }
+    }
+
+    private void loadPaired() {
+        synchronized (pairedLock) {
+            try {
+                if (!Files.exists(pairedFile)) {
+                    return;
+                }
+                String txt = new String(Files.readAllBytes(pairedFile), StandardCharsets.UTF_8);
+                if (txt.trim().isEmpty()) {
+                    return;
+                }
+                Map<String, Object> rootMap = Json.parseObject(txt);
+                for (Map.Entry<String, Object> e : rootMap.entrySet()) {
+                    Object v = e.getValue();
+                    if (!(v instanceof Map)) {
+                        continue;
+                    }
+                    Map<?, ?> row = (Map<?, ?>) v;
+                    String token = String.valueOf(row.get("token") == null ? "" : row.get("token"));
+                    if (token.isEmpty()) {
+                        continue;
+                    }
+                    pairedTokens.put(e.getKey(), token);
+                    Object n = row.get("name");
+                    if (n != null && !String.valueOf(n).isEmpty()) {
+                        pairedNames.put(e.getKey(), String.valueOf(n));
+                    }
+                    Object ip = row.get("ip");
+                    if (ip != null && !String.valueOf(ip).isEmpty()) {
+                        pairedIps.put(e.getKey(), String.valueOf(ip));
+                    }
+                }
+                Log.i("配对库：" + pairedTokens.size() + " 台已配对设备");
+            } catch (Exception e) {
+                Log.w("读取 paired.json 失败: " + e);
+            }
+        }
+    }
+
+    private void savePairedLocked() {
+        try {
+            Map<String, Object> out = new LinkedHashMap<String, Object>();
+            for (Map.Entry<String, String> e : pairedTokens.entrySet()) {
+                Map<String, Object> row = new LinkedHashMap<String, Object>();
+                row.put("name", pairedNames.getOrDefault(e.getKey(), ""));
+                row.put("token", e.getValue());
+                row.put("ip", pairedIps.getOrDefault(e.getKey(), ""));
+                out.put(e.getKey(), row);
+            }
+            atomicWrite(pairedFile, Json.stringify(out).getBytes(StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            Log.w("写入 paired.json 失败: " + e);
+        }
     }
 
     /**
@@ -328,7 +526,7 @@ public final class Store {
         return key != null && !key.isEmpty() && blockedGroups.remove(key) != null;
     }
 
-    // ===== 已知设备名单（后台允许连入：握手过 + 有消息/文件往来）=====
+    // ===== 已知设备名单（后台允许连入：握手过 且（配对过 或 有消息/文件往来））=====
 
     /** adopt 闸门调用：无锁读，绝不能被 save() 的写文件持锁卡住 */
     public boolean isTrustedAddr(String ip) {
@@ -340,12 +538,18 @@ public final class Store {
             return false;
         }
         String v = trustedPeers.get(k);
-        return v != null && v.indexOf('c') >= 0 && v.indexOf('f') >= 0;
+        // c=连接过；p=配对过（用户授权）；f=有过消息/文件往来
+        return v != null && v.indexOf('c') >= 0 && (v.indexOf('p') >= 0 || v.indexOf('f') >= 0);
     }
 
     /** 已知设备打点①：握手成功（含首次连上）。已置位则不重复落盘 */
     public synchronized void markTrustedConnected(String key) {
         markTrustedFlag(key, 'c');
+    }
+
+    /** 已知设备打点③：在本机配对成功（持有同一 token）——配对码即用户授权，等同于「有往来」 */
+    public synchronized void markTrustedPaired(String key) {
+        markTrustedFlag(key, 'p');
     }
 
     /** 已知设备打点②：有过消息/文件往来（收发都算）。已置位则不重复落盘 */
@@ -469,6 +673,85 @@ public final class Store {
         }
         groupCurIp.put(k, v);
         save();
+    }
+
+    // ==================== 设备换局域网地址（一台设备只留一个局域网接入点）====================
+
+    /**
+     * 一台设备已经通过**新地址**连上了（{@code deviceId}=对端身份，{@code newIp}=本次握手地址）：
+     * 当前地址切到 newIp，同组其它**局域网 IPv4** 地址一并删掉（与安卓端 Prefs.syncGroupLanIp 同口径）。
+     *
+     * <p>口径（用户指定）：设备身份是 deviceId+token，IP 只是它当下的接入点；重启/换 WiFi 后 DHCP 换了 IP，
+     * 旧地址就该自动消失，不能留在列表里让人点到死地址。**手动添加的公网地址 / IPv6 地址不动**
+     * （它们不可能是 DHCP 换出来的那个，删了就是删用户自己的配置）。
+     *
+     * @param isConnected 该地址此刻是否还有健康会话（有就不删：绝不清理正在用的地址；可为 null）
+     * @return true = 地址列表有变化（界面需要刷新）
+     */
+    public synchronized boolean syncGroupLanIp(String deviceId, String newIp,
+                                               java.util.function.Predicate<String> isConnected) {
+        String d = deviceId == null ? "" : deviceId.trim();
+        String n = newIp == null ? "" : newIp.trim();
+        if (d.isEmpty() || n.isEmpty() || !isLanV4(n)) {
+            return false;
+        }
+        // 身份还没落在这个地址上（同 IP 多设备时 bindDeviceIfFree 会拒绝抢绑）⇒ 什么都不做
+        if (!d.equals(convKeyOf(n))) {
+            return false;
+        }
+        List<String> drop = new ArrayList<String>();
+        for (Peer p : peerList) {
+            if (p.ip == null || p.ip.isEmpty() || p.ip.equals(n)) {
+                continue;
+            }
+            if (!d.equals(convKeyOf(p.ip))) {
+                continue;
+            }
+            if (!isLanV4(p.ip)) {
+                continue;                       // 公网 IP / IPv6 地址：用户可能手工加的，不动
+            }
+            if (isConnected != null && isConnected.test(p.ip)) {
+                continue;                       // 还有健康会话：正在用的地址不删
+            }
+            drop.add(p.ip);
+        }
+        boolean changed = false;
+        // 先把新地址登记上，再删旧地址：removePeer 在"组内一个地址都不剩"时会清掉「不再显示」标记，
+        // 顺序反了就会因为这个中间态把用户设置丢了
+        if (findPeer(n) == null) {
+            if (upsertPeer(n, null, d, null, System.currentTimeMillis())) {
+                changed = true;
+            }
+        }
+        for (String ip : drop) {
+            if (removePeer(ip)) {
+                changed = true;
+            }
+        }
+        // 组内"当前地址"只在它本来就是局域网地址（或还没记过）时才跟着迁移；
+        // 用户手动选的公网接入点是明确配置，不抢
+        String cur = groupCurIp.get(d);
+        if ((cur == null || cur.isEmpty() || isLanV4(cur)) && !n.equals(cur)) {
+            groupCurIp.put(d, n);
+            changed = true;
+        }
+        if (lastIp != null && !lastIp.isEmpty()
+                && (lastIp.equals(n) || drop.contains(lastIp))) {
+            lastIp = n;
+            changed = true;
+        }
+        if (changed) {
+            save();
+            Log.i("设备换地址：" + d + " 局域网地址 → " + n
+                    + (drop.isEmpty() ? "" : "（清掉 " + drop.size() + " 个旧地址：" + String.join(",", drop) + "）"));
+        }
+        return changed;
+    }
+
+    /** 是不是「局域网 IPv4」地址（只有这类地址会被 DHCP 换掉、才按“一台设备一个”清理） */
+    private static boolean isLanV4(String s) {
+        String v = s == null ? "" : s.trim();
+        return !v.isEmpty() && v.indexOf(':') < 0 && LocalIps.isLanPeer(v);
     }
 
     /**
@@ -775,8 +1058,9 @@ public final class Store {
     @SuppressWarnings("unchecked")
     public synchronized void load() {
         deviceName = defaultName();
-        deviceId = "pc-" + UUID.randomUUID().toString().substring(0, 8);
+        deviceId = "";
         if (!Files.exists(configFile)) {
+            deviceId = stableDeviceId();
             peerList.add(new Peer("192.168.1.14"));
             save();
             return;
@@ -784,7 +1068,11 @@ public final class Store {
         try {
             String s = new String(Files.readAllBytes(configFile), StandardCharsets.UTF_8);
             Map<String, Object> m = Json.parseObject(s);
-            deviceId = Json.str(m, "deviceId", deviceId);
+            deviceId = Json.str(m, "deviceId", "").trim();
+            if (deviceId.isEmpty()) {
+                // 老配置/被清过的配置没有身份：用机器级稳定值（见 stableDeviceId），别再用随机 UUID 换身份
+                deviceId = stableDeviceId();
+            }
             deviceName = Json.str(m, "deviceName", deviceName);
             tcpPort = Json.integer(m, "tcpPort", tcpPort);
             udpPort = Json.integer(m, "udpPort", udpPort);
@@ -823,7 +1111,8 @@ public final class Store {
                         continue;
                     }
                     String v = e.getValue() == null ? "" : String.valueOf(e.getValue());
-                    String flags = (v.indexOf('c') >= 0 ? "c" : "") + (v.indexOf('f') >= 0 ? "f" : "");
+                    String flags = (v.indexOf('c') >= 0 ? "c" : "") + (v.indexOf('p') >= 0 ? "p" : "")
+                            + (v.indexOf('f') >= 0 ? "f" : "");
                     if (!flags.isEmpty()) {
                         trustedPeers.put(String.valueOf(e.getKey()), flags);
                     }
@@ -874,7 +1163,8 @@ public final class Store {
             //    convKeyOf()把所有地址都退回"组键=IP":同一台设备的多个地址被拆成好几台(设备列表一台设备出现多行);
             //    config里的bindings表形同废纸(bindDevice见绑定没变就early-return,连ckeys都不会补)
             seedGroupKeys();
-            if (trustedSeeded) {
+            boolean pairedSeeded = seedTrustedFromPairings();
+            if (trustedSeeded || pairedSeeded) {
                 save();
             }
         } catch (Exception e) {
@@ -901,6 +1191,28 @@ public final class Store {
             }
             ckeys.put(p.ip, cur);
         }
+    }
+
+    /**
+     * 升级播种：paired.json 里已经配对过的设备，直接补 'p'（配对=用户授权）。
+     * 老版本的「已知设备」只认「握手过 + 有消息/文件往来」，于是「配对完、还没发消息就切后台」的设备
+     * 会被托盘后台当成陌生设备拒掉（本次修复的 bug）。补 'p' 后历史配对立即生效，不必重新配对
+     * @return true=名单有变化，需要落盘
+     */
+    private boolean seedTrustedFromPairings() {
+        boolean changed = false;
+        for (String dev : pairedTokens.keySet()) {
+            if (dev == null || dev.trim().isEmpty()) {
+                continue;
+            }
+            String cur = trustedPeers.get(dev);
+            if (cur != null && cur.indexOf('p') >= 0) {
+                continue;
+            }
+            trustedPeers.put(dev, (cur == null ? "" : cur) + "p");
+            changed = true;
+        }
+        return changed;
     }
 
     private static void readStringMap(Map<String, Object> m, String key, Map<String, String> out) {
@@ -961,6 +1273,62 @@ public final class Store {
     private static String defaultName() {
         String h = System.getenv("COMPUTERNAME");
         return (h == null || h.isEmpty()) ? "PC" : h;
+    }
+
+    /**
+     * 本机设备 id 的兜底值（配置里没有/被清掉时才用）。
+     *
+     * <p>「版本变化 → 清除数据」会把 config.json 整个删掉；旧实现这里用**随机 UUID** ⇒ 同一台电脑换了身份。
+     * 对端（手机）看到的就是同一 IP 上冒出「第二个同名设备」：旧身份残行 + 新身份主行，
+     * 旧配对 token 也全部作废 —— 用户视角＝「两个对方名称、再也连不上」。
+     *
+     * <p>改成从**机器级稳定值**派生：优先注册表 MachineGuid（重装 MSI / 清数据 / 换用户都不变），
+     * 退而用 COMPUTERNAME；都取不到才回退随机（极少数情况，行为与旧版一致）。
+     * 配置里已有 deviceId 时**原样保留**（老设备不能因升级突变身份）。
+     */
+    private static String stableDeviceId() {
+        String raw = machineGuid();
+        if (raw.isEmpty()) {
+            String cn = System.getenv("COMPUTERNAME");
+            raw = cn == null ? "" : cn.trim();
+        }
+        if (raw.isEmpty()) {
+            return "pc-" + UUID.randomUUID().toString().substring(0, 8);
+        }
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest(("pppc|" + raw).getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(8);
+            for (int i = 0; i < 4; i++) {
+                sb.append(String.format("%02x", d[i] & 0xFF));
+            }
+            return "pc-" + sb;
+        } catch (Exception e) {
+            return "pc-" + UUID.randomUUID().toString().substring(0, 8);
+        }
+    }
+
+    /** 读 HKLM\SOFTWARE\Microsoft\Cryptography 的 MachineGuid（只读；取不到返回空串） */
+    private static String machineGuid() {
+        Process p = null;
+        try {
+            ProcessBuilder pb = new ProcessBuilder("reg", "query",
+                    "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid");
+            pb.redirectErrorStream(true);
+            p = pb.start();
+            String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
+                    .matcher(out);
+            return m.find() ? m.group(1) : "";
+        } catch (Exception e) {
+            return "";
+        } finally {
+            if (p != null) {
+                p.destroy();
+            }
+        }
     }
 
     public synchronized String deviceId() {
@@ -1256,10 +1624,17 @@ public final class Store {
             //   · 原活动设备已离开(≥30s没动静,通常是IP被路由重新分配)⇒允许接管,否则这个地址会永远钉在已经关机的那台设备上
             if (active.isEmpty() || devGone(exist, active)) {
                 String oldKey = convKeyOf(v);
-                // 升级兼容:老配置/还没进别名表的旧活动设备补一条,否则接管后它就从列表里消失了。
-                // 但只在它最近还出现过时才补(见DEV_ALIAS_KEEP_MS):几天没动静的旧身份多半是换/重装前的deviceId,补进去只会留一条永远点不开、还删不干净的幽灵行
-                if (!active.isEmpty() && exist.dev(active) == null
+                // 「同地址 + 同广播名 + 换了 deviceId」基本只可能是同一台机器清了数据/重装(身份变了)。
+                // 这时**不能**把旧身份留成别名行:留了列表就是「名字」+「名字-2」两行,
+                // 点旧行还能把绑定抢回一个不再存在的身份(用户视角＝"再也连不上")。
+                boolean sameHostNewIdentity = !active.isEmpty() && !dn.isEmpty()
+                        && dn.equals(exist.lastName == null ? "" : exist.lastName.trim());
+                if (sameHostNewIdentity) {
+                    exist.removeDev(active);
+                } else if (!active.isEmpty() && exist.dev(active) == null
                         && !devStaleForAlias(exist.lastSeenAt, DEV_ALIAS_KEEP_MS)) {
+                    // 升级兼容:老配置/还没进别名表的旧活动设备补一条,否则接管后它就从列表里消失了。
+                    // 但只在它最近还出现过时才补(见DEV_ALIAS_KEEP_MS):几天没动静的旧身份多半是换/重装前的deviceId,补进去只会留一条永远点不开、还删不干净的幽灵行
                     exist.noteDev(active, exist.lastName, exist.lastSeenAt);
                 }
                 // 它真的占到地址了 → 用户之前「不再显示」的标记作废
@@ -1312,10 +1687,13 @@ public final class Store {
     }
 
     /**
-     * 别名行的显示时限:太久没露过面的"同一IP上的另一台设备"不再列出来。
-     * <p>为什么必须有:同一台手机换/重装后deviceId变了,旧身份永远不会再广播,但它可能在别名表里躺着——列表上就多一条"永远点不开的幽灵行",点它还会弹"是否断开当前设备并切过去"(切过去只会把好好的地址抢给一个不存在的身份)。
-     * 真正在场的设备每2s广播一次/握手一次,记录一直是新鲜的,所以这行不会误藏 */
-    private static final long DEV_ALIAS_SHOW_MS = 60 * 60_000L;
+     * 别名行的显示时限:只在「这台身份最近确实还活着」时列出来。
+     * <p>真正在场的设备每2s广播一次/握手一次,记录一直是新鲜的,所以这行不会误藏。
+     * <p>为什么从60分钟收到5分钟:对端「清除数据/重装」换了deviceId后,同一 IP 上会同时挂着
+     * 旧身份别名行 + 新身份主行(同名→显示成「名字」「名字-2」),而且点旧行还能把绑定抢回去,
+     * 用户看到的就是「两个对方名称、再也连不上」。
+     */
+    private static final long DEV_ALIAS_SHOW_MS = 5 * 60_000L;
 
     /**
      * 该地址上的活动设备是否已经离开。
@@ -1382,6 +1760,15 @@ public final class Store {
         }
         Peer p = findPeer(v);
         if (p == null) {
+            return false;
+        }
+        // 目标身份必须「此刻还在」:别名行可能是对端换/重装前的旧 deviceId 残行,
+        // 把地址绑回一个不再存在的身份 ⇒ 之后连谁都对不上组键(用户视角＝"再也连不上")
+        Peer.Dev target = p.dev(d);
+        long seen = (target != null) ? target.seenAt
+                : (d.equals(p.lastId == null ? "" : p.lastId.trim()) ? p.lastSeenAt : 0L);
+        if (devStaleForAlias(seen, DEV_ALIAS_SHOW_MS)) {
+            Log.w("切换设备被拒:" + d + " 在 " + v + " 上已超时未出现(残行不能抢绑定)");
             return false;
         }
         String old = convKeyOf(v);
@@ -1570,28 +1957,147 @@ public final class Store {
     /**
      * 历史封顶:单文件大小阈值(字节)。
      * <p>进度帧会对同一条消息多次落盘,不封顶则文件只增不减,hasMid/removeFromHistory/loadPendingRaw(全文件读入内存再写回)会越来越慢。
-     * 超阈值即触发{@link #capHistoryFile}:读⇒按mid合并⇒按ts留最近2000条⇒重写 */
+     * 超阈值即触发{@link #capHistoryFile}:读⇒按mid合并⇒按ts留最近500条⇒重写 */
     static final long HISTORY_MAX_BYTES = 8L * 1024 * 1024;
-    /** 封顶后保留条数：按 ts 留最近 N 条（对齐 Android 端封顶思路；PC UI 窗口 200 条，留足余量） */
-    static final int HISTORY_KEEP_ROWS = 2000;
+
+    /** 每个会话最多保留多少条（与安卓 HIST_KEEP=500 同口径） */
+    static final int HISTORY_KEEP_ROWS = 500;
+
+    /** 超过上限时一次删多少条最旧的（与安卓 HIST_DROP=50 同口径） */
+    static final int HISTORY_DROP_ROWS = 50;
+
+    /** 触发器计数：会话文件 → 文件内出现过的 mid（首次按文件播种；删除/清空/封顶后清掉重播） */
+    private final Map<String, java.util.LinkedHashSet<String>> histMidOrder =
+            new java.util.HashMap<String, java.util.LinkedHashSet<String>>();
 
     /**
      * 追加一条历史到"该消息所属设备"的文件里。
      * <p>追加后检查文件大小:单文件超{@link #HISTORY_MAX_BYTES}立即{@link #capHistoryFile}——读全部行、按mid合并(后行胜出)、按ts留最近{@link #HISTORY_KEEP_ROWS}条后整体重写 */
     public void appendHistory(String peerIp, Map<String, Object> record) {
-        synchronized (histLock) {
-            Path f = historyFile(peerIp);
-            try {
-                Files.write(f,
-                        (Json.stringify(record) + "\n").getBytes(StandardCharsets.UTF_8),
-                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-                if (Files.size(f) > HISTORY_MAX_BYTES) {
-                    capHistoryFile(f);
+        if (record == null || peerIp == null || peerIp.isEmpty()) {
+            return; // 归属不到的消息不落盘（防写 _unknown.jsonl）
+        }
+        histQueue.add(new HistWrite(peerIp, Json.str(record, "mid", ""), Json.stringify(record) + "\n"));
+        ensureHistWriter();
+        synchronized (histIoLock) {
+            histIoLock.notifyAll();
+        }
+    }
+
+    /** 惰性启动单写线程（daemon；进程退出时由 flushHistory 兜底落盘） */
+    private void ensureHistWriter() {
+        if (histWriterThread != null) {
+            return;
+        }
+        synchronized (histIoLock) {
+            if (histWriterThread != null) {
+                return;
+            }
+            Thread t = new Thread(this::histWriterLoop, "pp-hist-writer");
+            t.setDaemon(true);
+            histWriterThread = t;
+            t.start();
+            if (!histWriterHookAdded) {
+                histWriterHookAdded = true;
+                try {
+                    Runtime.getRuntime().addShutdownHook(new Thread(this::flushHistory, "pp-hist-flush"));
+                } catch (Throwable ignore) {
+                    // 已经在关停流程中：忽略
                 }
-            } catch (IOException e) {
-                Log.w("写历史失败(" + safeKey(peerIp) + "): " + e);
             }
         }
+    }
+
+    private void histWriterLoop() {
+        while (true) {
+            synchronized (histIoLock) {
+                while (histQueue.isEmpty()) {
+                    try {
+                        histIoLock.wait(300L);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+                try {
+                    drainHistLocked();
+                } catch (Throwable t) {
+                    // 单批失败不能让写线程死掉（死掉之后所有历史都只进队列不落盘）
+                    Log.w("历史批量落盘失败: " + t);
+                }
+            }
+        }
+    }
+
+    /**
+     * 把所有排队的历史一次性落盘（调用方必须持有 {@link #histIoLock}）。
+     * 按会话文件分组后每个文件只 open/close 一次，批量写比逐条写少一个数量级的系统调用。
+     */
+    private void drainHistLocked() {
+        java.util.LinkedHashMap<String, StringBuilder> byPeer =
+                new java.util.LinkedHashMap<String, StringBuilder>();
+        java.util.LinkedHashMap<String, java.util.LinkedHashSet<String>> midsByPeer =
+                new java.util.LinkedHashMap<String, java.util.LinkedHashSet<String>>();
+        HistWrite w;
+        while ((w = histQueue.poll()) != null) {
+            StringBuilder sb = byPeer.get(w.peerIp);
+            java.util.LinkedHashSet<String> mids = midsByPeer.get(w.peerIp);
+            if (sb == null) {
+                sb = new StringBuilder(256);
+                byPeer.put(w.peerIp, sb);
+                mids = new java.util.LinkedHashSet<String>();
+                midsByPeer.put(w.peerIp, mids);
+            }
+            sb.append(w.line);
+            if (!w.mid.isEmpty()) {
+                mids.add(w.mid);
+            }
+        }
+        for (Map.Entry<String, StringBuilder> e : byPeer.entrySet()) {
+            String peerIp = e.getKey();
+            synchronized (histLock) {
+                Path f = historyFile(peerIp);
+                try {
+                    Files.write(f,
+                            e.getValue().toString().getBytes(StandardCharsets.UTF_8),
+                            StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+                    if (Files.size(f) > HISTORY_MAX_BYTES) {
+                        capHistoryFile(f);
+                    }
+                    // 每条新消息都触发一次条数检测：>500 就删最旧 50（用户口径）
+                    // P4-3：新 mid 必须先加进触发器计数集合，否则集合只会播种一次、永远不会超 500（PC 端 P3-1 实际没生效）
+                    String key = f.toAbsolutePath().toString();
+                    java.util.LinkedHashSet<String> set = histMidOrder.get(key);
+                    if (set == null) {
+                        set = new java.util.LinkedHashSet<String>(midsInOrder(f));
+                        histMidOrder.put(key, set);
+                    }
+                    java.util.LinkedHashSet<String> newMids = midsByPeer.get(peerIp);
+                    if (newMids != null) {
+                        set.addAll(newMids);
+                    }
+                    trimIfNeeded(f);
+                } catch (IOException ex) {
+                    Log.w("写历史失败(" + safeKey(peerIp) + "): " + ex);
+                }
+            }
+        }
+    }
+
+    /** 把队列里尚未落盘的历史同步写完（切会话前/退出前调用；EDT 上不调用） */
+    public void flushHistory() {
+        if (histQueue.isEmpty()) {
+            return;
+        }
+        ensureHistWriter();
+        synchronized (histIoLock) {
+            drainHistLocked();
+        }
+    }
+
+    /** 当前线程是否 Swing EDT（是的话读历史不走 flush，避免把磁盘等待带进 UI 线程） */
+    private static boolean isEdt() {
+        return Thread.currentThread().getName().startsWith("AWT-EventQueue");
     }
 
     /**
@@ -1645,13 +2151,108 @@ public final class Store {
             for (int i = out.size() - 1; i >= 0; i--) {
                 sb.append(out.get(i)).append('\n');
             }
-            Files.write(f, sb.toString().getBytes(StandardCharsets.UTF_8));
+            atomicWrite(f, sb.toString().getBytes(StandardCharsets.UTF_8));
+            histMidOrder.clear();
             Log.i("历史封顶: " + f.getFileName() + " → " + out.size() + " 条 / " + size + " 字节");
             return true;
         } catch (IOException e) {
             Log.w("历史封顶失败(" + f.getFileName() + "): " + e);
             return false;
         }
+    }
+
+    /**
+     * 条数触发器（与安卓 P3-1 改法同构）：每个会话 > {@link #HISTORY_KEEP_ROWS}（500）条时，
+     * 按 ts 删掉最旧的 {@link #HISTORY_DROP_ROWS}（50）条再原子重写；每条新消息写入后调用。
+     * 计数用内存 mid 清单，不超限就不读盘。
+     */
+    private void trimIfNeeded(Path f) {
+        try {
+            String key = f.toAbsolutePath().toString();
+            java.util.LinkedHashSet<String> set = histMidOrder.get(key);
+            if (set == null) {
+                set = new java.util.LinkedHashSet<String>(midsInOrder(f));
+                histMidOrder.put(key, set);
+            }
+            if (set.size() <= HISTORY_KEEP_ROWS) {
+                return;
+            }
+            Map<String, Long> tsByMid = new java.util.HashMap<String, Long>();
+            for (String ln : Files.readAllLines(f, StandardCharsets.UTF_8)) {
+                String t = ln.trim();
+                if (t.isEmpty()) {
+                    continue;
+                }
+                try {
+                    Map<String, Object> row = Json.parseObject(t);
+                    String mid = Json.str(row, "mid", "");
+                    if (!mid.isEmpty()) {
+                        tsByMid.put(mid, Long.valueOf(Json.lng(row, "ts", 0L)));
+                    }
+                } catch (Exception ignore) {
+                }
+            }
+            if (tsByMid.size() <= HISTORY_KEEP_ROWS) {
+                return;
+            }
+            List<String> order = new ArrayList<String>(tsByMid.keySet());
+            order.sort((a, b) -> Long.compare(
+                    tsByMid.get(a) == null ? 0L : tsByMid.get(a).longValue(),
+                    tsByMid.get(b) == null ? 0L : tsByMid.get(b).longValue()));
+            java.util.Set<String> victims = new java.util.HashSet<String>(
+                    order.subList(0, Math.min(HISTORY_DROP_ROWS, order.size())));
+            StringBuilder kept = new StringBuilder();
+            for (String ln : Files.readAllLines(f, StandardCharsets.UTF_8)) {
+                String t = ln.trim();
+                if (t.isEmpty()) {
+                    continue;
+                }
+                String mid = "";
+                try {
+                    mid = Json.str(Json.parseObject(t), "mid", "");
+                } catch (Exception ignore) {
+                }
+                if (!mid.isEmpty() && victims.contains(mid)) {
+                    continue;
+                }
+                kept.append(t).append('\n');
+            }
+            atomicWrite(f, kept.toString().getBytes(StandardCharsets.UTF_8));
+            histMidOrder.put(key, new java.util.LinkedHashSet<String>(midsInOrder(f)));
+            Log.i("历史触发清理: " + f.getFileName() + " " + tsByMid.size()
+                    + " 条 → 删最旧 " + victims.size() + " 条");
+        } catch (IOException e) {
+            Log.w("历史触发清理失败(" + f.getFileName() + "): " + e);
+        }
+    }
+
+    /** 原子重写：先写同目录 .tmp，再 REPLACE_EXISTING(+ATOMIC_MOVE)；掉电/崩溃时原文件仍完整（与 Android 同构） */
+    private static void atomicWrite(Path f, byte[] data) throws IOException {
+        Path tmp = f.resolveSibling(f.getFileName().toString() + ".tmp");
+        Files.write(tmp, data);
+        try {
+            Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(tmp, f, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    /** 文件里出现过的 mid（按行序） */
+    private List<String> midsInOrder(Path f) throws IOException {        List<String> out = new ArrayList<String>();
+        for (String ln : Files.readAllLines(f, StandardCharsets.UTF_8)) {
+            String t = ln.trim();
+            if (t.isEmpty()) {
+                continue;
+            }
+            try {
+                String mid = Json.str(Json.parseObject(t), "mid", "");
+                if (!mid.isEmpty()) {
+                    out.add(mid);
+                }
+            } catch (Exception ignore) {
+            }
+        }
+        return out;
     }
 
     /**
@@ -1835,6 +2436,19 @@ public final class Store {
         return path;
     }
 
+    /** 已收妥那条记录的落盘字节数；-1 = 没有可确认的成品文件（判断"零分片直发 file_done"的接收回执） */
+    public long savedCompleteSize(String peerIp, String mid) {
+        String p = savedFileOf(peerIp, mid);
+        if (p.isEmpty()) {
+            return -1L;
+        }
+        try {
+            return Files.size(Paths.get(p));
+        } catch (IOException e) {
+            return -1L;
+        }
+    }
+
     /**
      * 按mid删除一条历史(用于"取消发送的文件"——取消后重载聊天记录也不应再出现)。
      * 只动该设备自己的文件:读出全部、滤掉该mid、再整体写回。
@@ -1866,6 +2480,7 @@ public final class Store {
                     }
                 }
                 Files.write(f, sb.toString().getBytes(StandardCharsets.UTF_8));
+                histMidOrder.remove(f.toAbsolutePath().toString());
             } catch (IOException e) {
                 Log.w("删历史失败: " + e);
             }
@@ -1917,6 +2532,7 @@ public final class Store {
                 }
                 if (removed > 0) {
                     Files.write(f, sb.toString().getBytes(StandardCharsets.UTF_8));
+                    histMidOrder.remove(f.toAbsolutePath().toString());
                 }
             } catch (IOException e) {
                 Log.w("批量删历史失败(" + safeKey(peerIp) + "): " + e);
@@ -1948,6 +2564,7 @@ public final class Store {
                     String kept = filterOutMid(f, mid);
                     if (kept != null) {
                         Files.write(f, kept.getBytes(StandardCharsets.UTF_8));
+                        histMidOrder.remove(f.toAbsolutePath().toString());
                         n++;
                     }
                 }
@@ -1987,6 +2604,10 @@ public final class Store {
      * 按mid合并去重(后行胜出):同一条消息可能有多行(file_meta落一次、终态updated再补一次)——加载时合成一条,后行的非空字段覆盖前行。
      * 这同时治愈旧版本留下的重复行(v1对端file_done会再emit一次added) */
     public List<Map<String, Object>> loadHistory(String peerIp, int max) {
+        // 先让排队的历史落盘（只在非 EDT 上等；EDT 走异步重载，见 ChatWindow.reloadHistory）
+        if (!isEdt()) {
+            flushHistory();
+        }
         List<Map<String, Object>> out = new ArrayList<Map<String, Object>>();
         synchronized (histLock) {
             Path f = historyFile(peerIp);
@@ -2058,11 +2679,175 @@ public final class Store {
         return old;
     }
 
+    // ==================== 删除墓碑（P2-7）====================
+
+    /**
+     * 本机删掉一条参与 hsync 的消息（文本/图片）时落一条墓碑，挡住「删了又被补回来」：
+     * ① 对端离线时 msg_del 丢失 → 墓碑让 hsync 差集里永远不再请求这条；
+     * ② 重连握手时把 sent=false 的墓碑补发一次 msg_del（对端收到即同步删除并也落墓碑）；
+     * ③ 超过 {@link #TOMB_TTL_MS}（30 天）自动清掉。
+     * 一行一条：{"peerIp":"<设备组键>","mid":"...","ts":123,"sent":false}；同一(设备,mid)后行胜出。
+     */
+    public static final long TOMB_TTL_MS = 30L * 24 * 60 * 60 * 1000;
+
+    private Path tombFile() {
+        return root.resolve("deleted.jsonl");
+    }
+
+    private static final class Tomb {
+        String key;
+        String mid;
+        long ts;
+        boolean sent;
+    }
+
+    public synchronized void addTomb(String peerIp, String mid, boolean sent) {
+        if (mid == null || mid.isEmpty()) {
+            return;
+        }
+        String k = convKeyOf(peerIp == null ? "" : peerIp);
+        if (k.isEmpty()) {
+            return;
+        }
+        try {
+            Map<String, Object> o = new LinkedHashMap<String, Object>();
+            o.put("peerIp", k);
+            o.put("mid", mid);
+            o.put("ts", System.currentTimeMillis());
+            o.put("sent", Boolean.valueOf(sent));
+            Files.write(tombFile(), (Json.stringify(o) + "\n").getBytes(StandardCharsets.UTF_8),
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (Exception e) {
+            Log.w("写删除墓碑失败: " + e);
+        }
+    }
+
+    /** 该设备名下的墓碑 mid 集合（挡 hsync 用） */
+    public synchronized Set<String> tombMids(String peerIp) {
+        Set<String> out = new HashSet<String>();
+        String k = convKeyOf(peerIp == null ? "" : peerIp);
+        for (Tomb t : readTombs().values()) {
+            if (t.key.equals(k) && !expired(t)) {
+                out.add(t.mid);
+            }
+        }
+        return out;
+    }
+
+    /** 还没通知到对端的墓碑 mid（握手补发 msg_del 用） */
+    public synchronized List<String> pendingTombs(String peerIp) {
+        List<String> out = new ArrayList<String>();
+        String k = convKeyOf(peerIp == null ? "" : peerIp);
+        for (Tomb t : readTombs().values()) {
+            if (t.key.equals(k) && !t.sent && !expired(t)) {
+                out.add(t.mid);
+            }
+        }
+        return out;
+    }
+
+    /** 标记这些 mid 已通知过对端（追加 sent=true 行，读时后行胜出） */
+    public synchronized void markTombsSent(String peerIp, java.util.Collection<String> mids) {
+        if (mids == null || mids.isEmpty()) {
+            return;
+        }
+        String k = convKeyOf(peerIp == null ? "" : peerIp);
+        if (k.isEmpty()) {
+            return;
+        }
+        try {
+            StringBuilder sb = new StringBuilder();
+            long now = System.currentTimeMillis();
+            for (String mid : mids) {
+                Map<String, Object> o = new LinkedHashMap<String, Object>();
+                o.put("peerIp", k);
+                o.put("mid", mid);
+                o.put("ts", Long.valueOf(now));
+                o.put("sent", Boolean.TRUE);
+                sb.append(Json.stringify(o)).append('\n');
+            }
+            Files.write(tombFile(), sb.toString().getBytes(StandardCharsets.UTF_8),
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (Exception e) {
+            Log.w("标记墓碑已发送失败: " + e);
+        }
+    }
+
+    /** 清掉过期墓碑（30 天）；连接建立时顺手调用一次 */
+    public synchronized void pruneTombs() {
+        try {
+            if (!Files.exists(tombFile())) {
+                return;
+            }
+            StringBuilder sb = new StringBuilder();
+            for (Tomb t : readTombs().values()) {
+                if (expired(t)) {
+                    continue;
+                }
+                Map<String, Object> o = new LinkedHashMap<String, Object>();
+                o.put("peerIp", t.key);
+                o.put("mid", t.mid);
+                o.put("ts", Long.valueOf(t.ts));
+                o.put("sent", Boolean.valueOf(t.sent));
+                sb.append(Json.stringify(o)).append('\n');
+            }
+            Files.write(tombFile(), sb.toString().getBytes(StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            Log.w("清理墓碑失败: " + e);
+        }
+    }
+
+    private static boolean expired(Tomb t) {
+        return System.currentTimeMillis() - t.ts > TOMB_TTL_MS;
+    }
+
+    /** 读全量墓碑（(设备组键,mid) 合并，后行胜出） */
+    private Map<String, Tomb> readTombs() {
+        Map<String, Tomb> out = new LinkedHashMap<String, Tomb>();
+        Path f = tombFile();
+        if (!Files.exists(f)) {
+            return out;
+        }
+        try {
+            for (String ln : Files.readAllLines(f, StandardCharsets.UTF_8)) {
+                String t = ln.trim();
+                if (t.isEmpty()) {
+                    continue;
+                }
+                try {
+                    Map<String, Object> o = Json.parseObject(t);
+                    String k = Json.str(o, "peerIp", "");
+                    String mid = Json.str(o, "mid", "");
+                    if (k.isEmpty() || mid.isEmpty()) {
+                        continue;
+                    }
+                    Tomb tb = new Tomb();
+                    tb.key = k;
+                    tb.mid = mid;
+                    tb.ts = Json.lng(o, "ts", 0L);
+                    tb.sent = Json.bool(o, "sent", false);
+                    out.put(k + "\u0000" + mid, tb);
+                } catch (Exception ignore) {
+                }
+            }
+        } catch (Exception e) {
+            Log.w("读墓碑失败: " + e);
+        }
+        return out;
+    }
+
     // ==================== 待发队列 ====================
 
     private Path pendingFile() {
         return root.resolve("pending.jsonl");
     }
+
+    /**
+     * 待发队列内存镜像（P4-10）：解析一次后常驻，新增只追加一行；
+     * 删除/清空/整批过滤时才整文件原子重写。与 Android Store.kt 的 pendingCache 同构。
+     * 所有访问都在 synchronized(this) 内（addPending/removePending/loadPending/... 均为 synchronized）。
+     */
+    private List<Map<String, Object>> pendingCache;
 
     public synchronized void addPending(Msg m) {
         List<Map<String, Object>> cur = loadPendingRaw();
@@ -2072,8 +2857,15 @@ public final class Store {
             }
         }
         m.status = Msg.ST_PENDING;
-        cur.add(m.toJson());
-        writePendingRaw(cur);
+        Map<String, Object> row = m.toJson();
+        cur.add(row);
+        try {
+            Files.write(pendingFile(),
+                    (Json.stringify(row) + "\n").getBytes(StandardCharsets.UTF_8),
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            Log.w("追加 pending.jsonl 失败: " + e);
+        }
     }
 
     public synchronized void removePending(String mid) {
@@ -2126,9 +2918,11 @@ public final class Store {
 
     /**
      * 清空与某台设备的全部聊天/传输记录:历史文件整删+待发队列里属于该设备的条目清掉。只动记录,不动已传输落盘的实际文件。
-     * <p>⚠不要用它实现"清空当前会话":它只删本机历史,对端那几条还在,对端一上线就会被hsync整段补回来。
+     * <p>⚠不要单独用它实现"清空当前会话":只删本机历史时，对端那几条还在，对端一上线就会被hsync整段补回来。
      * 界面上的清空走{@link ChatWindow#clearCurrentConversation()}——逐条mid删除+`msg_del`通知对端。
-     * 这个方法仅留给"确实要整文件丢弃"的场景(当前UI已无调用点)。
+     * 删除整台设备走{@link ChatWindow#deleteDevice(Store.Group)}：先在绑定有效时发`msg_del`，
+     * 再调用本方法整文件兜底，最后解除设备绑定，因此重发现后不会再补回已双端删除的消息。
+     * 只动记录,不动已传输落盘的实际文件。
      * @return 清掉的记录数(历史文件算1+待发条数),供UI提示;历史本来没有时也把待发清掉 */
     public int clearConversation(String peerIp) {
         if (peerIp == null || peerIp.isEmpty()) {
@@ -2187,9 +2981,13 @@ public final class Store {
     }
 
     private List<Map<String, Object>> loadPendingRaw() {
+        if (pendingCache != null) {
+            return pendingCache;
+        }
         List<Map<String, Object>> out = new ArrayList<Map<String, Object>>();
         Path f = pendingFile();
         if (!Files.exists(f)) {
+            pendingCache = out;
             return out;
         }
         try {
@@ -2207,6 +3005,7 @@ public final class Store {
         } catch (IOException e) {
             Log.w("读 pending.jsonl 失败: " + e);
         }
+        pendingCache = out;
         return out;
     }
 
@@ -2216,9 +3015,92 @@ public final class Store {
             sb.append(Json.stringify(m)).append('\n');
         }
         try {
-            Files.write(pendingFile(), sb.toString().getBytes(StandardCharsets.UTF_8));
+            atomicWrite(pendingFile(), sb.toString().getBytes(StandardCharsets.UTF_8));
         } catch (IOException e) {
             Log.w("写 pending.jsonl 失败: " + e);
+        }
+        // 重写后以新列表为准（调用方通常就是基于旧 cache 变异出来的，等价但更稳）
+        pendingCache = list;
+    }
+
+    // ==================== 送达台账（同 mid 不重发，扛进程重启；S22/S31） ====================
+
+    /** 「此 mid 已完整送达那台设备」台账（键 = mid@设备组键）。落盘 delivered.json，内存镜像读写不碰盘 */
+    private java.util.LinkedHashMap<String, Long> delivered;
+    private static final int DELIVERED_MAX = 4096;
+
+    private Path deliveredFile() {
+        return root.resolve("delivered.json");
+    }
+
+    /** 记一条送达；已记过就不回写整表 */
+    public synchronized void markDelivered(String key) {
+        if (key == null || key.isEmpty()) {
+            return;
+        }
+        java.util.LinkedHashMap<String, Long> d = loadDelivered();
+        if (d.containsKey(key)) {
+            return;
+        }
+        d.put(key, Long.valueOf(System.currentTimeMillis()));
+        while (d.size() > DELIVERED_MAX) {
+            String oldestKey = null;
+            long oldestTs = Long.MAX_VALUE;
+            for (Map.Entry<String, Long> e : d.entrySet()) {
+                long ts = e.getValue() == null ? 0L : e.getValue().longValue();
+                if (ts < oldestTs) {
+                    oldestTs = ts;
+                    oldestKey = e.getKey();
+                }
+            }
+            if (oldestKey == null) {
+                break;
+            }
+            d.remove(oldestKey);
+        }
+        writeDelivered(d);
+    }
+
+    public synchronized boolean isDelivered(String key) {
+        if (key == null || key.isEmpty()) {
+            return false;
+        }
+        return loadDelivered().containsKey(key);
+    }
+
+    private java.util.LinkedHashMap<String, Long> loadDelivered() {
+        if (delivered != null) {
+            return delivered;
+        }
+        java.util.LinkedHashMap<String, Long> d = new java.util.LinkedHashMap<String, Long>();
+        Path f = deliveredFile();
+        if (Files.exists(f)) {
+            try {
+                Object o = Json.parse(Files.readString(f, StandardCharsets.UTF_8));
+                if (o instanceof Map) {
+                    for (Map.Entry<?, ?> e : ((Map<?, ?>) o).entrySet()) {
+                        Object v = e.getValue();
+                        long ts = (v instanceof Number) ? ((Number) v).longValue() : 0L;
+                        d.put(String.valueOf(e.getKey()), Long.valueOf(ts));
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w("读送达台账失败: " + t);
+            }
+        }
+        delivered = d;
+        return d;
+    }
+
+    private void writeDelivered(java.util.LinkedHashMap<String, Long> d) {
+        try {
+            Map<String, Object> out = new java.util.LinkedHashMap<String, Object>();
+            for (Map.Entry<String, Long> e : d.entrySet()) {
+                out.put(e.getKey(), e.getValue());
+            }
+            atomicWrite(deliveredFile(), Json.stringify(out).getBytes(StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            Log.w("写送达台账失败: " + e);
         }
     }
 
@@ -2240,7 +3122,6 @@ public final class Store {
     }
 
     // ==================== 断点续传：半成品注册表 ====================
-
     /** 正在接收/未接收完的文件登记(mid→path/name/size/received),持久化到partials.json;
      *  发送端断线重连后发file_query,接收端凭它找到半成品继续追加,而不是推倒重来 */
     public synchronized void putPartial(String mid, String path, String name, long size, long received) {

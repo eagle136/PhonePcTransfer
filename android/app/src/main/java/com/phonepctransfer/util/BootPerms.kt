@@ -50,6 +50,13 @@ object BootPerms {
     /** 通知（API 33+ 才是运行时权限） */
     const val ID_NOTIF = "notif"
 
+    /**
+     * 电池优化白名单（Doze 豁免，API 23+）。
+     * 不加白名单：息屏几分钟后系统进 Doze → 后台网络整体掐断、定时器不跑 →
+     * 电脑端表现为「连接失败」，剪贴板/消息要等亮屏才恢复。加了白名单：Doze 期间仍可用网络。
+     */
+    const val ID_BATTERY = "battery"
+
     /** 图片读取（API 33+ 用 READ_MEDIA_IMAGES；更低版本被存储权限覆盖） */
     const val ID_MEDIA_IMG = "media_img"
 
@@ -142,6 +149,16 @@ object BootPerms {
             )
         }
 
+        // ---------- 特殊权限：息屏后链路不断（Doze 白名单）----------
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            out += BootPerm(
+                ID_BATTERY, "电池优化白名单",
+                "息屏后保持与电脑的连接：不加白名单时，锁屏几分钟系统就进 Doze、掐断后台网络，" +
+                    "电脑端会显示「连接失败」，剪贴板与消息要等亮屏才恢复",
+                PermKind.SPECIAL
+            )
+        }
+
         // ---------- 运行时权限：通话 ----------
         out += BootPerm(
             ID_MIC, "录音",
@@ -185,6 +202,11 @@ object BootPerms {
 
         ID_INSTALL -> ctx.packageManager.canRequestPackageInstalls()
 
+        // 已在白名单 = 已满足；低版本系统（<M）没有 Doze，也视作已满足
+        ID_BATTERY -> Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            (ctx.getSystemService(android.os.PowerManager::class.java)
+                ?.isIgnoringBatteryOptimizations(ctx.packageName) == true)
+
         else -> p.runtime?.let {
             ctx.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
         } ?: true
@@ -200,6 +222,10 @@ object BootPerms {
             ID_OVERLAY -> Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, pkg)
             ID_FSI -> Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, pkg)
             ID_INSTALL -> Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, pkg)
+            // 直接弹「是否允许不受电池优化限制」；部分 ROM 没有该页 → 退回电池优化总列表
+            ID_BATTERY -> runCatching {
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, pkg)
+            }.getOrElse { Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS) }
             else -> null
         }
     }

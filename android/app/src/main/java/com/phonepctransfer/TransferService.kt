@@ -15,7 +15,9 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
+import com.phonepctransfer.net.IdleHeartbeat
 import com.phonepctransfer.net.Link
+import com.phonepctransfer.voice.CallManager
 
 /** 前台服务：后台/小窗时保活链路；仅前台拉起（满足 startForeground 校验），持有「播放中」MediaSession 换取 ColorOS 速冻豁免 */
 class TransferService : Service() {
@@ -37,7 +39,11 @@ class TransferService : Service() {
     override fun onCreate() {
         super.onCreate()
         AppCore.init(applicationContext)
+        // 熄屏保活：亮/灭屏广播 + 熄屏期间的 CPU/WiFi 锁与 Doze 兜底心跳
+        IdleHeartbeat.start(this)
         setupMediaSession()
+        // P2-8：通话起止要立刻重申报，别等 5s 的 tick（接听后麦克风类型必须马上到位）
+        AppCore.fgsTypeRefresher = { refreshFgsType() }
     }
 
     /** 创建「播放中」的 MediaSession（不设轨/不发声），Hans 速冻豁免的关键 */
@@ -86,7 +92,7 @@ class TransferService : Service() {
         }
     }
 
-    /** 当前申报的 FGS 类型：基线 dataSync|mediaPlayback（速冻豁免），CAMERA 权限已授予才加 camera（无权限申报会抛 SecurityException）；申报类型恒为 manifest 声明的子集 */
+    /** 当前申报的 FGS 类型：基线 dataSync|mediaPlayback（速冻豁免）；CAMERA / MICROPHONE 权限已授予且**真的在用**才加（无权限申报会抛 SecurityException）；申报类型恒为 manifest 声明的子集 */
     private fun currentFgsType(): Int {
         var t = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
@@ -95,6 +101,15 @@ class TransferService : Service() {
             android.content.pm.PackageManager.PERMISSION_GRANTED
         ) {
             t = t or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+        }
+        // P2-8：microphone 只在「通话中 + 已授予 RECORD_AUDIO」时申报。
+        // 非通话期申报 microphone 会被系统判定为后台偷录音（Android 14 起更严），且用户能看见「正在录音」的提示。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+            AppCore.callState == CallManager.State.TALKING &&
+            checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            t = t or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
         }
         return t
     }
@@ -129,8 +144,10 @@ class TransferService : Service() {
     override fun onDestroy() {
         tick?.let { main.removeCallbacks(it) }
         tick = null
+        IdleHeartbeat.stop()
         fgsStarted = false
         lastFgsType = 0
+        AppCore.fgsTypeRefresher = null
         // 释放假媒体会话，免残留系统媒体面板
         runCatching { mediaSession?.release() }
         mediaSession = null
@@ -172,7 +189,7 @@ class TransferService : Service() {
             Link.State.IDLE -> "未连接"
             Link.State.STOPPED -> "未运行"
         }
-        val pending = AppCore.pendingCount
+        val pending = AppCore.waitingCount
         return if (pending > 0) "$base · 待发 $pending 条" else base
     }
 

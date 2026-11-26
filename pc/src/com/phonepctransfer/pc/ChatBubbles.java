@@ -43,6 +43,22 @@ final class ChatBubbles {
 
     private static javax.swing.Timer speedTicker;
 
+    /**
+     * 缩略图解码池。
+     * <p>原实现是「一条图片气泡 = 一个新 Thread」：批量收图时一次能开几十上百个线程，
+     * 而进度帧又会让气泡重建、每次重建再开一个 ⇒ 线程与解码任务成倍翻。固定两条线程 + 有界队列，
+     * 解不完的直接丢（图还在，重载会话会重试）。
+     */
+    private static final java.util.concurrent.ExecutorService THUMB_POOL =
+            new java.util.concurrent.ThreadPoolExecutor(2, 2, 30L, java.util.concurrent.TimeUnit.SECONDS,
+                    new java.util.concurrent.LinkedBlockingQueue<Runnable>(256),
+                    r -> {
+                        Thread th = new Thread(r, "pp-thumb");
+                        th.setDaemon(true);
+                        return th;
+                    },
+                    new java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy());
+
     private static synchronized void ensureSpeedTicker() {
         if (speedTicker != null && speedTicker.isRunning()) {
             return;
@@ -85,13 +101,40 @@ final class ChatBubbles {
         return sp.isEmpty() ? pct + "%" : pct + "%  " + sp;
     }
 
+    /**
+     * 进度帧原地更新：只改进度条数值与文案，不重建气泡。
+     * <p>批量传输时 1% 一帧、多个文件并行，全走「整泡重建 + 全量 revalidate」会把 EDT 淹死；
+     * 纯进度帧（状态没变）用这个方法，UI 泵最后一并 repaint 即可。
+     */
+    static boolean updateBarValue(String mid, int pct) {
+        if (mid == null || mid.isEmpty()) {
+            return false;
+        }
+        JProgressBar pb = LIVE_BARS.get(mid);
+        if (pb == null) {
+            return false;
+        }
+        if (pb.getParent() == null) { // 气泡已被重建/移除
+            LIVE_BARS.remove(mid);
+            return false;
+        }
+        pb.setValue(pct);
+        pb.setString(speedLabel(mid, pct));
+        return true;
+    }
+
     void addBubble(Msg m) {
+        addBubbleQuiet(m);
+        W.msgPanel.revalidate();
+    }
+
+    /** 只挂组件、不做布局：批量投递时由 UI 泵统一 revalidate/repaint（见 ChatWindow.postUi） */
+    void addBubbleQuiet(Msg m) {
         W.mids.add(m.mid);
         W.bubbleMsgOf.put(m.mid, m);
         JComponent c = bubble(m, false);
         W.comps.add(c);
         W.msgPanel.add(c);
-        W.msgPanel.revalidate();
     }
 
     void scrollToBottom() {
@@ -560,7 +603,7 @@ final class ChatBubbles {
             rp.add(pic);
             final File cache = thumbCacheFile(m.mid);
             final java.util.concurrent.atomic.AtomicBoolean replaced = new java.util.concurrent.atomic.AtomicBoolean(false);
-            Thread t = new Thread(() -> {
+            THUMB_POOL.execute(() -> {
                 // 重试：收到图片时这条气泡是**刚被重建**的，文件可能刚关流、系统还没把它索引好，
                 // 一次 decode 失败很常见。若失败就静默 return → 气泡永远停在「图片加载中…」，
                 // 只有切会话（重载全部气泡）才会重试成功。
@@ -599,9 +642,7 @@ final class ChatBubbles {
                     W.msgPanel.revalidate();
                     W.msgPanel.repaint();
                 });
-            }, "thumb-" + m.fileName);
-            t.setDaemon(true);
-            t.start();
+            });
         }
 
         JLabel name = new JLabel((isImage ? "[图片] " : "[文件] ") + Texts.middleEllipsis(m.fileName, 26));

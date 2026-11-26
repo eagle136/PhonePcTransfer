@@ -70,6 +70,17 @@ fun SettingsDialog(onDismiss: () -> Unit) {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                // 票③（拒绝使用数据流量）现在按设备 + 限时自动解除；这里再留一个显式反悔入口，
+                // 覆盖「红色叹号气泡被删掉」后没有重试按钮的情况（P1-1）。
+                TextButton(onClick = {
+                    val ip = AppCore.link.selectedIp
+                    if (ip.isEmpty()) {
+                        AppCore.toast("请先在设备列表选择一台设备")
+                    } else {
+                        AppCore.link.resumeFileSend(ip)
+                        AppCore.toast("已清除「拒绝数据流量」标记，正在补发该设备的待发文件")
+                    }
+                }) { Text("恢复文件发送（清除拒绝数据流量标记）") }
 
                 HorizontalDivider()
                 Row(
@@ -120,6 +131,7 @@ fun SettingsDialog(onDismiss: () -> Unit) {
 
                 HorizontalDivider()
                 A11yRow()
+                BatteryRow()
 
                 // 某一问上点「不需要」会把那一项永久关掉；这里留一个总反悔入口，
                 // 否则「显示悬浮窗 / 全屏通知」这类只能手动开的权限就再没有任何引导路径了。
@@ -232,6 +244,49 @@ fun SettingsDialog(onDismiss: () -> Unit) {
             }
         }
     )
+}
+
+/**
+ * 电池优化白名单（Doze 豁免）：息屏后保持链路真正的前提。
+ * 不持 wake lock，只申请「系统允许本应用在 Doze 期间使用网络」这一个白名单；
+ * 从系统设置页返回时按 ON_RESUME 自动刷新状态（与 [A11yRow] 同一套写法）。
+ */
+@Composable
+private fun BatteryRow() {
+    val ctx = LocalContext.current
+    val owner = ctx as? androidx.lifecycle.LifecycleOwner
+    fun nowIgnoring(): Boolean = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+        (ctx.getSystemService(android.os.PowerManager::class.java)
+            ?.isIgnoringBatteryOptimizations(ctx.packageName) == true)
+    var ignoring by remember { mutableStateOf(nowIgnoring()) }
+    androidx.compose.runtime.DisposableEffect(owner) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
+            if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) ignoring = nowIgnoring()
+        }
+        owner?.lifecycle?.addObserver(obs)
+        onDispose { owner?.lifecycle?.removeObserver(obs) }
+    }
+    Text(
+        "电池优化白名单：息屏后不被系统暂停后台网络。不加时锁屏几分钟就进 Doze，电脑端会显示「连接失败」。本应用不常驻持锁，只在传输/通话时持。",
+        style = MaterialTheme.typography.bodySmall
+    )
+    TextButton(onClick = {
+        val pkg = Uri.parse("package:${ctx.packageName}")
+        runCatching {
+            ctx.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, pkg))
+        }.onFailure {
+            runCatching { ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+        }
+    }) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (ignoring) GlyphIcon(Glyph.CHECK, size = 14.dp)
+            Text(
+                text = if (ignoring) "电池优化白名单：已加入（点此管理）"
+                else "去加入电池优化白名单（息屏保活）",
+                modifier = Modifier.padding(start = if (ignoring) 5.dp else 0.dp)
+            )
+        }
+    }
 }
 
 /**

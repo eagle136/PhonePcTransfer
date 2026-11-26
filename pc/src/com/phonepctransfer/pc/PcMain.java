@@ -41,6 +41,18 @@ public final class PcMain {
     private static final int GUARD_PORT = 8767;
     private static java.net.ServerSocket guardSocket;
 
+    /**
+     * 启动闸门：启动后先给「已保存设备」多少毫秒的连接机会，超时才开扫描（用户定：1s）。
+     * 扫描照旧执行（连上了也扫，只是顺序被推到这 1s 之后）。
+     */
+    private static final long STARTUP_DIAL_TIMEOUT_MS = 1000L;
+
+    /**
+     * 扫描后逐台拨号时，等「当前这一台的拨号动作」结束的上限（毫秒）。
+     * connectTo 的候选队列只有一个槽，不等就投下一台会把上一台顶掉 = 只有最后一台真被拨过。
+     */
+    private static final long DIAL_SLOT_WAIT_MS = 3000L;
+
     /** 已运行实例收到 SHOW 时执行的动作（主窗口建好之后才注册） */
     private static volatile Runnable onShowCommand = () -> { };
 
@@ -273,6 +285,281 @@ public final class PcMain {
         }
     }
 
+    /** 设备列表里是否有这个地址（启动自动连接/兜底判定用） */
+    private static boolean knownPeer(final Store store, final String ip) {
+        if (store == null || ip == null || ip.isEmpty()) {
+            return false;
+        }
+        for (Peer p : store.peers()) {
+            if (ip.equals(p.ip)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 设备列表里的显示名；没有则 null */
+    private static String peerLabelOf(final Store store, final String ip) {
+        if (store == null || ip == null || ip.isEmpty()) {
+            return null;
+        }
+        for (Peer p : store.peers()) {
+            if (ip.equals(p.ip)) {
+                return p.displayName();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 启动闸门第 1 步：先给「上次设备」一次连接机会，最多等 {@code timeoutMs}（阻塞到连上/超时）。
+     *
+     * <p>为什么要有这道闸门：扫描是主动广播 + 本网段 254 个地址逐个单播询问，一开跑就会占用
+     * 链路唯一的候选队列（{@code connectTo} 一次只处理一个候选队列），谁先拨谁占位。
+     * 需求定的是「先尝试已保存设备（超时 1s），之后才开扫描」，所以这里必须**串行**：
+     * 1s 内连上 → 返回 true；没连上 → 返回 false，由调用方继续开扫描（扫描照旧执行，连上也扫）。
+     *
+     * @return true = 1s 内已连上上次设备
+     */
+    private static boolean quickDialRemembered(final Store store, final Link link,
+                                               final long timeoutMs) {
+        String ip = store.lastIp();
+        if (ip == null || ip.isEmpty()) {
+            Log.i("启动闸门：没有上次设备，直接进入扫描");
+            return false;
+        }
+        // 设备身份是 deviceId+token，地址只是它当下的接入点：上次设备换了 IP（重启/换 WiFi/DHCP 续租），
+        // 就直接拨同一台设备组里最近出现的那个局域网地址，别拿着旧地址白等 1s、更别因此重新配对
+        String fresh = store.curIpOf(store.convKeyOf(ip));
+        if (fresh != null && !fresh.isEmpty() && !fresh.equals(ip)) {
+            Log.i("启动闸门：上次设备 " + ip + " 换了局域网地址 → " + fresh + "（同一设备，身份不变）");
+            ip = fresh;
+        }
+        if (!knownPeer(store, ip)) {
+            Log.i("启动闸门：上次设备 " + ip + " 已不在设备列表（用户删过），直接进入扫描");
+            return false;
+        }
+        if (link.isConnectedIp(ip)) {
+            Log.i("启动闸门：上次设备 " + ip + " 已在线");
+            return true;
+        }
+        final String label = peerLabelOf(store, ip);
+        final long t0 = System.currentTimeMillis();
+        Log.i("启动闸门：先拨上次设备 " + ip + (label != null ? "（" + label + "）" : "")
+                + "，最多等 " + timeoutMs + "ms");
+        link.selectAndConnect(ip, label);
+        while (System.currentTimeMillis() - t0 < timeoutMs) {
+            if (exiting) {
+                return false;
+            }
+            if (link.isConnectedIp(ip)) {
+                Log.i("启动闸门：上次设备 " + ip + " 在 " + (System.currentTimeMillis() - t0)
+                        + "ms 内连上（扫描照旧执行）");
+                return true;
+            }
+            try {
+                Thread.sleep(50L);
+            } catch (InterruptedException e) {
+                return false;
+            }
+        }
+        Log.i("启动闸门：上次设备 " + ip + " " + timeoutMs + "ms 内未连上，开始扫描");
+        return false;
+    }
+
+    /**
+     * 启动闸门第 2 步（只在 1s 内没连上时执行）：扫描之后再补拨「上次设备」几轮。
+     *
+     * <p>根因：单次 3s 扫描很容易漏掉刚启动/被系统冻结/广播被 AP 隔离吞掉的手机，
+     * 而扫描到别的设备时它会被整段跳过（实测 10:06 冷启动扫到另一台旧手机 .14，上次设备 .13 一次都没拨）。
+     * 节奏 0/1/2/4/8s 各试一次，连上即停；仍走 connectTo 的「单次意图」队列，不引入无限重连。
+     */
+    private static void dialRememberedRetries(final Store store, final Link link) {
+        String ip = store.lastIp();
+        if (ip == null || ip.isEmpty()) {
+            return;
+        }
+        // 同上：同一台设备换过局域网地址就拨新地址（身份不变，配对记录照旧有效）
+        String fresh = store.curIpOf(store.convKeyOf(ip));
+        if (fresh != null && !fresh.isEmpty()) {
+            ip = fresh;
+        }
+        if (!knownPeer(store, ip)) {
+            return;
+        }
+        // 重试节奏改快（原来 0/5/10s）：手机端冷启动要 3~5s 才 listen，5s 一次的退避正好每次都撞在
+        // "还没起来"的窗口上，实测从点开到连上要 17s。改成 0/1/2/4/8s，对端一起来就能接上。
+        final long[] waits = {0L, 1000L, 2000L, 4000L, 8000L};
+        for (int i = 0; i < waits.length; i++) {
+            if (exiting) {
+                return;
+            }
+            if (waits[i] > 0) {
+                try {
+                    Thread.sleep(waits[i]);
+                } catch (InterruptedException e) {
+                    return;
+                }
+            }
+            if (link.isConnectedIp(ip)) {
+                return;
+            }
+            // 用户在这几秒里点了别的设备 → 别再抢回「上次设备」，重试到此为止
+            if (i > 0 && !ip.equals(link.selectedIp())) {
+                Log.i("启动自动连接：用户已切到 " + link.selectedIp() + "，停止重试上次设备");
+                return;
+            }
+            // 扫描阶段的自动连接可能正在拨同一台：等它把候选队列用完再决定（顶掉会两边都连不上）
+            long dialDeadline = System.currentTimeMillis() + 4000L;
+            while (link.isDialing() && System.currentTimeMillis() < dialDeadline && !exiting) {
+                if (link.isConnectedIp(ip)) {
+                    return;
+                }
+                try {
+                    Thread.sleep(100L);
+                } catch (InterruptedException e) {
+                    return;
+                }
+            }
+            if (link.isConnectedIp(ip)) {
+                return;
+            }
+            Log.i("启动自动连接上次设备（补拨第 " + (i + 1) + " 次）" + ip
+                    + (peerLabelOf(store, ip) != null ? "（" + peerLabelOf(store, ip) + "）" : ""));
+            link.selectAndConnect(ip, peerLabelOf(store, ip));
+            // 等本轮尝试出结果（成功或候选全失败）再决定要不要重试；
+            // 否则下一次 selectAndConnect 会把仍在处理的候选队列顶掉。
+            long deadline = System.currentTimeMillis() + 8000L;
+            while (!exiting && System.currentTimeMillis() < deadline) {
+                if (link.isConnectedIp(ip)) {
+                    Log.i("启动自动连接成功 " + ip);
+                    return;
+                }
+                if (!link.isDialing()) {
+                    break;
+                }
+                try {
+                    Thread.sleep(200L);
+                } catch (InterruptedException e) {
+                    return;
+                }
+            }
+        }
+        Log.i("启动自动连接上次设备 " + ip + " 多次未成功，转为被动等待对端连入/用户手点");
+    }
+
+    /** 数据版本记录文件（%APPDATA%\PhonePcTransfer\data-version.txt） */
+    private static final String DATA_VERSION_FILE = "data-version.txt";
+
+    /**
+     * 版本号变化：问「是否需要清除应用数据（不影响已接收的文件）」。
+     * 清除 = 删数据目录下除 received/ 与 logs/ 之外的一切（配置/历史/配对/待发/半成品台账），
+     * 保留 = 只把记录改成当前版本。两条分支都写回记录 → 以后不再弹。
+     * 首次运行（无记录）静默写入；取不到当前版本号时直接跳过（绝不误清数据）。
+     */
+    private static void askDataVersionOnChange(Path root) {
+        String cur = Version.current();
+        if (cur.isEmpty()) {
+            Log.i("版本变化检查：取不到当前版本号，跳过（不清数据、不改记录）");
+            return;
+        }
+        Path marker = root.resolve(DATA_VERSION_FILE);
+        String rec = "";
+        try {
+            if (java.nio.file.Files.isRegularFile(marker)) {
+                rec = new String(java.nio.file.Files.readAllBytes(marker),
+                        java.nio.charset.StandardCharsets.UTF_8).trim();
+            }
+        } catch (Exception ignore) {
+            // 读不到就按「从未记录」处理
+        }
+        if (rec.isEmpty()) {
+            // 首次运行 vs 老版本升级：没有记录但**已经有旧数据** ⇒ 是升级（旧版本从没写过记录），照样要问
+            if (!hasExistingData(root)) {
+                writeDataVersion(marker, cur);
+                Log.i("版本变化检查：首次运行（无旧数据），已记录版本 " + cur);
+                return;
+            }
+            rec = "未知（旧版本）";
+            Log.i("版本变化检查：检测到旧数据但没有版本记录，按版本变化处理");
+        }
+        if (rec.equals(cur)) {
+            return;
+        }
+        Log.i("版本变化：数据记录 " + rec + " → 当前 " + cur);
+        int opt = javax.swing.JOptionPane.showOptionDialog(
+                null,
+                "检测到版本变化：" + rec + " → " + cur + "\n\n是否需要清除应用数据（不影响已接收的文件）？\n\n"
+                        + "清除：聊天记录、待发队列、半成品台账、设备与设置全部重置。\n"
+                        + "保留：沿用现有数据，只更新数据里的版本记录，之后不再提示。",
+                "版本变化",
+                javax.swing.JOptionPane.YES_NO_OPTION,
+                javax.swing.JOptionPane.QUESTION_MESSAGE,
+                null,
+                new Object[]{"清除数据", "保留数据"},
+                "保留数据");
+        // 关闭对话框（CLOSED_OPTION）/ESC 视为「保留」：不清数据只改记录，避免反复骚扰
+        if (opt == 0) {
+            int n = clearDataKeepingReceived(root);
+            Log.i("版本变化：已按用户选择清除应用数据（已接收的文件保留），删除 " + n + " 项");
+        } else {
+            Log.i("版本变化：用户选择保留现有数据，仅更新版本记录");
+        }
+        writeDataVersion(marker, cur);
+    }
+
+    /** 数据目录里是否已有旧数据（用于区分「首次运行」和「旧版本升级」） */
+    private static boolean hasExistingData(Path root) {
+        String[] names = {"config.json", "pending.jsonl", "deleted.jsonl",
+                "partials.json", "delivered.json", "paired.json"};
+        for (String n : names) {
+            if (java.nio.file.Files.isRegularFile(root.resolve(n))) {
+                return true;
+            }
+        }
+        Path hist = root.resolve("history");
+        if (java.nio.file.Files.isDirectory(hist)) {
+            try (java.nio.file.DirectoryStream<Path> ds = java.nio.file.Files.newDirectoryStream(hist)) {
+                for (Path p : ds) {
+                    if (java.nio.file.Files.isRegularFile(p) && java.nio.file.Files.size(p) > 0L) {
+                        return true;
+                    }
+                }
+            } catch (Exception ignore) {
+                // 读不了就当没有，最多是不提示，绝不误判成升级去删数据
+            }
+        }
+        return false;
+    }
+
+    /** 删数据目录下除 received/ 与 logs/ 之外的所有内容；返回删除的顶层项数 */
+    private static int clearDataKeepingReceived(Path root) {
+        int n = 0;
+        try (java.nio.file.DirectoryStream<Path> ds = java.nio.file.Files.newDirectoryStream(root)) {
+            for (Path p : ds) {
+                String name = p.getFileName().toString();
+                // received 是已接收的文件；logs 正被 Log 打开（Windows 上删不掉，也不该删）
+                if ("received".equals(name) || "logs".equals(name)) {
+                    continue;
+                }
+                LinkNames.deleteRecursively(p.toFile());
+                n++;
+            }
+        } catch (Exception e) {
+            Log.i("清除应用数据失败: " + e);
+        }
+        return n;
+    }
+
+    private static void writeDataVersion(Path marker, String v) {
+        try {
+            java.nio.file.Files.createDirectories(marker.getParent());
+            java.nio.file.Files.write(marker, v.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            Log.i("写数据版本记录失败: " + e);
+        }
+    }
+
     public static void main(String[] args) {
         try {
             // ===== UI 缩放钉定（必须是 main 里最先做的事）=====
@@ -304,6 +591,16 @@ public final class PcMain {
             Log.i("UI 缩放钉定: " + (uiScale > 0
                     ? "固定 " + uiScale + "（100% 整数像素渲染 + 宋体点阵；config.json uiScale=system 可改为跟随系统）"
                     : "跟随系统缩放"));
+            // 运行时版本 + 老运行时告警：JDK 21.0.2 在非 100% 显示缩放下有个渲染缺陷 ——
+            // JDialog / JFileChooser 这类二级窗口只画出标题栏，客户区整片空白（主窗口正常，
+            // 所以开发机看不出来）。实测 21.0.12 与 JBR 25 均正常。装在用户机上的安装版
+            // 如果还是 21.0.2，就会「按钮点了像没反应」，日志里要能一眼看见运行时时版本。
+            {
+                Runtime.Version rv = Runtime.version();
+                boolean oldRuntime = rv.feature() == 21 && rv.update() < 7;
+                Log.i("运行时: " + System.getProperty("java.vendor") + " " + rv
+                        + (oldRuntime ? "（⚠ 该补丁版在非 100% 缩放下二级窗口会整片空白，请升级到 21.0.7+ 重新打包）" : ""));
+            }
             logIfElevated();
 
             // ===== 单实例闸门：抢不到锁 = 已有实例在跑，唤起它然后退出 =====
@@ -317,6 +614,10 @@ public final class PcMain {
             Thread shortcut = new Thread(PcMain::ensureDesktopShortcut, "pp-shortcut");
             shortcut.setDaemon(true);
             shortcut.start();
+
+            // ===== 版本变化 → 问一次是否清除软件数据（不影响已接收的文件）=====
+            //  放在 new Store(root) 之前：此刻还没有任何数据对象/内存缓存，清完直接按干净状态启动
+            askDataVersionOnChange(root);
 
             final Store store = new Store(root);
             store.load();
@@ -374,7 +675,18 @@ public final class PcMain {
                     ? java.util.Arrays.asList("hevc", "h264")
                     : java.util.Collections.<String>emptyList());
 
-            final ChatWindow win = new ChatWindow(link, store);
+            // ChatWindow 必须在 EDT 上构建：Swing 组件树在非 EDT 线程建好、EDT 又同时在跑重绘，
+            // 会出现「首帧只画了一部分、鼠标划过才补齐」这类只在真机上复现的脏帧。
+            final ChatWindow win;
+            final ChatWindow[] winRef = new ChatWindow[1];
+            try {
+                javax.swing.SwingUtilities.invokeAndWait(() -> winRef[0] = new ChatWindow(link, store));
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                throw (cause instanceof RuntimeException) ? (RuntimeException) cause
+                        : new RuntimeException(cause);
+            }
+            win = winRef[0];
 
             // 后台入向闸门判据（与安卓端 incomingGate 同规则）：
             // 窗口隐藏进托盘 = 后台 → 陌生设备的 TCP 连入一律拒接，已知设备放行；
@@ -531,6 +843,18 @@ public final class PcMain {
                     // 日志已落盘，UI 只在状态栏给最近一条
                 }
 
+                /** 发送前校验失败等用户级提示：交给聊天窗口弹框（内部切 UI 线程） */
+                @Override
+                public void onNotice(String text) {
+                    win.notifyUser(text);
+                }
+
+                /** P4-5：配对覆盖层（显示 6 位码 / 数字键盘输入）；null = 关闭 */
+                @Override
+                public void onPairState(Link.PairUi u) {
+                    win.showPair(u);
+                }
+
                 @Override
                 public void onCallInvite(String peerIp, String name) {
                     callAsync(() -> call.onIncoming(peerIp, name));
@@ -630,21 +954,51 @@ public final class PcMain {
                     new Discovery.Listener() {
                         @Override
                         public void onPeer(String ip, String name, String id, int port) {
-                            // 自动发现：既有设备刷新发现信息，新设备直接进左侧设备列表
-                            if (store.upsertPeer(ip, null, id, name, System.currentTimeMillis())) {
+                            // 自动发现：既有设备刷新发现信息，新设备直接进左侧设备列表。
+                            // upsertPeer 返回 false 只代表「数据没变」，不代表「界面已经有了」——
+                            // 一律重刷列表，避免「设备一直在发广播、界面却停在旧列表」。
+                            boolean changed = store.upsertPeer(ip, null, id, name, System.currentTimeMillis());
+                            if (changed) {
                                 win.setSub("发现设备 " + name + " @ " + ip + "，已加入设备列表");
                                 Log.i("发现设备 " + name + " @ " + ip + "，已加入设备列表");
-                                win.refreshDevices();
                             }
+                            win.refreshDevices();
                         }
                     });
-            disc.start();
+            // 注意：这里**不** start —— 启动闸门要先把「上次设备」拨一次，之后才开发现/扫描
+
+            // 用户从托盘/二次启动把窗口唤回时补扫一轮：
+            // 「打开界面这一刻」最需要看到现在有哪些设备在线，而 Discovery 平时只被动接收。
+            // 8s 冷却：连点托盘图标不会反复扫；发现窗口还没显示就先跳过（冷启动由启动闸门负责）。
+            final long[] lastShowScanAt = new long[] { 0L };
+            win.onWindowShown = () -> {
+                long now = System.currentTimeMillis();
+                if (now - lastShowScanAt[0] < 8000L || !disc.isRunning()) {
+                    return;
+                }
+                lastShowScanAt[0] = now;
+                win.setSub("正在扫描局域网…");
+                Thread t = new Thread(() -> {
+                    java.util.List<String> found = disc.scanOnce(3000, Discovery.localIpv4());
+                    if (found.isEmpty()) {
+                        win.setSub("无新设备");
+                        Log.i("窗口唤回补扫：无新设备");
+                    } else {
+                        win.setSub("发现 " + found.size() + " 台设备");
+                        Log.i("窗口唤回补扫：发现 " + found.size() + " 台设备 " + found);
+                    }
+                    win.refreshDevices();
+                }, "pp-rescan-on-show");
+                t.setDaemon(true);
+                t.start();
+            };
 
             // ===== 启动扫一次局域网（只此一次）=====
-            // 闸门：本机 IP 必须落在**私网段**（10/8、172.16/12、192.168/16）
-            // 才真的扫 —— 公网 / 链路本地地址没有「本网段 /24」可扫，逐个扫 254 个地址既没意义，
+            // 闸门：本机**任意一块网卡**落在私网段（10/8、172.16/12、192.168/16）就扫
+            // （多网卡机器可能同时有 192.168.1.x 与 192.168.5.x，只看「首选 IP」会挑错网段）；
+            // 公网 / 链路本地地址没有「本网段 /24」可扫，逐个扫 254 个地址既没意义，
             // 也容易被对端网络当成端口扫描。
-            // 扫描窗口 = 广播询问 + **本网段 /24 逐地址单播询问**（本机 10.1.2.3 → 只扫 10.1.2.1-254）。
+            // 扫描窗口 = 广播询问 + **每个私网 /24 逐地址单播询问**。
             // 窗口内**回应**的设备会经由 Discovery.Listener → store.upsertPeer 自动进入设备列表，
             // 这里只负责汇报结果：有回应 →「发现 N 台设备」，一个都没有 →「无新设备」。
             // 此后不再主动扫：靠 Discovery 接收线程常驻，被动接收对端广播并刷新设备列表。
@@ -652,15 +1006,22 @@ public final class PcMain {
                 @Override
                 public void run() {
                     final String myIp = Discovery.localIpv4();
-                    final String prefix = Discovery.subnetPrefixOf(myIp);
-                    if (prefix == null) {
+                    final java.util.List<String> prefixes = new java.util.ArrayList<String>();
+                    for (String ip : Discovery.localIpv4s()) {
+                        String p = Discovery.subnetPrefixOf(ip);
+                        if (p != null && !prefixes.contains(p)) {
+                            prefixes.add(p);
+                        }
+                    }
+                    if (prefixes.isEmpty()) {
                         final String shown = (myIp == null || myIp.isEmpty()) ? "未知" : myIp;
                         win.setSub("本机不在局域网私有网段（" + shown + "），已跳过扫描");
                         Log.i("跳过局域网扫描：本机 " + shown + " 不属于私网段（10/172.16-31/192.168）");
                         return;
                     }
-                    win.setSub("正在扫描 " + prefix + ".1-254…");
-                    Log.i("开始扫描局域网（本机 " + myIp + "，本网段 " + prefix + ".1-254）");
+                    final String prefixLabel = String.join(" / ", prefixes);
+                    win.setSub("正在扫描 " + prefixLabel + ".1-254…");
+                    Log.i("开始扫描局域网（本机 " + myIp + "，网段 " + prefixLabel + ".1-254）");
                     Thread t = new Thread(new Runnable() {
                         @Override
                         public void run() {
@@ -676,45 +1037,59 @@ public final class PcMain {
                             // 只试一次，失败不重试，重连仍以用户点击设备为准）。
                             // 扫描空手时兜底：lastIp 仍在设备列表则单独试它。
                             try {
-                                if (!found.isEmpty()) {
-                                    for (String ip : found) {
+                                // 目标 = 上次设备（唯一优先）+ 无上次设备时才用扫描结果。
+                                // 根因：原来扫描结果非空就只连扫描到的设备，上次设备被整段跳过；
+                                // 而且 connectTo 的候选队列只有一个槽，「for 全部 found 逐个 selectAndConnect」
+                                // 实际只有最后一台能留下 —— 多台设备时等于是「最后扫到的那台」在抢占。
+                                java.util.List<String> targets = new java.util.ArrayList<>();
+                                String last = store.lastIp();
+                                if (!last.isEmpty() && knownPeer(store, last)) {
+                                    targets.add(last);
+                                    if (!found.contains(last)) {
+                                        Log.i("上次设备 " + last + " 本轮扫描未回应，仍优先尝试");
+                                    }
+                                }
+                                // 扫到的每个地址都排进队列（不是"有上次设备就整段跳过"）：
+                                // 之前配对过的带 token → 对端核对通过直接放行，并把它的历史地址换成这条
+                                // （替换在 Link.onSessionReady，验证通过之后才做）；
+                                // 没连接过的握手成功也只以「未配对」进列表，不弹配对码
+                                for (String ip : found) {
+                                    if (!targets.contains(ip)) {
+                                        targets.add(ip);
+                                    }
+                                }
+                                if (targets.isEmpty()) {
+                                    Log.i("跳过自动连接：本轮无扫描结果且无可用的历史连接目标");
+                                } else {
+                                    int dialed = 0;
+                                    for (String ip : targets) {
                                         if (link.isConnectedIp(ip)) {
                                             Log.i("自动连接目标 " + ip + " 已连接，无需连接");
                                             continue;
                                         }
-                                        String label = null;
-                                        for (Peer p : store.peers()) {
-                                            if (ip.equals(p.ip)) {
-                                                label = p.displayName();
-                                                break;
-                                            }
+                                        // 同一台设备已经在别的地址上连通了（换过 IP 的常见情形）：跳过，
+                                        // 别拿旧地址再扰它一次（组键≠IP 说明这行已绑到某台设备）
+                                        String devKey = store.convKeyOf(ip);
+                                        if (devKey != null && !devKey.isEmpty() && !devKey.equals(ip)
+                                                && link.isPeerConnected(devKey)) {
+                                            Log.i("自动连接目标 " + ip + " 所属设备已有会话，跳过");
+                                            continue;
                                         }
+                                        // 候选队列只有一个槽：上一台还在拨就先等它拨完（有上限），
+                                        // 否则后一台会把前一台顶掉，实际只有最后一台真拨出去
+                                        long waitUntil = System.currentTimeMillis() + DIAL_SLOT_WAIT_MS;
+                                        while (link.isDialing() && System.currentTimeMillis() < waitUntil) {
+                                            Thread.sleep(30);
+                                        }
+                                        String label = peerLabelOf(store, ip);
                                         Log.i("启动扫描后自动连接 " + ip
                                                 + (label != null ? "（" + label + "）" : ""));
                                         link.selectAndConnect(ip, label);
-                                        // 不再写 store.setLastIp(ip)：那是「上次会话」的记忆，
+                                        dialed++;
+                                        // 不写 store.setLastIp(ip)：那是「上次会话」的记忆，
                                         // 每轮扫描都覆盖会让下次启动恢复成最后扫描到的那台
                                     }
-                                    win.setSub("自动连接 " + found.size() + " 台设备…");
-                                } else {
-                                    String last = store.lastIp();
-                                    boolean inList = false;
-                                    if (!last.isEmpty()) {
-                                        for (Peer p : store.peers()) {
-                                            if (last.equals(p.ip)) {
-                                                inList = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if (inList && !link.isConnectedIp(last)) {
-                                        Log.i("本轮扫描无回应，兜底自动连接上次设备 " + last);
-                                        link.selectAndConnect(last, null);
-                                    } else {
-                                        Log.i("跳过自动连接：本轮无扫描结果"
-                                                + (last.isEmpty() ? "，且无历史连接目标" : "，上次设备 " + last
-                                                        + (inList ? " 已连接" : " 不在设备列表")));
-                                    }
+                                    win.setSub("自动连接 " + dialed + " 台设备…");
                                 }
                             } catch (Throwable t) {
                                 Log.w("自动连接失败: " + t);
@@ -732,16 +1107,39 @@ public final class PcMain {
                     }, "pp-scan");
                     t.setDaemon(true);
                     t.start();
+                    // 同步等它扫完：启动闸门要求「1s 拨号 → 扫描 → 补拨重试」严格串行，
+                    // 扫描还没结束就补拨会把 Link 唯一的候选队列顶掉（两边都连不上）。
+                    try {
+                        t.join();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
             };
-            // 只扫这一次：之后不再主动广播扫描，改为纯被动接收对端广播
-            //（Discovery 的接收线程常驻，收到谁就把谁 upsert 进设备列表）。
-            startupScan.run();
-
-            // 托盘常驻
+            // 托盘常驻（先就绪：1s 闸门在后台线程里跑，别让它拖慢图标出现）
             Tray.init(win, link, clip, disc, store);
             // 注册主题监听：运行期切主题时重刷托盘菜单（菜单只在 init 建一次，颜色建时烤走，根因③）
             Ui.addThemeListener(Tray::refreshTheme);
+
+            // ===== 启动闸门：先 1s 尝试「已保存设备」，之后才开扫描 =====
+            // 顺序（需求定死，不要并行化）：quickDial(≤1s) → disc.start() → startupScan
+            // → 仍未连上才补拨几轮。扫描照旧执行（1s 内连上也扫，见 quickDialRemembered 注释）。
+            Thread boot = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    boolean quick = quickDialRemembered(store, link, STARTUP_DIAL_TIMEOUT_MS);
+                    // 被动发现先起：scanOnce 的回应要靠 Discovery 的收线程收
+                    disc.start();
+                    // 只扫这一次：之后不再主动广播扫描，改为纯被动接收对端广播
+                    //（Discovery 的接收线程常驻，收到谁就把谁 upsert 进设备列表）。
+                    startupScan.run();
+                    if (!quick) {
+                        dialRememberedRetries(store, link);
+                    }
+                }
+            }, "pp-startup");
+            boot.setDaemon(true);
+            boot.start();
 
             // 主窗口就绪 → 注册二次启动的唤起动作，并开始守卫监听
             onShowCommand = win::showWindow;
@@ -980,16 +1378,32 @@ public final class PcMain {
 
                 icon = new TrayIcon(makeIcon(), "手机电脑互传");
                 icon.setImageAutoSize(true);
-                icon.addActionListener(e -> win.showWindow());
+                /*
+                 * ⚠️ 窗口唤起只走 MouseListener，不要再挂 addActionListener。
+                 * 根因：AWT 的托盘 ActionListener 在 Windows 上**只有双击**才触发，而且实测
+                 * 本机单击、双击都毫无反应；右键菜单却能正常弹出（日志有「托盘菜单弹出 @ …」）
+                 * —— 说明 MouseEvent 通路是通的，ActionEvent 那条通路收不到。
+                 * 现在：左键（单击/双击都算）→ 打开主窗口；右键 → 弹菜单（行为不变）。
+                 */
                 icon.addMouseListener(new MouseAdapter() {
                     @Override
                     public void mousePressed(MouseEvent e) {
                         maybeShowMenu(e);
+                        // 鼠标在图标上按下时就唤起：不等 release，避免部分机器/输入设备
+                        // 只送 press 不送 release 时又变成「点了没反应」
+                        if (isLeftButton(e)) {
+                            openFromTray(win);
+                        }
                     }
 
                     @Override
                     public void mouseReleased(MouseEvent e) {
                         maybeShowMenu(e);
+                        // press + release 两条都挂上：不同 Windows/输入设备送给托盘的事件子集不一样，
+                        // 来一条就能唤起（openFromTray 内部 250ms 去重，重复调用无副作用）
+                        if (isLeftButton(e)) {
+                            openFromTray(win);
+                        }
                     }
                 });
                 tray.add(icon);
@@ -1021,6 +1435,27 @@ public final class PcMain {
                 }
                 Ui.theme(menu);
             });
+        }
+
+        /** 左键（排除右键/中键，也不认 popup 触发）：托盘唤起主窗口的唯一判据 */
+        private static boolean isLeftButton(MouseEvent e) {
+            return !e.isPopupTrigger() && e.getButton() == MouseEvent.BUTTON1;
+        }
+
+        /** 上一次托盘唤起时刻。一次左键会连续送 press/click（双击还有两轮），去重避免重复 showWindow */
+        private static long lastOpenAt = 0L;
+
+        /** 托盘 → 打开主窗口。逐次落日志：以后再出现「点不开」，先看日志里有没有这条 */
+        private static void openFromTray(final ChatWindow win) {
+            long now = System.currentTimeMillis();
+            synchronized (Tray.class) {
+                if (now - lastOpenAt < 250L) {
+                    return;
+                }
+                lastOpenAt = now;
+            }
+            Log.i("托盘左键 → 打开主窗口");
+            win.showWindow();
         }
 
         /**

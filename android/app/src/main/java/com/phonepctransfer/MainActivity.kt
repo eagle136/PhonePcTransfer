@@ -21,6 +21,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import com.phonepctransfer.ui.A11yKeepAliveDialog
 import com.phonepctransfer.ui.ChatScreen
+import com.phonepctransfer.ui.DataVersionDialog
 import com.phonepctransfer.ui.PPTheme
 import com.phonepctransfer.ui.isAppDark
 import com.phonepctransfer.ui.PermAskDialog
@@ -52,6 +53,16 @@ class MainActivity : ComponentActivity() {
 
     /** 「要不要使用无障碍保活」这一问是否显示（本次冷启动只问一次） */
     private val a11yAsk = mutableStateOf(false)
+
+    /** 版本变化 → 是否清除应用数据（本次冷启动只问一次，回答后写版本记录） */
+    private val dataVerAsk = mutableStateOf(false)
+
+    /** 提示文案里用到的两个版本号（询问那一刻的旧记录 / 当前版本） */
+    private var dataVerFrom = ""
+    private var dataVerTo = ""
+
+    /** 启动权限引导是否已启动（版本一问未答前先不启动，避免两个弹窗叠加） */
+    private var bootPermStarted = false
 
     /** 本次冷启动是否刚授予过本地网络/文件读取（是则队列走完后重启一次重建链路） */
     private var bootRebuildNeeded = false
@@ -131,6 +142,14 @@ class MainActivity : ComponentActivity() {
             AppCore.prefs.permRestartNotice = false
             AppCore.toast("权限已生效，已重启应用以重建连接与设备列表")
         }
+        // 版本号变化 → 问一次「是否清除应用数据（不影响已接收的文件）」
+        // 这一问排在启动权限引导之前：答完再走权限队列，避免两个弹窗叠在一起
+        val askDataVer = AppCore.needAskDataVersionChange()
+        if (askDataVer) {
+            dataVerFrom = AppCore.recordedDataVersion()
+            dataVerTo = AppCore.currentVersionName()
+            dataVerAsk.value = true
+        }
         // 录音权限申请入口：直接申请，回调里再区分普通/永久拒绝（rationale API 首请求前也返回 false，不能预判）
         AppCore.recordPermRequester = { after ->
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
@@ -155,8 +174,12 @@ class MainActivity : ComponentActivity() {
         }
         // 来电启动意图（须先于 setContent：showWhenLocked 越早越稳，接听动作还依赖相机申请入口已注册）
         applyCallIntent(intent)
-        // 启动权限引导须先于 setContent，首帧才能画出当前那一问
-        startBootPermAsks()
+        // 启动权限引导须先于 setContent，首帧才能画出当前那一问；
+        // 但版本变化那一问还没答时先不启动，等它答完再推（两问不叠在一起）
+        if (!askDataVer) {
+            bootPermStarted = true
+            startBootPermAsks()
+        }
         setContent {
             // 主题状态在根作用域读取后传给 PPTheme，保证配色当帧跟上新主题
             val dark = isAppDark()
@@ -194,6 +217,27 @@ class MainActivity : ComponentActivity() {
                         onNeed = { openA11ySettings() },
                         onNoNeed = { declineA11yKeepAlive() },
                         onDismiss = { a11yAsk.value = false }
+                    )
+                }
+                // 版本变化一问：清除数据（重启重建干净状态）或只更新版本记录
+                if (dataVerAsk.value) {
+                    DataVersionDialog(
+                        fromVersion = dataVerFrom,
+                        toVersion = dataVerTo,
+                        onClear = {
+                            dataVerAsk.value = false
+                            AppCore.clearDataAndAlignVersion()
+                            restartApp()
+                        },
+                        onKeep = {
+                            dataVerAsk.value = false
+                            AppCore.keepDataAndAlignVersion()
+                            // 版本一问答完，接着走启动权限引导
+                            if (!bootPermStarted) {
+                                bootPermStarted = true
+                                startBootPermAsks()
+                            }
+                        }
                     )
                 }
             }
@@ -317,6 +361,27 @@ class MainActivity : ComponentActivity() {
         }
         remindMissingPerms()
         maybeAskA11yKeepAlive()
+    }
+
+    /**
+     * 清完软件数据后自杀重拉一次：内存里的设备列表/历史/链路都还指着已被删掉的台账，
+     * 重启最干净（已接收的文件在下载目录，不受影响）。
+     */
+    private fun restartApp() {
+        val i = packageManager.getLaunchIntentForPackage(packageName)
+        if (i == null) {
+            Log.w(TAG, "拿不到本应用启动 Intent：仅结束当前任务，不重启")
+            finishAndRemoveTask()
+            return
+        }
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        val pi = PendingIntent.getActivity(
+            this, 0, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_CANCEL_CURRENT
+        )
+        runCatching { pi.send() }.onFailure { Log.w(TAG, "重新拉起失败: ${it.message}") }
+        finishAndRemoveTask()
+        Process.killProcess(Process.myPid())
+        exitProcess(0)
     }
 
     /** 自杀并重新拉起自己一次：旧 socket 不随权限变化，授权后旧进程照样连不上；提示 toast 推迟到重启后首个 onCreate */

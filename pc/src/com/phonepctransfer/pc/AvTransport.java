@@ -852,7 +852,19 @@ public final class AvTransport {
         if (b != null) {
             b.release();
         }
-        // 本轮只落UDP侧自有IO:TCP档mediaUsesMainTcp仍true,看门狗判据不过不起线程
+        // 本轮只落 UDP 侧自有 IO：TCP 档的媒体 IO 尚未实现，媒体实际走主连接带内。
+        // S29：如实标降级（UI 要提示）并释放 ④ 预建的那条 mediaTcp —— 留着既占一条连接，
+        // 又容易被误判成"TCP 档生效"
+        inbandDowngraded = true;
+        java.net.Socket mt = mediaTcp;
+        mediaTcp = null;
+        if (mt != null) {
+            try {
+                mt.close();
+            } catch (Exception ignore) {
+            }
+        }
+        Log.i("[媒体定档] TCP 档 " + t + " 的媒体 IO 未实现，媒体回落带内并已释放预建连接（UI 显示降级）");
         startAliveWatchdog();
     }
 
@@ -954,6 +966,10 @@ public final class AvTransport {
             }
             long now = System.currentTimeMillis();
             java.net.SocketAddress from = p.getSocketAddress();
+            // S28：只接受通话对端的源地址——定档后不再让任意主机的"合法格式"媒体包进来播放/改目标
+            if (!spec.peerIp.isEmpty() && !sameHost(hostOf(from), spec.peerIp)) {
+                continue;
+            }
             notePeerSource(from);
             notePeerMediaPacket();
             Protocol.Datagram dg;
@@ -1082,6 +1098,12 @@ public final class AvTransport {
         if (!(from instanceof java.net.InetSocketAddress a) || a.getAddress() == null) {
             return;
         }
+        // S28：源 IP 必须等于通话对端——UDP 源地址可伪造，不能凭一个包就把后续媒体目标改写过去
+        if (!spec.peerIp.isEmpty() && !sameHost(a.getAddress().getHostAddress(), spec.peerIp)) {
+            Log.w("[媒体目标] 拒绝非对端源 " + a.getAddress().getHostAddress() + ":" + a.getPort()
+                    + "（期望 " + spec.peerIp + "），忽略该包");
+            return;
+        }
         java.net.InetSocketAddress old = peerMediaTarget;
         if (old != null && old.equals(a)) {
             return;   // 源没变 ⇒ 不写、不打日志
@@ -1090,6 +1112,30 @@ public final class AvTransport {
         Log.i("[媒体目标] 以实测收包源为准：" + (old == null ? "首次 " : old + " → ")
                 + a.getAddress().getHostAddress() + ":" + a.getPort()
                 + "（invite/accept 里的 IP 只是初值，不是唯一目标 —— D10 / 2.7）");
+    }
+
+    /** 两个地址是不是同一台主机（同字符串优先，IPv4/IPv6 文本差异走 InetAddress 比较） */
+    private static boolean sameHost(String a, String b) {
+        if (a == null || a.isEmpty() || b == null || b.isEmpty()) {
+            return false;
+        }
+        if (a.equals(b)) {
+            return true;
+        }
+        try {
+            return java.net.InetAddress.getByName(a).equals(java.net.InetAddress.getByName(b));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** 从 SocketAddress 取 IP（取不到返回空串） */
+    private static String hostOf(java.net.SocketAddress sa) {
+        if (sa instanceof java.net.InetSocketAddress) {
+            java.net.InetAddress a = ((java.net.InetSocketAddress) sa).getAddress();
+            return a == null ? "" : a.getHostAddress();
+        }
+        return "";
     }
 
     /** 该往哪打:有实测收包源用它;没有退回初值(invite/accept的IP+对端广告端口) */

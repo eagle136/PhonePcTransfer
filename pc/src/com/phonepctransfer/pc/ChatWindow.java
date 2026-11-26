@@ -73,6 +73,22 @@ public final class ChatWindow {
     final Link link;
     final Store store;
 
+    // ==================== UI 事件泵 ====================
+    // 网络线程只把事件丢进队列，EDT 一次消费一批、最后只做一次布局/重绘。
+    // 批量传文件时，原来「每条消息 / 每 1% 进度都 invokeLater 一次，每次整泡重建 + revalidate + validate 置底」
+    // 会把 EDT 淹在 O(N²) 的组件重建和布局里 ⇒ 窗口停在旧帧、大部分白屏。
+    private final java.util.concurrent.ConcurrentLinkedQueue<Runnable> uiQueue =
+            new java.util.concurrent.ConcurrentLinkedQueue<Runnable>();
+    private final java.util.concurrent.atomic.AtomicBoolean uiPumpScheduled =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile boolean uiNeedLayout = false;
+    private volatile boolean uiNeedPaint = false;
+    private volatile boolean uiNeedScroll = false;
+    private long lastScrollAtMs = 0L;
+    private javax.swing.Timer scrollTimer;
+    /** 会话重载代号：后台读盘返回后据此丢弃过期结果 */
+    private int reloadSeq = 0;
+
     private CallManager call;
     /** 语音通话独立窗口（只在通话期间存在；视频通话走 VideoWindow，不经这里） */
     private VoiceCallWindow callWindow;
@@ -84,6 +100,202 @@ public final class ChatWindow {
     final ChatDevices devices = new ChatDevices(this);
 
     public void refreshDevices() { devices.refreshDevices(); }
+
+    /**
+     * 展示「必须让用户看见」的提示（发送前校验失败等）。可能从任意后台线程调用 → 统一切 UI 线程。
+     * 校验失败的语义是**取消本次传输**，所以这里用模态提示框，而不是只写日志。
+     */
+    public void notifyUser(final String text) {
+        javax.swing.SwingUtilities.invokeLater(new Runnable() {
+            @Override
+            public void run() {
+                JOptionPane.showMessageDialog(frame, text, "传输已取消",
+                        JOptionPane.WARNING_MESSAGE);
+            }
+        });
+    }
+
+    // ==================== P4-5 配对覆盖层（应用内叠加窗口）====================
+    /** 当前覆盖层里输入的 6 位码（重建面板时保留，避免每刷一次状态就清空） */
+    private String pairInput = "";
+    private String pairInputIp = "";
+
+    /**
+     * 显示/关闭配对覆盖层（glassPane，不弹出系统窗口）。
+     * showCode=true → 显示 6 位码给对方读；false → 内置数字键盘输入对方显示的码；u=null → 关闭。
+     */
+    public void showPair(final Link.PairUi u) {
+        javax.swing.SwingUtilities.invokeLater(new Runnable() {
+            @Override
+            public void run() {
+                if (u == null) {
+                    JPanel empty = new JPanel();
+                    empty.setOpaque(false);
+                    frame.setGlassPane(empty);
+                    empty.setVisible(false);
+                    pairInput = "";
+                    pairInputIp = "";
+                    return;
+                }
+                if (!u.ip.equals(pairInputIp)) {
+                    pairInput = "";
+                    pairInputIp = u.ip;
+                }
+                // 配对遮罩挂在 glassPane 上：窗口藏在托盘时用户根本看不到，
+                // 等超时才消失 = 「没弹 PIN」。需要配对时先把主窗唤到前台。
+                if (!frame.isVisible()) {
+                    showWindow();
+                }
+                JPanel glass = new JPanel(new java.awt.GridBagLayout());
+                glass.setOpaque(true);
+                glass.setBackground(new Color(18, 20, 23));
+                // 覆盖层自己吃掉所有点击，底下的聊天区不被误操作
+                glass.addMouseListener(new java.awt.event.MouseAdapter() { });
+
+                JPanel card = new JPanel();
+                card.setLayout(new BoxLayout(card, BoxLayout.Y_AXIS));
+                card.setBackground(Ui.SURFACE);
+                card.setBorder(BorderFactory.createCompoundBorder(
+                        BorderFactory.createLineBorder(Ui.BORDER),
+                        BorderFactory.createEmptyBorder(18, 22, 18, 22)));
+
+                JLabel title = new JLabel("设备配对");
+                title.setFont(new Font(UI_FONT, Font.BOLD, 22));
+                title.setForeground(Ui.TEXT_MAIN);
+                title.setAlignmentX(Component.CENTER_ALIGNMENT);
+                card.add(title);
+
+                JLabel who = new JLabel("首次连接 " + (u.name.isEmpty() ? u.ip : u.name) + "，需要配对");
+                who.setFont(new Font(UI_FONT, Font.PLAIN, Ui.FS_MIN));
+                who.setForeground(Ui.TEXT_SUB);
+                who.setAlignmentX(Component.CENTER_ALIGNMENT);
+                card.add(who);
+                card.add(javax.swing.Box.createVerticalStrut(12));
+
+                final JLabel display = new JLabel();
+                display.setFont(new Font(Font.MONOSPACED, Font.BOLD, 30));
+                display.setForeground(Ui.ACCENT);
+                display.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+                if (u.showCode) {
+                    JLabel tip = new JLabel("请把下面这 6 位配对码输入到对方设备");
+                    tip.setFont(new Font(UI_FONT, Font.PLAIN, Ui.FS_MIN));
+                    tip.setForeground(Ui.TEXT_SUB);
+                    tip.setAlignmentX(Component.CENTER_ALIGNMENT);
+                    card.add(tip);
+                    card.add(javax.swing.Box.createVerticalStrut(8));
+                    display.setText(u.code.isEmpty() ? "-- -- --" : spacedCode(u.code));
+                    card.add(display);
+                } else {
+                    JLabel tip = new JLabel("请输入对方设备上显示的 6 位配对码");
+                    tip.setFont(new Font(UI_FONT, Font.PLAIN, Ui.FS_MIN));
+                    tip.setForeground(Ui.TEXT_SUB);
+                    tip.setAlignmentX(Component.CENTER_ALIGNMENT);
+                    card.add(tip);
+                    card.add(javax.swing.Box.createVerticalStrut(8));
+                    display.setText(pairInput.isEmpty() ? "------" : spacedCode(pairInput));
+                    card.add(display);
+                    card.add(javax.swing.Box.createVerticalStrut(10));
+
+                    // 内置数字键盘 3×4：1-9、删除、0、确认——不依赖系统输入法/文本框
+                    JPanel pad = new JPanel(new java.awt.GridLayout(4, 3, 6, 6));
+                    pad.setOpaque(false);
+                    pad.setAlignmentX(Component.CENTER_ALIGNMENT);
+                    String[] keys = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "删除", "0", "确认"};
+                    for (final String k : keys) {
+                        JButton b = new JButton(k);
+                        b.setFont(new Font(UI_FONT, Font.BOLD, 16));
+                        b.setFocusable(false);
+                        if ("确认".equals(k)) {
+                            b.setForeground(Ui.ACCENT);
+                        }
+                        b.addActionListener(new java.awt.event.ActionListener() {
+                            @Override
+                            public void actionPerformed(java.awt.event.ActionEvent e) {
+                                if (u.done) {
+                                    return;
+                                }
+                                if ("删除".equals(k)) {
+                                    if (!pairInput.isEmpty()) {
+                                        pairInput = pairInput.substring(0, pairInput.length() - 1);
+                                    }
+                                } else if ("确认".equals(k)) {
+                                    if (pairInput.length() == 6) {
+                                        link.submitPairCode(u.ip, pairInput);
+                                    }
+                                } else if (pairInput.length() < 6) {
+                                    pairInput = pairInput + k;
+                                }
+                                display.setText(pairInput.isEmpty() ? "------" : spacedCode(pairInput));
+                            }
+                        });
+                        pad.add(b);
+                    }
+                    card.add(pad);
+                }
+
+                if (u.message != null && !u.message.isEmpty()) {
+                    card.add(javax.swing.Box.createVerticalStrut(10));
+                    JLabel msg = new JLabel(u.message);
+                    msg.setFont(new Font(UI_FONT, Font.PLAIN, Ui.FS_MIN));
+                    msg.setForeground(u.done && !u.ok ? new Color(0xD9534F) : Ui.TEXT_SUB);
+                    msg.setAlignmentX(Component.CENTER_ALIGNMENT);
+                    card.add(msg);
+                } else if (!u.showCode && u.attemptsLeft > 0 && !u.done) {
+                    card.add(javax.swing.Box.createVerticalStrut(8));
+                    JLabel left = new JLabel("剩余 " + u.attemptsLeft + " 次机会");
+                    left.setFont(new Font(UI_FONT, Font.PLAIN, Ui.FS_MIN));
+                    left.setForeground(Ui.TEXT_SUB);
+                    left.setAlignmentX(Component.CENTER_ALIGNMENT);
+                    card.add(left);
+                }
+
+                card.add(javax.swing.Box.createVerticalStrut(14));
+                if (!u.done) {
+                    JLabel note = new JLabel("取消只是关掉这个提示，连接会保留；下次点这台设备可重新配对");
+                    note.setFont(new Font(UI_FONT, Font.PLAIN, Ui.FS_MIN));
+                    note.setForeground(Ui.TEXT_SUB);
+                    note.setAlignmentX(Component.CENTER_ALIGNMENT);
+                    card.add(note);
+                    card.add(javax.swing.Box.createVerticalStrut(8));
+                }
+                JPanel btns = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.CENTER, 10, 0));
+                btns.setOpaque(false);
+                JButton cancel = new JButton(u.done ? "关闭" : "取消");
+                cancel.setFont(new Font(UI_FONT, Font.PLAIN, Ui.FS_STD));
+                cancel.setFocusable(false);
+                cancel.addActionListener(new java.awt.event.ActionListener() {
+                    @Override
+                    public void actionPerformed(java.awt.event.ActionEvent e) {
+                        if (u.done) {
+                            showPair(null);
+                        } else {
+                            link.cancelPairing(u.ip);
+                        }
+                    }
+                });
+                btns.add(cancel);
+                card.add(btns);
+
+                glass.add(card);
+                frame.setGlassPane(glass);
+                glass.setVisible(true);
+                frame.repaint();
+            }
+        });
+    }
+
+    /** 6 位码按 3+3 分组，读起来不容易串位 */
+    private static String spacedCode(String code) {
+        if (code == null) {
+            return "";
+        }
+        if (code.length() <= 3) {
+            return code;
+        }
+        return code.substring(0, 3) + " " + code.substring(3);
+    }
+
 
     void setDeviceState(String text) { devices.setDeviceState(text); }
     final JPanel msgPanel = new JPanel();
@@ -180,6 +392,26 @@ public final class ChatWindow {
             @Override
             public void windowClosing(WindowEvent e) {
                 frame.setVisible(false);
+            }
+        });
+        // 尺寸变化（最大化/还原/拖边）与从最小化恢复：透明分层窗口容易留旧帧，统一做一次整窗重绘。
+        // 用 80ms 防抖：拖动窗口边缘时 componentResized 会连发几十次，逐次整窗重绘会掉帧。
+        javax.swing.Timer[] resizeRepaint = new javax.swing.Timer[1];
+        frame.addComponentListener(new java.awt.event.ComponentAdapter() {
+            @Override
+            public void componentResized(java.awt.event.ComponentEvent e) {
+                if (resizeRepaint[0] != null) {
+                    resizeRepaint[0].stop();
+                }
+                resizeRepaint[0] = new javax.swing.Timer(80, ev -> forceFullRepaint());
+                resizeRepaint[0].setRepeats(false);
+                resizeRepaint[0].start();
+            }
+        });
+        frame.addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowDeiconified(WindowEvent e) {
+                forceFullRepaint();
             }
         });
 
@@ -291,6 +523,8 @@ public final class ChatWindow {
             store.setGroupCurIp(store.convKeyOf(v), v);
         }
         link.selectAndConnect(v, label);
+        // 用户主动点设备/切地址 → 若这台还没配对就出示配对码（双端都不再随连接自动弹）
+        link.requestPair(v);
         // 记住用户手动选中的设备，供下次启动扫描后自动连接一次（与安卓端 lastSelectedIp 对齐）
         store.setLastIp(v);
         reloadHistory();
@@ -749,6 +983,10 @@ public final class ChatWindow {
                 setSub(DataConsent.peerRefusedText(DataConsent.KIND_VOICE));
                 return;
             }
+            if (c == DataConsent.REMOTE_TIMEOUT) {
+                setSub(DataConsent.peerTimeoutText(DataConsent.KIND_VOICE));
+                return;
+            }
             setSub("设备未连接，无法发起通话");
         });
     }
@@ -791,39 +1029,151 @@ public final class ChatWindow {
         }
     }
 
+    // ==================== UI 事件泵（任何线程可投递，EDT 批量消费） ====================
+
+    /** 投递一个 UI 事件；批量传输时同一批事件只触发一次布局/重绘 */
+    void postUi(Runnable r) {
+        if (r == null) {
+            return;
+        }
+        uiQueue.add(r);
+        scheduleUiPump();
+    }
+
+    void markUiLayout() {
+        uiNeedLayout = true;
+        uiNeedPaint = true;
+    }
+
+    void markUiPaint() {
+        uiNeedPaint = true;
+    }
+
+    void markUiScroll() {
+        uiNeedScroll = true;
+    }
+
+    private void scheduleUiPump() {
+        if (uiPumpScheduled.compareAndSet(false, true)) {
+            SwingUtilities.invokeLater(this::drainUi);
+        }
+    }
+
+    /**
+     * 一次消费一批事件（最多 400 条 / 30ms，剩下的留给下一帧，保证鼠标键盘不被饿死），
+     * 然后统一 revalidate + repaint + 置底。这样 EDT 的工作量与「消息条数」不再成正比，
+     * 只与「帧数」成正比。
+     */
+    private void drainUi() {
+        uiPumpScheduled.set(false);
+        long deadline = System.currentTimeMillis() + 30L;
+        int n = 0;
+        Runnable r;
+        while ((r = uiQueue.poll()) != null) {
+            try {
+                r.run();
+            } catch (Throwable t) {
+                Log.w("UI 事件处理失败: " + t);
+            }
+            if (++n >= 400 || System.currentTimeMillis() > deadline) {
+                break;
+            }
+        }
+        boolean layout = uiNeedLayout;
+        boolean paint = uiNeedPaint;
+        boolean scroll = uiNeedScroll;
+        uiNeedLayout = false;
+        uiNeedPaint = false;
+        uiNeedScroll = false;
+        if (layout) {
+            msgPanel.revalidate();
+        }
+        if (paint || layout) {
+            msgPanel.repaint();
+        }
+        if (scroll) {
+            scrollToBottomCoalesced();
+        }
+        if (!uiQueue.isEmpty()) {
+            scheduleUiPump();
+        }
+    }
+
+    /** 置底合并：最多 8Hz 做一次同步 validate；最后一条用 120ms 单发定时器兜底，保证一定落到底 */
+    private void scrollToBottomCoalesced() {
+        long now = System.currentTimeMillis();
+        if (now - lastScrollAtMs >= 120L) {
+            lastScrollAtMs = now;
+            bubbles.scrollToBottom();
+            return;
+        }
+        if (scrollTimer == null) {
+            scrollTimer = new javax.swing.Timer(120, e -> {
+                scrollTimer.stop();
+                lastScrollAtMs = System.currentTimeMillis();
+                bubbles.scrollToBottom();
+            });
+            scrollTimer.setRepeats(false);
+        }
+        scrollTimer.restart();
+    }
+
     // ==================== 消息渲染 ====================
 
     /**
      * 按当前对话设备重载聊天区(切换设备时也走这里)。
-     * 历史文件按对端分文件存(`history/<ip>.jsonl`),所以这里天然只读到一个设备的内容——A→B的消息不可能出现在C的记录里。待发队列同样按`peerIp`过滤 */
+     * 历史文件按对端分文件存(`history/<ip>.jsonl`),所以这里天然只读到一个设备的内容——A→B的消息不可能出现在C的记录里。待发队列同样按`peerIp`过滤
+     * <p>读盘与 JSON 解析在后台线程做，EDT 只负责挂组件：批量传输/大历史下也不会把主界面顶死。
+     */
     void reloadHistory() {
         if (store == null) {
             return;
         }
+        if (!SwingUtilities.isEventDispatchThread()) {
+            SwingUtilities.invokeLater(this::reloadHistory);
+            return;
+        }
         final String ip = shownIp;
+        final int seq = ++reloadSeq;
         mids.clear();
         comps.clear();
         bubbleMsgOf.clear();
         msgPanel.removeAll();
-        // 同一条消息可能同时出现在待发队列与历史里（重发成功后），mid 只画一次
-        java.util.Set<String> seen = new java.util.HashSet<String>();
+        msgPanel.revalidate();
+        msgPanel.repaint();
         if (ip == null || ip.isEmpty()) {
-            msgPanel.revalidate();
-            msgPanel.repaint();
             return;
         }
-        for (Msg m : store.loadPending()) {
+        final Store st = store;
+        Thread t = new Thread(() -> {
+            List<Msg> pending = st.loadPending();
+            List<java.util.Map<String, Object>> his = st.loadHistory(ip, 200);
+            // 按ts排序:hsync补进来的旧消息是追加在文件尾部的,不排会跑到时间线最后
+            his.sort(java.util.Comparator.comparingLong(
+                    r -> Json.lng(r, "ts", 0L)));
+            SwingUtilities.invokeLater(() -> applyReload(seq, ip, his, pending));
+        }, "pp-reload");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** 后台读盘结果落到界面（过期结果直接丢弃：读盘期间用户又切了会话） */
+    private void applyReload(int seq, String ip, List<java.util.Map<String, Object>> his,
+                             List<Msg> pending) {
+        if (seq != reloadSeq || ip == null || !ip.equals(shownIp)) {
+            return;
+        }
+        // 同一条消息可能同时出现在待发队列与历史里（重发成功后），mid 只画一次。
+        // 初始集合带上「读盘期间已经挂到界面上的 mid」：否则那几条会被重复画一遍（读盘是异步的）。
+        java.util.Set<String> seen = new java.util.HashSet<String>(mids);
+        for (Msg m : pending) {
             // 未送达的主动消息也先显示出来(剪贴板不算消息,跳过;别的设备的待发不进本会话)。
             // 判据是设备(组键):条目可能是从这台设备的另一个地址排进去的。
             if (!Msg.KIND_CLIP.equals(m.kind) && sameDevice(m.peerIp, ip)
                     && !m.mid.isEmpty() && seen.add(m.mid)) {
-                bubbles.addBubble(m);
+                bubbles.addBubbleQuiet(m);
             }
         }
-        List<java.util.Map<String, Object>> his = store.loadHistory(ip, 200);
-        // 按ts排序:hsync补进来的旧消息是追加在文件尾部的,不排会跑到时间线最后
-        his.sort(java.util.Comparator.comparingLong(
-                r -> Json.lng(r, "ts", 0L)));
         for (java.util.Map<String, Object> r : his) {
             Msg m = new Msg();
             m.mid = Json.str(r, "mid", "");
@@ -840,10 +1190,42 @@ public final class ChatWindow {
             m.dirCount = Json.integer(r, "dirCount", 0);
             // 剪贴板同步不是「发消息」：早期版本写进历史的 CLIP 记录不再显示
             if (!Msg.KIND_CLIP.equals(m.kind) && !m.mid.isEmpty() && seen.add(m.mid)) {
-                bubbles.addBubble(m);
+                bubbles.addBubbleQuiet(m);
             }
         }
+        msgPanel.revalidate();
+        msgPanel.repaint();
         bubbles.scrollToBottom();
+    }
+
+    /** 枚举一台设备的全部历史+待发 mid，并分出需要跨端删除的文本/图片。调用时必须尚未解绑。 */
+    private void collectConversationMids(String ip, List<String> allMids, List<String> syncMids) {
+        final java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<String>();
+        if (store == null) {
+            return;
+        }
+        for (java.util.Map<String, Object> r : store.loadHistory(ip, Integer.MAX_VALUE)) {
+            String mid = Json.str(r, "mid", "");
+            if (mid.isEmpty() || !seen.add(mid)) {
+                continue;
+            }
+            allMids.add(mid);
+            if (LinkHsync.hsyncSyncable(r)) {
+                syncMids.add(mid);
+            }
+        }
+        for (Msg m : store.loadPending()) {
+            if (m == null || m.mid == null || m.mid.isEmpty() || !sameDevice(m.peerIp, ip)) {
+                continue;
+            }
+            if (!seen.add(m.mid)) {
+                continue;
+            }
+            allMids.add(m.mid);
+            if (ChatBubbles.syncableKind(m)) {
+                syncMids.add(m.mid);
+            }
+        }
     }
 
     /**
@@ -874,33 +1256,7 @@ public final class ChatWindow {
         //    历史按组键存⇒同一台设备的另一个地址的往来也在同一份文件里,一并清掉。
         final List<String> allMids = new ArrayList<String>();
         final List<String> syncMids = new ArrayList<String>();
-        final java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<String>();
-        if (store != null) {
-            // ⚠loadHistory对>2MB的历史只读尾部2MB(极端长会话可能有更早的行枚举不到,
-            //   那部分本来就超出UI的200条窗口,留在文件里不影响界面)
-            for (java.util.Map<String, Object> r : store.loadHistory(ip, Integer.MAX_VALUE)) {
-                String mid = Json.str(r, "mid", "");
-                if (mid.isEmpty() || !seen.add(mid)) {
-                    continue;
-                }
-                allMids.add(mid);
-                if (LinkHsync.hsyncSyncable(r)) {
-                    syncMids.add(mid);
-                }
-            }
-            for (Msg m : store.loadPending()) {
-                if (m == null || m.mid == null || m.mid.isEmpty() || !sameDevice(m.peerIp, ip)) {
-                    continue;
-                }
-                if (!seen.add(m.mid)) {
-                    continue;
-                }
-                allMids.add(m.mid);
-                if (ChatBubbles.syncableKind(m)) {
-                    syncMids.add(m.mid);
-                }
-            }
-        }
+        collectConversationMids(ip, allMids, syncMids);
 
         // ②对端能不能收到删除命令(在线+支持hd)——直接决定提示语,不能含糊
         final boolean canNotify = link.canSendMsgDel(ip);
@@ -941,8 +1297,50 @@ public final class ChatWindow {
         }
     }
 
+    /**
+     * 删除整台设备：先在身份绑定仍有效时清会话并通知在线对端，再删地址与绑定。
+     * 否则对方仍在线时，重新发现并点击设备会由 hsync 把旧文本/图片补回来。
+     */
+    void deleteDevice(final Store.Group g) {
+        if (g == null || g.curIp == null || g.curIp.isEmpty()) {
+            return;
+        }
+        final String ip = g.curIp;
+        final boolean clearSelection = sameDevice(shownIp, ip);
+        final boolean clearRemembered = g.ips.contains(store.lastIp());
+        final List<String> allMids = new ArrayList<String>();
+        final List<String> syncMids = new ArrayList<String>();
+        collectConversationMids(ip, allMids, syncMids);
+
+        int notified = allMids.isEmpty() ? 0 : link.deleteMessages(ip, allMids, syncMids);
+        // loadHistory 对超大文件有读取窗口；删整台设备必须整文件清掉，不能只清本次枚举到的行。
+        store.clearConversation(ip);
+        for (String mid : allMids) {
+            File th = bubbles.thumbCacheFile(mid);
+            if (th.exists()) {
+                th.delete();
+            }
+        }
+        for (String addr : g.ips) {
+            store.removePeer(addr);
+        }
+        store.setGroupRemark(g.key, "");
+        if (clearSelection) {
+            shownIp = "";
+            shownKey = "";
+            restoredIp = "";
+        }
+        if (clearRemembered) {
+            store.setLastIp("");
+        }
+        reloadHistory();
+        refreshDevices();
+        setSub("Deleted " + g.displayName() + " (notified peer to remove "
+                + notified + " text/image messages)");
+    }
+
     public void onMessageAdded(final Msg m) {
-        SwingUtilities.invokeLater(() -> {
+        postUi(() -> {
             // 归属不明的消息直接丢弃,绝不画进当前会话。
             // 判据一律是组键(=对端deviceId),不是IP字符串:同一台设备的另一个地址(换网卡/热点)属于同一份会话。
             // ⚠️空peerIp不能当"非本设备"放行——谁发的都往当前打开的会话里塞。
@@ -958,13 +1356,14 @@ public final class ChatWindow {
             if (mids.contains(m.mid)) {
                 return;
             }
-            bubbles.addBubble(m);
-            bubbles.scrollToBottom();
+            bubbles.addBubbleQuiet(m);
+            markUiLayout();
+            markUiScroll();
         });
     }
 
     public void onMessageUpdated(final Msg m) {
-        SwingUtilities.invokeLater(() -> {
+        postUi(() -> {
             int idx = mids.indexOf(m.mid);
             if (idx < 0) {
                 // 该mid还没有气泡。两种来路:①接收中的气泡被一次reloadHistory清掉了(还没写进历史、只在界面上的在途气泡,如file_meta刚落下的那条),
@@ -978,12 +1377,29 @@ public final class ChatWindow {
                 if (unknown || foreign || noBody) {
                     return;
                 }
-                bubbles.addBubble(m);
-                bubbles.scrollToBottom();
+                bubbles.addBubbleQuiet(m);
+                markUiLayout();
+                markUiScroll();
                 return;
             }
             // 记住最新状态（重试/移动时要拿得到最新的 text/status）
             Msg cur = bubbleMsgOf.get(m.mid);
+            // 纯进度帧（批量传输里的绝大多数帧）：气泡结构没变，只原地改进度条，不重建组件。
+            // 原来每 1% 都整泡重建 + 全量 revalidate，几百个文件并行时 EDT 直接跑不完。
+            // 判据：状态仍是 SENDING、百分比在途，且文本/文件名/路径与当前气泡完全一致（结构不会变）。
+            if (cur != null
+                    && m.progress >= 0 && m.progress < 100
+                    && Msg.ST_SENDING.equals(m.status) && Msg.ST_SENDING.equals(cur.status)
+                    && (m.text == null || m.text.isEmpty() || m.text.equals(cur.text))
+                    && (m.fileName == null || m.fileName.isEmpty() || m.fileName.equals(cur.fileName))
+                    && (m.filePath == null || m.filePath.isEmpty() || m.filePath.equals(cur.filePath))) {
+                if (ChatBubbles.updateBarValue(m.mid, m.progress)) {
+                    cur.progress = m.progress;
+                    markUiPaint();
+                    return;
+                }
+                // 没有可原地更新的进度条（气泡初始未画条）→ 落到下面的重建分支
+            }
             if (cur != null) {
                 if (m.text != null && !m.text.isEmpty()) {
                     cur.text = m.text;
@@ -1008,14 +1424,13 @@ public final class ChatWindow {
             msgPanel.remove(old);
             msgPanel.add(fresh, idx);
             comps.set(idx, fresh);
-            msgPanel.revalidate();
-            msgPanel.repaint();
+            markUiLayout();
         });
     }
 
     /** 一条消息被移除（文件被任一方取消）——从聊天区摘掉，两端都不再显示 */
     public void onMessageRemoved(String mid) {
-        SwingUtilities.invokeLater(() -> {
+        postUi(() -> {
             int idx = mids.indexOf(mid);
             if (idx < 0) {
                 return;
@@ -1025,12 +1440,17 @@ public final class ChatWindow {
             mids.remove(idx);
             comps.remove(idx);
             bubbleMsgOf.remove(mid);
-            msgPanel.revalidate();
-            msgPanel.repaint();
-            // 缩略图缓存随消息一起清理，避免堆积
-            File th = bubbles.thumbCacheFile(mid);
+            markUiLayout();
+            // 缩略图缓存随消息一起清理，避免堆积（删文件走后台，不占 EDT）
+            final File th = bubbles.thumbCacheFile(mid);
             if (th.exists()) {
-                th.delete();
+                Thread t = new Thread(() -> {
+                    if (!th.delete()) {
+                        th.deleteOnExit();
+                    }
+                }, "pp-thumb-del");
+                t.setDaemon(true);
+                t.start();
             }
         });
     }
@@ -1039,7 +1459,7 @@ public final class ChatWindow {
      * 一条消息在时间线上被移到"最新一条"(v2.7):把它的气泡摘下来重新挂到末尾,
      * 并刷新ts(历史按ts排序,重载后才不会又跳回原位) */
     public void onMessageMoved(String mid) {
-        SwingUtilities.invokeLater(() -> {
+        postUi(() -> {
             int idx = mids.indexOf(mid);
             if (idx < 0) {
                 return;
@@ -1053,6 +1473,7 @@ public final class ChatWindow {
                 if (old != null) {
                     old.ts = System.currentTimeMillis();
                     if (store != null) {
+                        // 历史写入已异步化（Store.appendHistory 只入队），这里不再占 EDT 的磁盘时间
                         store.appendHistory(old.peerIp, old.toJson());
                     }
                     c = bubbles.bubble(old, false);
@@ -1061,9 +1482,8 @@ public final class ChatWindow {
             mids.add(mid);
             comps.add(c);
             msgPanel.add(c);
-            msgPanel.revalidate();
-            msgPanel.repaint();
-            bubbles.scrollToBottom();
+            markUiLayout();
+            markUiScroll();
         });
     }
 
@@ -1141,16 +1561,127 @@ public final class ChatWindow {
     /** 首次显示窗口（= 冷启动）：显示后补一次置底，让恢复的会话落在最新一条上 */
     private boolean firstShow = true;
 
+    /**
+     * 「窗口从隐藏变成显示」时的回调（PcMain 挂上来做一次局域网补扫）。
+     * 冷启动那一次不触发 —— 启动闸门自己会扫描，别重复。
+     */
+    Runnable onWindowShown;
+
     public void showWindow() {
-        frame.setVisible(true);
-        frame.toFront();
-        frame.requestFocus();
-        if (firstShow) {
-            firstShow = false;
-            // 构造期窗口还没显示,布局/滚动条的视口尺寸都不可靠⇒那一次scrollToBottom落不住。
-            // 真正可见之后再置底一次(只做首次;之后用户从托盘唤起时保持他原来的滚动位置)。
-            bubbles.scrollToBottom();
+        // 统一在 EDT 上做：托盘 MouseEvent 可能来自 AWT 自己的线程，直接 setVisible 会撞锁
+        Runnable show = () -> {
+            boolean wasHidden = !frame.isVisible();
+            // 最小化过：先还原成普通态，否则只闪一下任务栏、窗口不出来
+            if ((frame.getExtendedState() & java.awt.Frame.ICONIFIED) != 0) {
+                frame.setExtendedState(java.awt.Frame.NORMAL);
+            }
+            frame.setVisible(true);
+            ensureOnScreen();
+            frame.toFront();
+            frame.requestFocusInWindow();
+            Log.i("showWindow: visible=" + frame.isVisible() + " state=" + frame.getExtendedState()
+                    + " bounds=" + frame.getBounds());
+            // 透明窗口（PERPIXEL_TRANSLUCENT + 自绘外壳）在 Windows 上偶发「首帧没刷出去」：
+            // 整窗一片白/空，鼠标划到哪才重画哪。show 之后强制整窗重绘一次兜住这种脏帧。
+            forceFullRepaint();
+            if (!firstShow && wasHidden && onWindowShown != null) {
+                try {
+                    onWindowShown.run();
+                } catch (Throwable t) {
+                    Log.w("窗口显示后补扫失败: " + t);
+                }
+            }
+            // Windows 前台锁兜底：setVisible+toFront 常被系统拦掉（只闪任务栏，窗口仍压在后面，
+            // 表现就是"点了没反应"）。下一轮 EDT 里若仍未拿到焦点，用一次"短暂置顶"把窗口拎到最前，
+            // 再撤掉置顶 —— 不改变用户可见的置顶状态。
+            SwingUtilities.invokeLater(() -> {
+                if (!frame.isVisible() || frame.isFocused()) {
+                    return;
+                }
+                frame.setAlwaysOnTop(true);
+                frame.toFront();
+                frame.requestFocusInWindow();
+                SwingUtilities.invokeLater(() -> frame.setAlwaysOnTop(false));
+                Log.i("showWindow: 前台锁兜底，已置顶脉冲一次");
+            });
+            if (firstShow) {
+                firstShow = false;
+                // 构造期窗口还没显示,布局/滚动条的视口尺寸都不可靠⇒那一次scrollToBottom落不住。
+                // 真正可见之后再置底一次(只做首次;之后用户从托盘唤起时保持他原来的滚动位置)。
+                bubbles.scrollToBottom();
+            }
+        };
+        if (SwingUtilities.isEventDispatchThread()) {
+            show.run();
+        } else {
+            SwingUtilities.invokeLater(show);
         }
+    }
+
+    /** 整窗强制重绘的「补帧」定时器（同一时刻只保留一个，避免拖动窗口时堆积） */
+    private javax.swing.Timer fullRepaintSweep;
+
+    /**
+     * 整窗强制重绘（含布局失效）。
+     *
+     * <p>为什么要显式做：本窗是「无边框 + 全透明背景 + 自绘圆角外壳」的分层窗口
+     * （JFrame.setBackground(alpha=0)），Windows 上偶发首帧/还原后只合成一部分 ——
+     * 现象就是整片白或整片空、鼠标划过哪里哪里才正常。整窗 invalidate + repaint 把脏区
+     * 一次性推给 RepaintManager，再补两帧（下一轮 EDT + 350ms 后）保证真的走到系统 present。
+     */
+    private void forceFullRepaint() {
+        if (!frame.isDisplayable()) {
+            return;
+        }
+        frame.invalidate();
+        frame.validate();
+        frame.repaint();
+        frame.getRootPane().repaint();
+        SwingUtilities.invokeLater(() -> {
+            if (!frame.isDisplayable()) {
+                return;
+            }
+            frame.repaint();
+            frame.getRootPane().repaint();
+            if (frame.getContentPane() != null) {
+                frame.getContentPane().repaint();
+            }
+        });
+        if (fullRepaintSweep != null) {
+            fullRepaintSweep.stop();
+        }
+        fullRepaintSweep = new javax.swing.Timer(350, ev -> {
+            if (frame.isDisplayable()) {
+                frame.repaint();
+                frame.getRootPane().repaint();
+            }
+        });
+        fullRepaintSweep.setRepeats(false);
+        fullRepaintSweep.start();
+    }
+
+    /**
+     * 窗口落在屏幕外就挪回主屏中央。
+     * <p>为什么:显示器布局会变(拔掉副屏/换分辨率/远程桌面退出),窗口之前记住的位置可能整块落在不存在的区域,
+     * 之后再 setVisible(true) 就是"窗口打开了但谁也看不见"——用户侧同样表现为"点不开"。
+     */
+    private void ensureOnScreen() {
+        java.awt.Rectangle b = frame.getBounds();
+        java.awt.GraphicsEnvironment ge = java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment();
+        boolean onScreen = false;
+        for (java.awt.GraphicsDevice d : ge.getScreenDevices()) {
+            if (d.getDefaultConfiguration().getBounds().intersects(b)) {
+                onScreen = true;
+                break;
+            }
+        }
+        if (onScreen) {
+            return;
+        }
+        java.awt.Rectangle usable = ge.getMaximumWindowBounds();
+        frame.setLocation(usable.x + Math.max(0, (usable.width - b.width) / 2),
+                          usable.y + Math.max(0, (usable.height - b.height) / 2));
+        Log.i("窗口原位置在屏幕外 " + b + "，已归位到 " + frame.getLocation());
     }
 
     // ==================== 语音通话 UI ====================
@@ -1410,6 +1941,10 @@ public final class ChatWindow {
             JButton ok = Ui.primary(new JButton("关闭"));
             ok.addActionListener(e -> close.run());
             JPanel south = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 6));
+            // 深色主题下默认 JPanel 底色是 LAF 的浅灰：不显式染成 SURFACE 的话，
+            // 弹窗就成了「只有外框是黑的、内容整片发白」（用户报的截图就是这个）。
+            south.setOpaque(true);
+            south.setBackground(Ui.SURFACE);
             south.add(ok);
             d.add(south, BorderLayout.SOUTH);
 
@@ -1428,10 +1963,13 @@ public final class ChatWindow {
             JPanel dirBox = new JPanel();
             dirBox.setLayout(new BoxLayout(dirBox, BoxLayout.Y_AXIS));
             dirBox.setBorder(BorderFactory.createEmptyBorder(8, 8, 4, 8));
+            // 透明底：底色由最外层 box 统一画（深色主题下不能留 LAF 的浅灰底）
+            dirBox.setOpaque(false);
 
             JLabel t1 = new JLabel("收到文件的保存位置");
             // 档位：常规 15（=发送文件按钮同档）；标题与说明的层级由颜色区分（不用假粗）
             t1.setFont(new Font(UI_FONT, Font.PLAIN, Ui.FS_STD));
+            t1.setForeground(Ui.TEXT_MAIN);
             t1.setAlignmentX(Component.LEFT_ALIGNMENT);
             dirBox.add(t1);
 
@@ -1511,10 +2049,12 @@ public final class ChatWindow {
             JPanel clipBox = new JPanel();
             clipBox.setLayout(new BoxLayout(clipBox, BoxLayout.Y_AXIS));
             clipBox.setBorder(BorderFactory.createEmptyBorder(10, 8, 4, 8));
+            clipBox.setOpaque(false);
 
             JLabel t2 = new JLabel("剪贴板");
             // 档位：常规 15（=发送文件按钮同档）
             t2.setFont(new Font(UI_FONT, Font.PLAIN, Ui.FS_STD));
+            t2.setForeground(Ui.TEXT_MAIN);
             t2.setAlignmentX(Component.LEFT_ALIGNMENT);
             clipBox.add(t2);
 
@@ -1553,10 +2093,12 @@ public final class ChatWindow {
             JPanel bootBox = new JPanel();
             bootBox.setLayout(new BoxLayout(bootBox, BoxLayout.Y_AXIS));
             bootBox.setBorder(BorderFactory.createEmptyBorder(10, 8, 4, 8));
+            bootBox.setOpaque(false);
 
             JLabel t3 = new JLabel("开机自启");
             // 档位：常规 15（=发送文件按钮同档）
             t3.setFont(new Font(UI_FONT, Font.PLAIN, Ui.FS_STD));
+            t3.setForeground(Ui.TEXT_MAIN);
             t3.setAlignmentX(Component.LEFT_ALIGNMENT);
             bootBox.add(t3);
 
@@ -1651,10 +2193,12 @@ public final class ChatWindow {
             JPanel videoBox = new JPanel();
             videoBox.setLayout(new BoxLayout(videoBox, BoxLayout.Y_AXIS));
             videoBox.setBorder(BorderFactory.createEmptyBorder(10, 8, 4, 8));
+            videoBox.setOpaque(false);
 
             JLabel t4 = new JLabel("视频接收画质上限");
             // 档位：常规 15（=发送文件按钮同档）
             t4.setFont(new Font(UI_FONT, Font.PLAIN, Ui.FS_STD));
+            t4.setForeground(Ui.TEXT_MAIN);
             t4.setAlignmentX(Component.LEFT_ALIGNMENT);
             videoBox.add(t4);
 
@@ -1710,6 +2254,10 @@ public final class ChatWindow {
             JPanel box = new JPanel();
             box.setLayout(new BoxLayout(box, BoxLayout.Y_AXIS));
             box.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
+            // 整个设置页的底色统一画在这里（DialogChrome 的圆角 SURFACE 之外再兜一层，
+            // 否则四个分组各自是 LAF 默认的浅灰底 —— 深色主题下就是「只有外框黑、内容全白」）
+            box.setOpaque(true);
+            box.setBackground(Ui.SURFACE);
             box.add(dirBox);
             box.add(clipBox);
             box.add(bootBox);
@@ -1718,3 +2266,4 @@ public final class ChatWindow {
         }
     }
 }
+

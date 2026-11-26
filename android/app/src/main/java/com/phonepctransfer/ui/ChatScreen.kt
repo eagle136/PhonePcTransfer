@@ -2,9 +2,11 @@ package com.phonepctransfer.ui
 
 import com.phonepctransfer.call.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 
 import androidx.compose.foundation.layout.Arrangement
@@ -40,9 +42,11 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -75,6 +79,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 // 注意:`TextUnit.isSp`是TextUnit的成员属性(不是顶层扩展)→不要写import,写了会Unresolved reference
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowInsetsCompat
@@ -175,7 +180,12 @@ fun ChatScreen() {
                     )
             ) {
                 // 列表展开时顶栏不显示备注(列表里已经列着备注,顶栏再写一遍是重复)
-                HeaderBar(onToggleList = { listOpen = !listOpen }, showRemark = !listOpen)
+                HeaderBar(
+                    onToggleList = { listOpen = !listOpen },
+                    showRemark = !listOpen,
+                    // 消息区右上角「清空」：走 AppCore.clearHistory 的逐条删除确认流程（有选定设备只清该台）
+                    onClearMessages = { AppCore.clearHistory() }
+                )
 
                 CallBanner()
 
@@ -253,20 +263,20 @@ fun ChatScreen() {
     AppCore.clearWarn?.let { w ->
         ClearWarnDialog(msg = w, onClose = { AppCore.dismissClearWarn() })
     }
-    // 数据网络提醒·发起方向(本机在用数据流量,且即将发文件/语音/视频)——每次使用都弹一次,不记忆已同意的对端
+    // 数据网络提醒·发起方向(本机在用数据流量,且即将发文件/语音/视频)——每次使用都弹一次,不记忆已同意的对端；P2-1 起按队列逐条处理
     AppCore.dataNetConfirm?.let { c ->
         DataNetConfirmDialog(
             label = c.label,
-            onDismiss = { AppCore.cancelDataNet() },
-            onConfirm = { AppCore.acceptDataNet() }
+            onDismiss = { AppCore.cancelDataNet(c.id) },
+            onConfirm = { AppCore.acceptDataNet(c.id) }
         )
     }
     // 数据网络提醒·接收方向(对端在用数据流量,问本机是否同意接收)——拒绝时本机什么都不记录,只回一帧让对端如实提示
     AppCore.dataNetIncoming?.let { c ->
         IncomingDataConfirmDialog(
             label = c.label,
-            onRefuse = { AppCore.rejectIncomingData() },
-            onAgree = { AppCore.acceptIncomingData() }
+            onRefuse = { AppCore.rejectIncomingData(c.peerIp, c.mid) },
+            onAgree = { AppCore.acceptIncomingData(c.peerIp, c.mid) }
         )
     }
     // 从系统"分享"进来:先问发给哪台设备(见ShareDialog.kt)
@@ -287,6 +297,141 @@ fun ChatScreen() {
     BigTransferHint()
     // 视频通话全屏界面（视频模式 TALKING 时盖在最上层）
     if (AppCore.videoActive) VideoCallScreen()
+    // P4-5：新设备首次连接的 6 位配对码覆盖层（唯一盖在视频界面之上的应用内弹层）
+    PairCodeOverlay()
+}
+
+/**
+ * P4-5 配对覆盖层：接收方显示 6 位码给对方读；发起方内置数字键盘输入 6 位码。
+ * 应用内叠加窗口（不是系统 Dialog），盖住整屏并可拦截所有点击。
+ */
+@Composable
+private fun PairCodeOverlay() {
+    val p = AppCore.pairUi ?: return
+    var input by remember(p.ip) { mutableStateOf("") }
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xCC000000))
+            .pointerInput(Unit) { detectTapGestures { } },
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 6.dp,
+            modifier = Modifier.padding(24.dp).fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text("设备配对", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "首次连接 ${p.name.ifEmpty { p.ip }}，需要配对",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(14.dp))
+                if (p.showCode) {
+                    Text(
+                        "请把下面这 6 位配对码输入到对方设备",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        p.code.ifEmpty { "------" },
+                        style = MaterialTheme.typography.headlineMedium,
+                        letterSpacing = 6.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                } else {
+                    Text(
+                        input.ifEmpty { "------" },
+                        style = MaterialTheme.typography.headlineMedium,
+                        letterSpacing = 8.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    // 内置数字键盘（3×4），不拉起系统输入法
+                    val keys = listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "删除", "0", "确认")
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        keys.chunked(3).forEach { row ->
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                row.forEach { k ->
+                                    val enabled = !p.done
+                                    Surface(
+                                        shape = RoundedCornerShape(10.dp),
+                                        color = if (k == "确认") MaterialTheme.colorScheme.primary
+                                        else MaterialTheme.colorScheme.surfaceVariant,
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .height(46.dp)
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .clickable(enabled = enabled) {
+                                                when (k) {
+                                                    "删除" -> input = input.dropLast(1)
+                                                    "确认" -> if (input.length == 6) {
+                                                        AppCore.submitPairCode(input)
+                                                    }
+                                                    else -> if (input.length < 6) input += k
+                                                }
+                                            }
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Text(
+                                                k,
+                                                style = MaterialTheme.typography.titleMedium,
+                                                color = if (k == "确认") MaterialTheme.colorScheme.onPrimary
+                                                else MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (p.message.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        p.message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (p.done && !p.ok) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                if (p.attemptsLeft > 0 && p.message.isEmpty() && !p.showCode) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "剩余 ${p.attemptsLeft} 次机会",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Spacer(Modifier.height(14.dp))
+                if (!p.done) {
+                    Text(
+                        "取消只是关掉这个提示，连接会保留；下次点这台设备可重新配对",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(8.dp))
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedButton(onClick = { AppCore.cancelPairing() }) {
+                        Text(if (p.done) "关闭" else "取消")
+                    }
+                    if (p.done && p.ok) {
+                        Button(onClick = { AppCore.cancelPairing() }) { Text("好") }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -540,11 +685,12 @@ internal val TOP_ROW_H = 36.dp
 private const val IP_HEADER_BUDGET = 20
 
 /**
- * 顶栏:第一行"左备注/中 地址▼",第二行连接状态(居中,与PC端`headerState()`一致)。
+ * 顶栏:第一行"左备注/中 地址▼/右 清空",第二行连接状态(居中,与PC端`headerState()`一致)。
  * 左=当前设备备注(没备注留空,不回落广播名/IP;列表展开时不显示);中=当前连接地址+紧跟其后的▼(一个紧凑整体,点它弹[AddressMenu]并高亮当前选中;IPv6中间省略);
+ * 右=「清空」消息入口(用户要求放在消息区右上角,点击走 [AppCore.clearHistory] 的确认流程);
  * 居中对象是"地址 ▼"整体(▼跟在IP后面,左右各`weight(1f)`);左上角只留加长三横(抽屉开关:右滑开、左滑关、点聊天区空白关,输入法开着时一并收起) */
 @Composable
-private fun HeaderBar(onToggleList: () -> Unit, showRemark: Boolean) {
+private fun HeaderBar(onToggleList: () -> Unit, showRemark: Boolean, onClearMessages: () -> Unit) {
     // 状态栏内边距加在Surface内部的Column上(不是加在外层行上):Surface的底色铺到屏幕最顶边,通知栏条与顶栏同色,内容仍被顶下来不与时间/电量重叠。
     // 顶部不再叠自己的垂直内边距:状态栏带本身有系统留的白,再叠4dp只会让"顶部空得多"更明显(配合第一行按钮48dp→40dp,应用留白从19.75dp收到11.75dp)
     Surface(color = MaterialTheme.colorScheme.surfaceVariant) {
@@ -620,8 +766,14 @@ private fun HeaderBar(onToggleList: () -> Unit, showRemark: Boolean) {
                     Text("手机电脑互传", style = MaterialTheme.typography.titleSmall)
                 }
 
-                // 右区：与左区同权重的余量（左右等权 = 中段真居中）
-                Spacer(Modifier.weight(1f))
+                // 右区：与左区同权重的余量（左右等权 = 中段真居中）；「清空」贴右端（消息区右上角）
+                Row(
+                    modifier = Modifier.weight(1f),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    ClearMessagesButton(onClick = onClearMessages)
+                }
             }
 
             // 第二行：连接状态（居中）
@@ -654,6 +806,33 @@ private fun HeaderBar(onToggleList: () -> Unit, showRemark: Boolean) {
 @Composable
 private fun connectedColor(): Color =
     if (isAppDark()) Color(0xFF6BD48A) else Color(0xFF2E7D32)
+
+/**
+ * 顶栏右上角「清空」按钮（用户要求：消息区右上角能清空消息）。
+ * 用 Box 自绘而不用 TextButton：M3 的 48dp 最小触摸目标会把 36dp 高的顶栏第一行撑高（与「＋设备」同一口径）；
+ * 触摸盒 26dp，边框/圆角/描边宽度与左侧「＋设备」按钮保持一致；点击只发起流程，确认框与执行仍由 AppCore 负责。
+ */
+@Composable
+private fun ClearMessagesButton(onClick: () -> Unit) {
+    val shape = RoundedCornerShape(8.dp)
+    Box(
+        modifier = Modifier
+            .padding(end = 4.dp)
+            .height(26.dp)
+            .clip(shape)
+            .border(1.2.dp, MaterialTheme.colorScheme.onSurfaceVariant, shape)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = ripple(),
+                onClick = onClick
+            )
+            .semantics { contentDescription = "清空消息" }
+            .padding(horizontal = 10.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text("清空", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+    }
+}
 
 /**
  * 顶栏的"地址列表"下拉(锚点由调用处的Box决定):一台设备可能有WiFi/热点/USB网卡等多个地址(同一个deviceId),展开后列出全部,当前选中的那条高亮;
@@ -965,8 +1144,14 @@ private fun BottomArea(compact: Boolean, onPickFile: () -> Unit, onPickFolder: (
                 Banner(AppCore.lanInfo.detail, warn = true)
             } else if (AppCore.vpnActive) {
                 Banner("检测到 VPN 已开启，网络连接可能失败；建议关闭 VPN 或把本应用加入放行名单", warn = true)
-            } else if (AppCore.pendingCount > 0) {
-                Banner("待发送 ${AppCore.pendingCount} 条，连接后自动补发")
+            } else if (AppCore.waitingCount > 0) {
+                // 在传的那条不算「待发」（详见 AppCore.waitingCount）：已连接时只说排队，
+                // 没连接时才说「连接后自动补发」，别把正常传输/刚取消误报成未连接
+                if (AppCore.linkState == Link.State.CONNECTED) {
+                    Banner("还有 ${AppCore.waitingCount} 条待发，前面的传完自动继续")
+                } else {
+                    Banner("待发送 ${AppCore.waitingCount} 条，连接后自动补发")
+                }
             }
             InputBar(compact = compact, onPickFile = onPickFile, onPickFolder = onPickFolder)
             // 底部空白垫高:圆角屏会把屏幕四角物理切掉,`navigationBars`只让开手势条、不含圆角,最右下的"发送"会压在圆角上。

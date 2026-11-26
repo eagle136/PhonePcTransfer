@@ -47,6 +47,8 @@ final class LinkHsync {
         if (!s.handshaked || s.closed || L.store == null) {
             return;
         }
+        // P2-7：先把「删了但没通知到对端」的墓碑补发一次（老端 hd=0 就只挡本机，不发帧）
+        flushDeletedTombs(s);
         List<String> mids = new ArrayList<String>();
         for (Map<String, Object> r : L.store.loadHistory(s.remoteIp(), HSYNC_SCAN)) {
             if (!hsyncSyncable(r)) {
@@ -63,6 +65,37 @@ final class LinkHsync {
         L.trySend(s, Protocol.hsyncMids(mids));
     }
 
+    /**
+     * P2-7：握手时补发未送达的 msg_del，并顺手清过期墓碑。
+     * 只做一次：发完就标 sent=true，避免每次重连都重放整段删除。
+     */
+    void flushDeletedTombs(Session s) {
+        if (L.store == null) {
+            return;
+        }
+        try {
+            L.store.pruneTombs();
+        } catch (Exception ignore) {
+        }
+        if (!s.caps.hd) {
+            return;
+        }
+        List<String> pend = L.store.pendingTombs(s.remoteIp());
+        if (pend == null || pend.isEmpty()) {
+            return;
+        }
+        for (int i = 0; i < pend.size(); i += MSG_DEL_CHUNK) {
+            List<String> chunk = pend.subList(i, Math.min(i + MSG_DEL_CHUNK, pend.size()));
+            if (!L.trySend(s, Protocol.msgDel(new ArrayList<String>(chunk)))) {
+                // 没交到 socket 就不算发过：剩下的留待下次握手补发，否则对端永远不知道这条被删了
+                L.log("删除墓碑发送失败，停止本轮补发（已发 " + i + "/" + pend.size() + "，其余留待下次握手）");
+                return;
+            }
+            L.store.markTombsSent(s.remoteIp(), chunk);
+        }
+        L.log("删除墓碑：握手补发 " + pend.size() + " 条 msg_del");
+    }
+
     void onHsyncMids(Session s, Map<String, Object> j) {
         if (L.store == null) {
             return;
@@ -74,12 +107,14 @@ final class LinkHsync {
                 mine.add(mid);
             }
         }
+        // P2-7：本机删过（墓碑里还有）的 mid 不再向对端要
+        java.util.Set<String> tombs = L.store.tombMids(s.remoteIp());
         Object arr = j.get("mids");
         List<String> missing = new ArrayList<String>();
         if (arr instanceof List) {
             for (Object o : (List<?>) arr) {
                 String mid = String.valueOf(o);
-                if (!mid.isEmpty() && !mine.contains(mid)) {
+                if (!mid.isEmpty() && !mine.contains(mid) && !tombs.contains(mid)) {
                     missing.add(mid);
                 }
             }
@@ -87,8 +122,8 @@ final class LinkHsync {
         if (missing.isEmpty()) {
             return;
         }
-        L.log("历史同步：对端持有 " + missing.size() + "+ 条缺失（清单共 "
-                + ((List<?>) arr).size() + " 条），请求补齐");
+        L.log("历史同步：对端持有 " + ((List<?>) arr).size() + " 条，本机缺 "
+                + missing.size() + " 条（墓碑已排除），请求补齐");
         if (missing.size() > HSYNC_PULL_MAX) {
             missing = missing.subList(0, HSYNC_PULL_MAX);
         }
@@ -106,13 +141,19 @@ final class LinkHsync {
                 byMid.put(mid, r);
             }
         }
+        // P2-7：本机已删掉的（墓碑）绝不补发回去
+        java.util.Set<String> tombs = L.store.tombMids(s.remoteIp());
         Object arr = j.get("mids");
         List<Map<String, Object>> texts = new ArrayList<Map<String, Object>>();
         int nText = 0;
         int nFile = 0;
         if (arr instanceof List) {
             for (Object o : (List<?>) arr) {
-                Map<String, Object> r = byMid.get(String.valueOf(o));
+                String reqMid = String.valueOf(o);
+                if (tombs.contains(reqMid)) {
+                    continue;
+                }
+                Map<String, Object> r = byMid.get(reqMid);
                 if (r == null) {
                     continue;
                 }
@@ -123,7 +164,7 @@ final class LinkHsync {
                     e.put("mid", Json.str(r, "mid", ""));
                     e.put("dir", "SELF".equals(Json.str(r, "dir", "PEER")) ? "PEER" : "SELF");
                     e.put("kind", "TEXT");
-                    e.put("text", Json.str(r, "text", ""));
+                    e.put("text", Protocol.limitText(Json.str(r, "text", "")));
                     e.put("ts", Long.valueOf(Json.lng(r, "ts", System.currentTimeMillis())));
                     texts.add(e);
                     nText++;
@@ -154,6 +195,8 @@ final class LinkHsync {
             return;
         }
         int added = 0;
+        // P2-7：墓碑里的 mid 是「本机已删」的，对端补来也不能落库
+        java.util.Set<String> tombs = L.store.tombMids(s.remoteIp());
         for (Object o : (List<?>) arr) {
             if (!(o instanceof Map)) {
                 continue;
@@ -162,6 +205,9 @@ final class LinkHsync {
             String mid = Json.str(e, "mid", "");
             String text = Json.str(e, "text", "");
             if (mid.isEmpty() || text.isEmpty()) {
+                continue;
+            }
+            if (tombs.contains(mid)) {
                 continue;
             }
             // 统一 mid 查重：本机已有该条就不重复入列
@@ -173,8 +219,8 @@ final class LinkHsync {
             m.peerIp = s.remoteIp();
             m.dir = "SELF".equals(Json.str(e, "dir", "PEER")) ? Msg.DIR_SELF : Msg.DIR_PEER;
             m.kind = Msg.KIND_TEXT;
-            m.text = text;
-            m.ts = Json.lng(e, "ts", System.currentTimeMillis());
+            m.text = Protocol.limitText(text);
+            m.ts = Protocol.saneTs(Json.lng(e, "ts", System.currentTimeMillis()));
             m.status = Msg.ST_OK;
             L.emit(m);
             added++;
@@ -241,7 +287,10 @@ final class LinkHsync {
         if (mid == null || mid.isEmpty()) {
             return;
         }
+        Session target = syncable ? delTarget(peerIp) : null;
         if (L.store != null) {
+            // P2-7：先落墓碑（sent=false 时握手补发一次 msg_del），删了才不会被 hsync 补回来
+            L.store.addTomb(peerIp, mid, target != null);
             L.store.removePending(mid);
             L.store.removeFromHistory(peerIp, mid);
         }
@@ -249,12 +298,9 @@ final class LinkHsync {
         if (l != null) {
             l.onMessageRemoved(mid);
         }
-        if (syncable) {
-            Session s = delTarget(peerIp);
-            if (s != null) {
-                L.trySend(s, Protocol.msgDel(java.util.Collections.singletonList(mid)));
-                L.log("已通知对端删除消息 mid=" + mid);
-            }
+        if (target != null) {
+            L.trySend(target, Protocol.msgDel(java.util.Collections.singletonList(mid)));
+            L.log("已通知对端删除消息 mid=" + mid);
         }
         L.log("已删除消息 mid=" + mid + (syncable ? "" : "（不同步类型，只删本机）"));
     }
@@ -288,9 +334,20 @@ final class LinkHsync {
         }
         Session s = delTarget(peerIp);
         if (s == null) {
+            // P2-7：没发出去的也落墓碑（sent=false），下次握手补发 msg_del
+            if (L.store != null) {
+                for (String mid : syncableMids) {
+                    L.store.addTomb(peerIp, mid, false);
+                }
+            }
             L.log("清空：对端不在线或老版本（hd=0），" + syncableMids.size()
-                    + " 条文本/图片只清了本机，下次连接可能被 hsync 补回");
+                    + " 条文本/图片只清了本机，已落墓碑待下次握手补发");
             return 0;
+        }
+        if (L.store != null) {
+            for (String mid : syncableMids) {
+                L.store.addTomb(peerIp, mid, true);
+            }
         }
         for (int i = 0; i < syncableMids.size(); i += MSG_DEL_CHUNK) {
             List<String> chunk = syncableMids.subList(i,
@@ -322,6 +379,8 @@ final class LinkHsync {
                 }
                 L.store.removePending(mid);
                 L.store.removeFromHistory(s.remoteIp(), mid);
+                // P2-7：对端发来的删除也落墓碑（本机从此不再向对端要这条、补发时也跳过）
+                L.store.addTomb(s.remoteIp(), mid, true);
                 Link.Listener l = L.listener;
                 if (l != null) {
                     l.onMessageRemoved(mid);
@@ -343,6 +402,13 @@ final class LinkHsync {
         String mid = Json.str(r, "mid", "");
         String name = Json.str(r, "fileName", "");
         if (mid.isEmpty() || L.inFlight.contains(mid)) {
+            return false;
+        }
+        // 已经完整送达过这台设备 → 不再重发（S31，重复投递根源修，与安卓同口径）：
+        // 对端的「缺失清单」是它自己握手时刻算的，很可能早于我们刚跑完的那次补发；
+        // 真丢了（重装/清历史）极少，下一轮握手照常补齐
+        if (L.send.isFileDelivered(mid, s.remoteIp())) {
+            L.log("历史补齐 " + name + " 本机已完整送达，跳过重发");
             return false;
         }
         File f = new File(Json.str(r, "filePath", ""));

@@ -1,5 +1,6 @@
 # ---- build outputs ----
 /out/
+/temp/
 /build/
 /android/build/
 /android/app/build/
@@ -31,6 +32,8 @@
 /pc/tools/wix311/
 /pc/tools/wix311_orig/
 /pc/tools/runtime/
+/pc/tools/runtime-*.bak/
+/pc/tools/runtime-*/
 
 # ---- editor / agent scratch ----
 /回收站/
@@ -55,13 +58,25 @@
 
 # ---- local backup helper ----
 /备 份 代 码.bat
+/备份代码.bat
 /代 码 备 份
+
+# ---- personal work notes (dev logs / fix checklists / acceptance scripts) ----
+/修复清单-*.md
+/连接逻辑*.md
+/连接逻辑*.py
+/连接逻辑*.ps1
+
+# ---- personal test helper (magisk input module) ----
+/ppinput-magisk模块/
 
 # ---- build products inside tool dirs ----
 *.class
 __pycache__/
 *.bak-*
+*.bak.*
 *.log
+/android/build_apk*_log.txt
 
 # ---- local signing material ----
 /signing/

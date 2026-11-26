@@ -441,11 +441,11 @@ class CallManager(private val link: Link, private val ctx: Context) {
         // 端口在这里带出去）。bind 不成立 ⇒ 0/false，对端落带内档。
         val t0 = av
         if (!link.sendCallInvite(
-                name, AppCore.localIp, wantVideo, lv, VoiceEngine.VOICE_FRAME_MS_LOWLAT,
+                name, AppCore.localIp, ip, wantVideo, lv, VoiceEngine.VOICE_FRAME_MS_LOWLAT,
                 t0?.mediaPort() ?: 0, t0?.mediaIsUdp() == true, t0?.localMsid() ?: ""
             )
         ) {
-            AppCore.appendLogPublic("设备 $name 未连接，无法发起通话")
+            AppCore.appendLogPublic("设备 $localName 未连接，无法发起通话")
             closeTransport()
             return false
         }
@@ -866,6 +866,8 @@ class CallManager(private val link: Link, private val ctx: Context) {
 
     private fun startTalking() {
         if (state != State.OUTGOING && state != State.INCOMING) return
+        // 通话期间持 CPU/WiFi 锁（endCall 释放），防息屏后音频断流
+        com.phonepctransfer.util.BusyLock.begin("call")
         stopRinger()
         // 媒体帧 ts 的零点：与 PC 端 CallManager.startTalking 同位置置零。
         // 音频与视频**共用这一个零点**，所以两端能各自做本端 A/V 对轴。
@@ -881,7 +883,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
         setState(State.TALKING)
         // 进入 TALKING ⇒ "通话中"这一票投 1（边界：**仅接通后**，振铃期不投，
         // 所以不是 isBusy()）。此后文件与目录一律不入网、在传的在分片/成员边界暂停。
-        link.setFileVote(Link.VOTE_IN_CALL, true)
+        link.setFileVote(Link.VOTE_IN_CALL, true, peerIp)
         //  ⚠ 音频设备初始化（AudioRecord/AudioTrack 打开）与相机/编码器启动都可能阻塞数百毫秒~数秒，
         // 必须放到独立线程：startTalking 在 Android 由主线程调用（AppCore 的 ui{}）。
         // 直接在主线程做 = ANR；在网络读线程做 = 卡死会话（收不到对端帧 → 对端 35s 判死掉线）。
@@ -1062,6 +1064,8 @@ class CallManager(private val link: Link, private val ctx: Context) {
     private var ringer: MediaPlayer? = null
 
     private fun endCall(ip: String, reason: String) {
+        // 通话结束即释放 CPU/WiFi 锁（begin 在 startTalking）
+        com.phonepctransfer.util.BusyLock.end("call")
         SegMeter.stop()
         val wasTalking = state == State.TALKING
         val wasVideo = videoMode
@@ -1094,7 +1098,7 @@ class CallManager(private val link: Link, private val ctx: Context) {
         setState(State.IDLE)
         // 挂断 ⇒ "通话中"这一票收回为 0。若三票全为 0，setFileVote 内部会自动
         // 续发一次待发队列（对端没应答就停在 PAUSED 等手动「继续」）。
-        link.setFileVote(Link.VOTE_IN_CALL, false)
+        link.setFileVote(Link.VOTE_IN_CALL, false, ip)
         listener?.onCallEnded(ip, reason, wasVideo, durationMs, wasOutgoing)
         if (wasTalking) {
             AppCore.appendLogPublic("${if (wasVideo) "视频" else ""}通话结束（$reason）")

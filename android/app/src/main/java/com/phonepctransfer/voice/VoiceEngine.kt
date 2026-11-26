@@ -76,6 +76,12 @@ class VoiceEngine {
         const val BITRATE_VIDEO_L1 = 64000
 
         /**
+         * 播放增益（用户口径：双端语音音量提高 50%）。
+         * 加在解码后的 PCM 上，超出 Short 范围削顶，避免回绕成刺啦声。
+         */
+        const val PLAYBACK_GAIN = 1.5f
+
+        /**
          * 缺帧等待轮询间隔（ms）。**不引入额外延迟**：播放端不预缓冲，
          * 只要下一帧到了就立刻解码写出；这个值只决定「队列空时多久回来看一眼」。
          * 20ms 帧长下必须调到毫秒级，否则等待本身就成了延迟。
@@ -882,6 +888,7 @@ class VoiceEngine {
             if (written < frameSamples) {
                 java.util.Arrays.fill(short, written, frameSamples, 0)
             }
+            applyPlaybackGain(short, frameSamples)
             val pcm = shortArrayToBytes(short, frameSamples)
             writeTrack(t, pcm)
         } catch (e: Throwable) {
@@ -907,6 +914,18 @@ class VoiceEngine {
     private fun writeTrack(t: AudioTrack, pcm: ByteArray) {
         writtenSamplesTotal += pcm.size / 2
         t.write(pcm, 0, pcm.size)
+    }
+
+    /** 对一帧 PCM 施加播放增益（就地修改，带削顶） */
+    private fun applyPlaybackGain(s: ShortArray, n: Int) {
+        for (i in 0 until n) {
+            val v = (s[i] * PLAYBACK_GAIN).toInt()
+            s[i] = when {
+                v > 32767 -> 32767
+                v < -32768 -> -32768
+                else -> v.toShort()
+            }
+        }
     }
 
     private fun shortArrayToBytes(s: ShortArray, n: Int): ByteArray {

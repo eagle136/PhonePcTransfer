@@ -153,6 +153,8 @@ fun DeviceListPanel(
                         DeviceRow(
                             group = g,
                             connected = AppCore.isGroupOnline(g),
+                            // 已连上但还没配对：副标题提示点一下才会出示配对码（双端不再自动弹）
+                            unpaired = AppCore.isGroupUnpaired(g),
                             // 别名行不带「当前对话」高亮：它的 ips 就是那个 IP，用 contains 判会把「同 IP 的另一台」也点亮
                             current = !g.alt && g.ips.contains(AppCore.selectedPeerIp),
                             onClick = { onPick(g) },
@@ -401,6 +403,8 @@ internal fun middleShorten(s: String, max: Int): String {
 private fun DeviceRow(
     group: PeerGroup,
     connected: Boolean,
+    /** 已连上但还没配对：副标题追加提示，点这一行才出示配对码 */
+    unpaired: Boolean,
     /** 是否是「当前对话」那台（聊天区正在显示它的记录） */
     current: Boolean,
     onClick: () -> Unit,
@@ -443,8 +447,9 @@ private fun DeviceRow(
         // 副标题：当前地址（+ 地址数量），没有备注/广播名时它就是唯一可读信息，照常显示；
         // 别名行（同 IP 多设备）额外标一句，否则用户只看到「同一个 IP 出现两次」；
         // 主行的「共用地址」也在这行提示（那些地址当前属于别的设备，只做提示不可切换）。
+        // 未配对（连上但内容通道被闸门拦住）追加一句：必须点这一行才会出示配对码。
         Text(
-            when {
+            (when {
                 group.alt -> "${group.curIp} · 同 IP 的另一台设备"
                 group.guestIps.isNotEmpty() -> {
                     val base = if (group.multi) "${group.curIp} · ${group.ips.size} 个地址"
@@ -453,10 +458,11 @@ private fun DeviceRow(
                 }
                 group.multi -> "${group.curIp} · ${group.ips.size} 个地址"
                 else -> group.curIp
-            },
+            }) + if (unpaired) " · 未配对，点一下配对" else "",
             style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
+            color = if (unpaired) MaterialTheme.colorScheme.primary
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 2,
             overflow = TextOverflow.Ellipsis
         )
     }
@@ -549,7 +555,7 @@ fun PeerEditDialog(initial: PeerGroup?, onDismiss: () -> Unit) {
                 }
                 if (!isNew) {
                     Text(
-                        "备注只存在本机；同一设备的多个地址共用同一份备注与聊天记录。删除只影响本机列表。",
+                        "备注只存在本机；同一设备的多个地址共用同一份备注与聊天记录。删除会清空该会话；在线时文本/图片也会通知对方删除，已落盘文件不动。",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 6.dp)

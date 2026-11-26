@@ -70,7 +70,7 @@ if %errorlevel% equ 0 (
 )
 
 if not exist "%JAR%" (
-  echo [ERROR] %JAR% not found. Run build.bat first.
+  echo [ERROR] %JAR% not found. Run build_jar.py first.
   pause
   exit /b 1
 )
@@ -111,7 +111,7 @@ if %errorlevel% neq 0 (
 rem ---------- start the app NON-elevated ----------
 echo Starting tray app (non-elevated - Explorer drag-drop works) ...
 rem  -Dawt.useSystemAAFontSettings=off -Dswing.aatext=false : text AA off (SimSun bitmap strikes,
-rem  100% pinned scale) - must stay in sync with PcMain.main setProperty and make-msi.sh/make-appimage.sh
+rem  100% pinned scale) - must stay in sync with PcMain.main setProperty and tools/make-msi.sh
 start "" "%JBR%\bin\javaw.exe" -Dfile.encoding=UTF-8 -Dawt.useSystemAAFontSettings=off -Dswing.aatext=false -jar "%JAR%" %*
 
 rem --- verify it really came up (javaw is silent on crash) ---
@@ -120,7 +120,7 @@ netstat -ano | findstr /c:":28765" | findstr /c:"LISTENING" >nul 2>&1
 if %errorlevel% neq 0 (
   echo.
   echo [ERROR] App did not start within 3 seconds. Possible causes:
-  echo         - corrupted jar ^(run build.bat again^)
+  echo         - corrupted jar ^(run build_jar.py again^)
   echo         - JBR path wrong ^(edit JBR variable above^)
   echo.
   echo To see the actual error, run in console mode:

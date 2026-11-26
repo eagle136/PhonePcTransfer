@@ -46,7 +46,10 @@ public final class TestClient {
         final DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
         final DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
 
-        Protocol.write(out, Protocol.hello(myId, "TestClient", "java-test"));
+        // P4-1/P4-5 起 hello 必须带 blk（32MB 分块校验）与 pr（配对能力），否则对端按「版本过旧」拒连；
+        // 用 9 参重载（含 tok=""）即可，本测试端不参与配对，收到 pair_need 后应打印出来
+        Protocol.write(out, Protocol.hello(myId, "TestClient", "java-test",
+                false, false, null, 1, 0, ""));
 
         Thread reader = new Thread(new Runnable() {
             @Override

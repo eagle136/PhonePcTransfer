@@ -22,6 +22,11 @@ final class LinkConsent {
 
     static final long DATA_ANS_WAIT_MS = 90_000L;
 
+    /** P2-6：链路停止时清掉在等的应答信箱（等待方靠超时自然退出，不会永远挂着） */
+    void clearAll() {
+        dataAnsBoxes.clear();
+    }
+
     void deliverDataAns(String mid, boolean ok) {
         java.util.concurrent.ArrayBlockingQueue<Boolean> box = dataAnsBoxes.get(mid);
         if (box != null) {
@@ -53,18 +58,18 @@ final class LinkConsent {
         dataAnsBoxes.put(mid, box);
         try {
             if (!L.sendOrDrop(s, Protocol.dataAsk(mid, kind, name, size), "data_ask", true)) {
-                L.log("数据流量确认：对端会话不可用，按未同意处理");
-                return DataConsent.REMOTE_REFUSED;
+                L.log("数据流量确认：对端会话不可用，按未确认处理（不投拒收票）");
+                return DataConsent.REMOTE_TIMEOUT;
             }
             Boolean r = box.poll(DATA_ANS_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
             if (r == null) {
-                L.log("数据流量确认：对端 " + (DATA_ANS_WAIT_MS / 1000) + "s 内未应答，按未同意处理");
-                return DataConsent.REMOTE_REFUSED;
+                L.log("数据流量确认：对端 " + (DATA_ANS_WAIT_MS / 1000) + "s 内未应答，按未确认处理（不投拒收票）");
+                return DataConsent.REMOTE_TIMEOUT;
             }
             return r.booleanValue() ? DataConsent.OK : DataConsent.REMOTE_REFUSED;
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
-            return DataConsent.REMOTE_REFUSED;
+            return DataConsent.REMOTE_TIMEOUT;
         } finally {
             dataAnsBoxes.remove(mid);
         }

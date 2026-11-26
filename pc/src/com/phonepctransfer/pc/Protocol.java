@@ -24,15 +24,34 @@ import java.util.Map;
  */
 public final class Protocol {
 
-    public static final int PROTO_VER = 2;
+    /** v3：分片 1MB→4MB（传输提速一期）。两端必须同值，靠 hello.chunk 校验，不一致直接拒连 */
+    public static final int PROTO_VER = 4;
     public static final int DEFAULT_TCP_PORT = 28765;
     public static final int DEFAULT_UDP_PORT = 28766;
     /** JSON 控制帧上限 8 MB（二进制帧长度同样受它约束） */
     public static final int MAX_FRAME = 8 * 1024 * 1024;
-    /** 文件分片大小（原始字节，二进制帧） */
-    public static final int CHUNK_SIZE = 1 * 1024 * 1024;
-    /** 接收端双缓冲：每块 4MB，一块写满切另一块、满块交给落盘线程 */
-    public static final int RX_BUF_SIZE = 4 * 1024 * 1024;
+    /**
+     * 文件分片大小（原始字节，二进制帧）。
+     * <p>v3 起 4MB：帧数降到 1/4，帧头/刷缓冲/syscall 次数同步下降，长肥管道下单帧窗口利用率更高。
+     * ⚠️ 该值参与接收端 offset 换算（seq * CHUNK_SIZE），收发两端必须一致，改动等于换协议。
+     * <p>注意：**这不是线上每帧的实际大小**。单文件发送走 {@code AdaptiveFrame}（1M 起步、8M 封顶），
+     * 这里的 4MB 只是「续传偏移/多通道单元」的换算单位与 hello 兼容闸门。
+     */
+    public static final int CHUNK_SIZE = 4 * 1024 * 1024;
+
+    /** 续传/传输校验块：32MB（P4-1，双端同值） */
+    public static final int BLOCK_SIZE = 32 * 1024 * 1024;
+
+    /** 单条文本上限（16k 字符，P4-6；不做送达验证） */
+    public static final int MAX_TEXT_CHARS = 16384;
+
+    /**
+     * 接收端缓冲池单块大小：每块 8MB（2026-11-22 由 4MB 抬到 8MB，与发送端自适应顶档齐平），
+     * 3 块轮转（见 LinkReceive.RX_BUF_COUNT），攒满 1MB 即交落盘线程。
+     * <p>必须 ≥ 发送端最大帧，否则大帧走不进「直接读进轮转缓冲」的零拷贝路径，退化成每帧现分配。
+     * ⚠️ 该值不进 hello 校验，单端改了不会拒连，只会让对端退化成逐帧分配 —— 所以仍要双端一起改。
+     */
+    public static final int RX_BUF_SIZE = 8 * 1024 * 1024;
     /** 二进制帧标志位（长度字段最高位） */
     public static final int BIN_FLAG = 0x80000000;
     /** 二进制帧子类型：文件分片 */
@@ -191,34 +210,77 @@ public final class Protocol {
     }
 
     /**
-     * 写一个二进制文件分片帧。
-     * 载荷 = [1B 子类型][1B midLen][mid UTF-8][4B seq 大端][data...]，一次性写出后 flush。
+     * 分片帧头缓存（每线程一份）：同一 mid 的 6 字节前缀只算一次，之后每帧只覆盖 4B 帧长与 4B seq，
+     * 不再每帧 new 两个数组（原实现每帧 2 次分配 + 3 次 write）。
      */
-    public static void writeChunk(OutputStream out, String mid, int seq,
-                                  byte[] data, int off, int len) throws IOException {
-        byte[] midB = mid.getBytes(StandardCharsets.UTF_8);
-        if (midB.length > 255) {
-            throw new IOException("mid 过长");
+    private static final class ChunkHead {
+        String mid = "";
+        byte[] buf = new byte[0];
+        int seqOff = 0;
+    }
+
+    private static final ThreadLocal<ChunkHead> CHUNK_HEAD =
+            new ThreadLocal<ChunkHead>() {
+                @Override
+                protected ChunkHead initialValue() {
+                    return new ChunkHead();
+                }
+            };
+
+    /**
+     * 生成一块分片帧头（复用线程私有缓冲）：[4B 帧长][1B 子类型][1B midLen][mid][4B seq]。
+     * 普通发送路径由 writeChunk 直接写；零拷贝路径（P1-4）拿它走 SocketChannel 一次写出。
+     */
+    public static byte[] chunkHeader(String mid, int seq, int len) throws IOException {
+        ChunkHead ch = CHUNK_HEAD.get();
+        byte[] buf = ch.buf;
+        if (!ch.mid.equals(mid)) {
+            byte[] midB = mid.getBytes(StandardCharsets.UTF_8);
+            if (midB.length > 255) {
+                throw new IOException("mid 过长");
+            }
+            ch.mid = mid;
+            // [0..3] 帧长 | [4] 子类型 | [5] midLen | [6..] mid | [seqOff..seqOff+3] seq
+            buf = new byte[10 + midB.length];
+            buf[4] = BIN_CHUNK;
+            buf[5] = (byte) midB.length;
+            System.arraycopy(midB, 0, buf, 6, midB.length);
+            ch.buf = buf;
+            ch.seqOff = 6 + midB.length;
         }
-        int payloadLen = 1 + 1 + midB.length + 4 + len;
+        int payloadLen = (buf.length - 4) + len;
         if (payloadLen > MAX_FRAME) {
             throw new IOException("分片帧过大: " + payloadLen);
         }
         int fl = BIN_FLAG | payloadLen;
-        out.write(new byte[]{
-                (byte) (fl >>> 24), (byte) (fl >>> 16), (byte) (fl >>> 8), (byte) fl
-        });
-        byte[] head = new byte[2 + midB.length + 4];
-        head[0] = BIN_CHUNK;
-        head[1] = (byte) midB.length;
-        System.arraycopy(midB, 0, head, 2, midB.length);
-        head[2 + midB.length] = (byte) (seq >>> 24);
-        head[3 + midB.length] = (byte) (seq >>> 16);
-        head[4 + midB.length] = (byte) (seq >>> 8);
-        head[5 + midB.length] = (byte) seq;
-        out.write(head);
-        out.write(data, off, len);
-        out.flush();
+        buf[0] = (byte) (fl >>> 24);
+        buf[1] = (byte) (fl >>> 16);
+        buf[2] = (byte) (fl >>> 8);
+        buf[3] = (byte) fl;
+        int so = ch.seqOff;
+        buf[so] = (byte) (seq >>> 24);
+        buf[so + 1] = (byte) (seq >>> 16);
+        buf[so + 2] = (byte) (seq >>> 8);
+        buf[so + 3] = (byte) seq;
+        return buf;
+    }
+
+    /**
+     * 写一个二进制文件分片帧。
+     * <p>线上字节序列与原实现逐字节相同（4B 帧长｜子类型｜midLen｜mid｜seq｜载荷），
+     * 只是把「帧长 + 帧头」合并成一次 write，并去掉逐帧 flush：大载荷走直写分支，小尾块才 flush。
+     */
+    public static void writeChunk(OutputStream out, String mid, int seq,
+                                  byte[] data, int off, int len) throws IOException {
+        byte[] buf = chunkHeader(mid, seq, len);
+        out.write(buf);
+        if (len > 0) {
+            out.write(data, off, len);
+        }
+        // 尾块（< 8KB 会话缓冲）留在缓冲里不会自己出去；大块已直写，无需再刷
+        if (len < 8192) {
+            out.flush();
+        }
     }
 
     /** 一帧：JSON 控制帧或二进制分片帧 */
@@ -232,18 +294,30 @@ public final class Protocol {
             }
         }
 
-        /** 二进制文件分片帧；data 有效范围 [0, len) */
+        /**
+         * 二进制文件分片帧；data 有效范围 [off, off+len)。
+         * direct = true 表示载荷由读循环**直接读进** data（接收端 4MB 轮转缓冲），
+         * 已省掉「先分配到临时数组再 memcpy 进缓冲」的一次分配 + 一次拷贝。
+         */
         public static final class Chunk extends Frame {
             public final String mid;
             public final int seq;
             public final byte[] data;
             public final int len;
+            public final int off;
+            public final boolean direct;
 
             Chunk(String mid, int seq, byte[] data, int len) {
+                this(mid, seq, data, len, 0, false);
+            }
+
+            Chunk(String mid, int seq, byte[] data, int len, int off, boolean direct) {
                 this.mid = mid;
                 this.seq = seq;
                 this.data = data;
                 this.len = len;
+                this.off = off;
+                this.direct = direct;
             }
         }
 
@@ -292,8 +366,39 @@ public final class Protocol {
         }
     }
 
+    /** 分片载荷落点：接收端在拿到分片头后指定「直接写进哪块缓冲的哪个偏移」 */
+    public static final class ChunkSink {
+        public final byte[] buf;
+        public final int off;
+
+        public ChunkSink(byte[] buf, int off) {
+            this.buf = buf;
+            this.off = off;
+        }
+    }
+
+    /** 直读落点解析：返回非空 = 走快路径，返回 null = 回落常规分配 */
+    public interface ChunkSinkResolver {
+        ChunkSink resolve(String mid, int seq, int len);
+    }
+
     /** @return 帧内容；流正常结束返回 null */
-    public static Frame readFrame(InputStream in) throws IOException {        byte[] len = readFully(in, 4);
+    public static Frame readFrame(InputStream in) throws IOException {
+        return readFrameInto(in, new ChunkSinkResolver() {
+            @Override
+            public ChunkSink resolve(String mid, int seq, int len) {
+                return null;
+            }
+        });
+    }
+
+    /**
+     * 带直读落点的帧读取：解析到文件分片头时先问 resolver「这块要落到哪」。
+     * <p>resolver 返回非空 → 载荷不分配临时数组，直接读进指定缓冲（快路径）；
+     * 返回 null → 退回原逻辑（分配 byte[]），保证乱序/未知 mid/跨缓冲等异常路径行为不变。
+     */
+    public static Frame readFrameInto(InputStream in, ChunkSinkResolver resolver) throws IOException {
+        byte[] len = readFully(in, 4);
         if (len == null) {
             return null;
         }
@@ -359,7 +464,16 @@ public final class Protocol {
         if (dataLen < 0) {
             throw new IOException("二进制帧长度不符: " + n);
         }
+        String mid = new String(midB, StandardCharsets.UTF_8);
+        ChunkSink sink = resolver == null ? null : resolver.resolve(mid, seq, dataLen);
+        if (sink != null) {
+            if (dataLen > 0) {
+                readFullyInto(in, sink.buf, sink.off, dataLen);
+            }
+            return new Frame.Chunk(mid, seq, sink.buf, dataLen, sink.off, true);
+        }
         byte[] data = new byte[dataLen];
+        TxStats.alloc(1);
         if (dataLen > 0) {
             byte[] d = readFully(in, dataLen);
             if (d == null) {
@@ -367,7 +481,21 @@ public final class Protocol {
             }
             data = d;
         }
-        return new Frame.Chunk(new String(midB, StandardCharsets.UTF_8), seq, data, dataLen);
+        return new Frame.Chunk(mid, seq, data, dataLen);
+    }
+
+    /** 把 len 字节直接读进 buf 的 off 处（不分配、不二次拷贝） */
+    private static void readFullyInto(InputStream in, byte[] buf, int off, int len) throws IOException {
+        int at = off;
+        int remain = len;
+        while (remain > 0) {
+            int n = in.read(buf, at, remain);
+            if (n < 0) {
+                throw new EOFException("分片数据不完整");
+            }
+            at += n;
+            remain -= n;
+        }
     }
 
     private static int readInt(InputStream in) throws IOException {
@@ -405,11 +533,18 @@ public final class Protocol {
     }
 
     public static Map<String, Object> hello(String id, String name, String model) {
-        return hello(id, name, model, false, false, null);
+        return hello(id, name, model, false, false, null, 1, 0);
+    }
+
+    /** 主连接握手（单通道语义，lane=0） */
+    public static Map<String, Object> hello(String id, String name, String model,
+                                            boolean vid, boolean cam,
+                                            java.util.List<String> vcodec) {
+        return hello(id, name, model, vid, cam, vcodec, 1, 0);
     }
 
     /**
-     * 握手 + 视频能力协商（与 Android 端同构）。
+     * 握手 + 视频能力协商 + 多通道能力协商（与 Android 端同构）。
      *
      * 老版本对端不认识 {@code vid/cam/vcodec} 字段 → 天然忽略，因此**不发生断链**；
      * 而新版本只有在看到对端 {@code vid=true} 时才允许发视频二进制帧
@@ -418,15 +553,35 @@ public final class Protocol {
      * @param vid   本端**可接收**视频
      * @param cam   本端**有摄像头可发送**（PC 恒 false —— 只收不发）
      * @param vcodec 本端**可解码**的编码列表，如 ["hevc","h264"]
+     * @param lanes 本端最多能同时使用的数据通道数（1 = 不支持多通道）
+     * @param lane  本条连接的角色（0 = 主连接，>0 = 纯数据通道）
      */
     public static Map<String, Object> hello(String id, String name, String model,
                                             boolean vid, boolean cam,
-                                            java.util.List<String> vcodec) {
+                                            java.util.List<String> vcodec,
+                                            int lanes, int lane) {
+        return hello(id, name, model, vid, cam, vcodec, lanes, lane, "");
+    }
+
+    /**
+     * 同上，额外带已配对设备的共享 token（P4-5）。
+     * 接收端拿 token 与本机配对库比对：一致直接放行；不一致/为空则进入 6 位配对码流程。
+     */
+    public static Map<String, Object> hello(String id, String name, String model,
+                                            boolean vid, boolean cam,
+                                            java.util.List<String> vcodec,
+                                            int lanes, int lane,
+                                            String tok) {
         Map<String, Object> m = msg("hello");
         m.put("id", id);
         m.put("name", name);
         m.put("model", model);
         m.put("ver", Integer.valueOf(PROTO_VER));
+        // 分片大小协商：老端不带该字段 → 按 1MB 处理，onHello 直接拒连，避免错位写坏文件
+        m.put("chunk", Integer.valueOf(CHUNK_SIZE));
+        // 2 期：多通道能力协商。老端忽略这两个字段 → 自动单通道
+        m.put("lanes", Integer.valueOf(lanes));
+        m.put("lane", Integer.valueOf(lane));
         m.put("vid", Boolean.valueOf(vid));
         m.put("cam", Boolean.valueOf(cam));
         m.put("vcodec", vcodec == null ? new java.util.ArrayList<String>() : vcodec);
@@ -435,8 +590,64 @@ public final class Protocol {
         m.put("dl", Boolean.TRUE);
         // 数据流量确认（v2.7）：PC 恒为「不在运营商数据网络」，收到 data_ask 一律自动同意
         m.put("dm", Boolean.TRUE);
+        // P4-1 分块校验 / P4-5 配对能力（老端不带 → false，由 onHello 拒绝并提示同时升级）
+        m.put("blk", Integer.valueOf(BLOCK_SIZE));
+        m.put("pr", Boolean.TRUE);
+        m.put("tok", tok == null ? "" : tok);
         return m;
     }
+
+    /** 单条文本截断到 {@link #MAX_TEXT_CHARS}（发送端与接收端都调用，保证落库口径一致） */
+    public static String limitText(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.length() > MAX_TEXT_CHARS ? s.substring(0, MAX_TEXT_CHARS) : s;
+    }
+
+    /** 对端可控时间戳只允许「不晚于本机时钟 5 分钟」；非法/未来值回落到 now */
+    public static long saneTs(long ts) {
+        long now = System.currentTimeMillis();
+        return (ts <= 0L || ts > now + 5 * 60_000L) ? now : ts;
+    }
+
+    // ==================== 多通道传输（2 期，v4）====================
+
+    /** 多通道开传声明：必须在 file_meta 之前发，接收端据此把该 mid 建成 3 槽重排环 */
+    public static Map<String, Object> xeBegin(String mid, int unit, int lanes, long startAt) {
+        Map<String, Object> m = msg("xe_begin");
+        m.put("mid", mid);
+        m.put("unit", Integer.valueOf(unit));
+        m.put("lanes", Integer.valueOf(lanes));
+        m.put("startAt", Long.valueOf(startAt));
+        return m;
+    }
+
+    /** 多通道收尾：所有单元已发完（file_done 紧跟其后） */
+    public static Map<String, Object> xeEnd(String mid) {
+        Map<String, Object> m = msg("xe_end");
+        m.put("mid", mid);
+        return m;
+    }
+
+    /**
+     * 接收上下文就绪应答：接收端已把该 mid 的 Rx（多通道时含 3 槽重排环）建好并登记进 rxMap，
+     * 发送端收到后才允许启动数据通道发分片。在此之前发出去的分片会因「未知 mid」被丢弃，
+     * 留下无法补齐的单元缺口 —— 2 期首测 1GB 卡死 30s 的根因就是这个时序。
+     */
+    public static Map<String, Object> xeReady(String mid) {
+        Map<String, Object> m = msg("xe_ready");
+        m.put("mid", mid);
+        return m;
+    }
+
+    /** 数据通道就绪应答（对端挂载成功后回发，拨号方据此确认该 lane 可用） */
+    public static Map<String, Object> laneOk(int lane) {
+        Map<String, Object> m = msg("lane_ok");
+        m.put("lane", Integer.valueOf(lane));
+        return m;
+    }
+
 
     // ==================== 数据流量确认（v2.7，仅双方 dm=1 时使用）====================
 
@@ -511,6 +722,17 @@ public final class Protocol {
     public static Map<String, Object> busy(String holder) {
         Map<String, Object> m = msg("busy");
         m.put("holder", holder);
+        return m;
+    }
+
+    /** 拒绝传输：本机任务槽被占（单任务闸门）。带 mid ⇒ 只回绝这一条、对端自动排队重试，不关会话；
+     *  kind ∈ {"file","dir","member"}（对端只用来区分文案/标记） */
+    public static Map<String, Object> busy(String mid, String name, String holder, String kind) {
+        Map<String, Object> m = msg("busy");
+        m.put("mid", mid);
+        m.put("name", name);
+        m.put("holder", holder);
+        m.put("kind", kind);
         return m;
     }
 
@@ -607,31 +829,106 @@ public final class Protocol {
      * sha256 为前缀摘要（对端自行维护/重算，可能为空）；ok=false 从头传。
      */
     public static Map<String, Object> fileResume(String mid, boolean ok, long offset, String sha256) {
+        return fileResume(mid, ok, offset, sha256, false);
+    }
+
+    /**
+     * 断点续传应答（大小校验版）。
+     * <p>{@code needBlk=true}：对端命中了磁盘上的半成品，offset 已向下对齐到 32MB 边界；
+     * 发送端发 {@link #blkVerify} 请求按块核对大小，等 {@link #blkAck} 回到最终偏移后再发数据。
+     */
+    public static Map<String, Object> fileResume(String mid, boolean ok, long offset, String sha256,
+                                                 boolean needBlk) {
         Map<String, Object> m = msg("file_resume");
         m.put("mid", mid);
         m.put("ok", Boolean.valueOf(ok));
         m.put("offset", Long.valueOf(offset));
         m.put("sha256", sha256 == null ? "" : sha256);
+        m.put("needBlk", Boolean.valueOf(needBlk));
         return m;
+    }
+
+    // ==================== 32MB 分块大小校验（不做 hash） ====================
+
+    /**
+     * 发送端 → 接收端：发起前缀大小校验——按 32MB 一块核对 [0, offset) 是否都在盘上，
+     * 接收端截断到最后一个完整块边界、建好续传通道后回 {@link #blkAck}（带实际核验偏移）。
+     * offset=0 表示放弃续传、从头接收（接收端清掉半成品）。
+     */
+    public static Map<String, Object> blkVerify(String mid, long offset) {
+        Map<String, Object> m = msg("blk_verify");
+        m.put("mid", mid);
+        m.put("offset", Long.valueOf(offset));
+        return m;
+    }
+
+    /**
+     * 接收端 → 发送端：大小校验结果。ok=false 请从 0 重来；
+     * offset = 实际核验通过的续传起点（可能小于请求值：盘上字节不够时退到最后一个完整块边界）。
+     */
+    public static Map<String, Object> blkAck(String mid, int idx, boolean ok, long offset) {
+        Map<String, Object> m = msg("blk_ack");
+        m.put("mid", mid);
+        m.put("idx", Integer.valueOf(idx));
+        m.put("ok", Boolean.valueOf(ok));
+        m.put("offset", Long.valueOf(offset));
+        return m;
+    }
+
+    // ==================== P4-5 设备配对（6 位码）====================
+
+    /** 接收方 → 发起方：这台设备未配对（或 token 不匹配），请让用户在发起方输入本机显示的 6 位码 */
+    public static Map<String, Object> pairNeed(long ttlMs) {
+        Map<String, Object> m = msg("pair_need");
+        m.put("ttl", Long.valueOf(ttlMs));
+        return m;
+    }
+
+    /** 发起方 → 接收方：用户输入的 6 位配对码 */
+    public static Map<String, Object> pairSubmit(String code) {
+        Map<String, Object> m = msg("pair_submit");
+        m.put("code", code == null ? "" : code);
+        return m;
+    }
+
+    /** 接收方 → 发起方：配对成功（token 为空 = 仅确认既有的 hello.tok 校验通过） */
+    public static Map<String, Object> pairOk(String token) {
+        Map<String, Object> m = msg("pair_ok");
+        m.put("token", token == null ? "" : token);
+        return m;
+    }
+
+    /** 接收方 → 发起方：配对码错误，left=剩余次数 */
+    public static Map<String, Object> pairFail(int left) {
+        Map<String, Object> m = msg("pair_fail");
+        m.put("left", Integer.valueOf(left));
+        return m;
+    }
+
+    /** 任一端 → 对端：用户点了弹窗里的「取消」，请对端也把配对弹窗关掉（连接保留，仍未配对） */
+    public static Map<String, Object> pairCancel() {
+        return msg("pair_cancel");
     }
 
     /** 文件夹传输开始：name=文件夹名，fileCount=成员数，totalSize=总字节 */
     public static Map<String, Object> dirMeta(String mid, String name, int fileCount, long totalSize,
                                               List<String> emptyDirs) {
-        return dirMeta(mid, name, fileCount, totalSize, emptyDirs, null, 0);
+        return dirMeta(mid, name, fileCount, totalSize, emptyDirs, null, 0, null);
     }
 
     /**
-     * 文件夹传输开始（v2.6 扩充）。
+     * 文件夹传输开始（清单版：先给清单再发数据）。
      *
-     * @param memberList 成员相对路径清单。接收端收到 dir_end 时用它求差集，把没到的成员
+     * @param memberList 成员相对路径清单（目录结构）。接收端收到 dir_end 时用它求差集，把没到的成员
      *                   回发 dir_missing 让本端补发 —— 这是「文件夹静默缺文件」的根治手段。
      *                   为空 = 不带清单，退化为「只按数量核对」（老端行为）。
      * @param skipped    因深度/数量上限被跳过的分支数；&gt;0 时对端明确提示，不让内容无声消失
+     * @param sizes      成员大小清单（与 memberList 逐项对应）；接收端按清单存放并核对每个成员的字节数。
+     *                   为空/长度不符 = 不带大小，只按路径核对
      */
     public static Map<String, Object> dirMeta(String mid, String name, int fileCount, long totalSize,
                                               List<String> emptyDirs, List<String> memberList,
-                                              int skipped) {
+                                              int skipped, List<Long> sizes) {
         Map<String, Object> m = msg("dir_meta");
         m.put("mid", mid);
         m.put("name", name);
@@ -644,6 +941,9 @@ public final class Protocol {
         }
         if (skipped > 0) {
             m.put("skipped", Integer.valueOf(skipped));
+        }
+        if (sizes != null && !sizes.isEmpty() && memberList != null && sizes.size() == memberList.size()) {
+            m.put("sizes", sizes);
         }
         return m;
     }
@@ -677,13 +977,24 @@ public final class Protocol {
     }
 
     /**
-     * 续传完成核对：接收端把落盘文件的 MD5 回发给发送端比对（端到端完整性）。
-     * 只对触发过续传的普通单文件发送；发送端异步核对，不阻塞任何线程。
+     * 接收端在收到 dir_meta 后立刻回报「本机已经在盘上的成员」：
+     * 断链重发整目录时发送端据此跳过这些成员，只补真正缺的文件（局域网按文件粒度即可）。
      */
-    public static Map<String, Object> fileVerify(String mid, String md5) {
+    public static Map<String, Object> dirHave(String mid, List<String> items) {
+        Map<String, Object> m = msg("dir_have");
+        m.put("mid", mid);
+        m.put("items", items == null ? new ArrayList<String>() : items);
+        return m;
+    }
+
+    /**
+     * 续传完成核对（大小版）：接收端把落盘文件的实际字节数回发给发送端比对。
+     * 只对触发过续传的普通单文件发送；发送端按整文件 10s 超时等待，不阻塞任何线程。
+     */
+    public static Map<String, Object> fileVerify(String mid, long size) {
         Map<String, Object> m = msg("file_verify");
         m.put("mid", mid);
-        m.put("md5", md5 == null ? "" : md5);
+        m.put("size", Long.valueOf(size));
         return m;
     }
 

@@ -48,13 +48,12 @@ android {
         applicationId = "com.phonepctransfer"
         minSdk = 28
         targetSdk = 37
-        // versionCode 走「major*10000 + minor*100 + patch」＝ 10200，保证严格递增
+        // versionCode 走「major*10000 + minor*100 + patch」＝ 10213，保证严格递增
         // （同签名覆盖安装认 versionCode，必须 ≥ 已装版本）。
-        // 2026-11-17 升版：对外 1.2，内部 10200（= 1.2 口径，两者对应；上一版是 1.1/10100）。
-        // CI 通过 -PppVersionName=1.2.<run> -PppVersionCode=10200+<run> 注入，
-        // 保证每次 Release 的 versionCode 单调递增。
-        versionCode = (project.findProperty("ppVersionCode") as String?)?.toInt() ?: 10200
-        versionName = (project.findProperty("ppVersionName") as String?) ?: "1.2"
+        // 2026-11-26 升版：对外 1.2.13，内部 10213（配对验证 + 传输效率 + 若干潜在 bug 修复）。
+        // CI 通过 -PppVersionName / -PppVersionCode 注入（取自 tag），保证每次 Release 的版本号单调递增。
+        versionCode = (project.findProperty("ppVersionCode") as String?)?.toInt() ?: 10213
+        versionName = (project.findProperty("ppVersionName") as String?) ?: "1.2.13"
 
         // 只保留中英文资源
         resourceConfigurations.addAll(listOf("zh", "zh-rCN", "zh-rTW", "en"))

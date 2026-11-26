@@ -122,6 +122,26 @@ public final class VoiceEngine {
     private volatile int bitrate = BITRATE_VOICE;
 
     /**
+     * 播放增益（用户口径：双端语音音量提高 50%）。
+     * 加在解码后的 PCM 上（声卡通用，不依赖 FloatControl 是否被驱动支持），
+     * 超出 short 范围直接削顶，避免整数回绕成刺啦声。
+     */
+    static final float PLAYBACK_GAIN = 1.5f;
+
+    /** 对一帧 PCM 施加播放增益（就地修改，n 为有效样本数） */
+    private static void applyPlaybackGain(short[] s, int n) {
+        for (int i = 0; i < n; i++) {
+            int v = (int) (s[i] * PLAYBACK_GAIN);
+            if (v > 32767) {
+                v = 32767;
+            } else if (v < -32768) {
+                v = -32768;
+            }
+            s[i] = (short) v;
+        }
+    }
+
+    /**
      * 静音开关（视频通话窗口的「静音」按钮）。
      *
      * 语义 = **不发送**，而不是发送静音帧：编码直接跳过以省 CPU，但 **seq 仍然递增**，
@@ -847,6 +867,8 @@ public final class VoiceEngine {
             if (written < frameSamples()) {
                 java.util.Arrays.fill(shortBuf, written, frameSamples(), (short) 0);
             }
+            // 音量 +50%（削顶保护见 applyPlaybackGain）
+            applyPlaybackGain(shortBuf, frameSamples());
             byte[] pcm = shortArrayToBytes(shortBuf, frameSamples());
             line.write(pcm, 0, pcm.length);
         } catch (Throwable t) {

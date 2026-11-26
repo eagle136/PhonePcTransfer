@@ -30,6 +30,13 @@ public final class DataConsent {
     /** 目标设备当前没有健康会话 */
     public static final int NO_SESSION = 3;
 
+    /**
+     * 已把 data_ask 发出去，但 90s 内没等到 data_ans（对端锁屏/界面忙/半死）。
+     * <p>与 Android 端 {@code REMOTE_TIMEOUT} 同义：**不是拒绝**，不投「拒收」票、不关文件管线；
+     * 条目留在待发队列，下次握手或用户点继续时再试。
+     */
+    public static final int REMOTE_TIMEOUT = 4;
+
     public static final String KIND_FILE = "file";
     public static final String KIND_VOICE = "voice";
     public static final String KIND_VIDEO = "video";
@@ -63,6 +70,11 @@ public final class DataConsent {
      * 发起方看到「对端拒绝用数据流量接收」时的提示文本，斜杠按三个场景分别取值：
      * 「对方拒绝了使用数据流量接受文件 / 接受语音通话 / 接受视频通话」。
      */
+    /** 发起方看到「对端迟迟未确认」时的提示文本（可重试，不是拒绝） */
+    public static String peerTimeoutText(String kind) {
+        return "对方未确认（" + labelOf(kind) + "请求已保留，可重试）";
+    }
+
     public static String peerRefusedText(String kind) {
         if (KIND_VOICE.equals(kind)) {
             return "对方拒绝了使用数据流量接受语音通话";

@@ -18,6 +18,164 @@ final class LinkNames {
     private LinkNames() {
     }
 
+    // ==================================================================
+    // 发送端名校验（与 Android 端 util/NameRules.kt 同一口径，双端同步改）：
+    //   ① UTF-8 字节数 ≤ MAX_NAME_BYTES（含扩展名）→ 提示「文件名过长」并禁止发送；
+    //   ② 含可能影响 Linux/Windows 的字符/保留名/结尾点空格 → 提示后取消本次传输任务。
+    // 校验失败 = 整次发送请求取消；接收端仍用 sanitize 兜底 + clampName 截断。
+    // ==================================================================
+
+    /**
+     * 文件名上限（UTF-8 字节数，含扩展名）。
+     * <p>取 200：仍低于 ext4/NTFS 单段 255 字节的硬上限，又足够容纳「项目名+日期+后缀」这类
+     * 真实长名（原 48 字节把大量正常文件名挡在发送前）。
+     */
+    static final int MAX_NAME_BYTES = 200;
+
+    private static final char[] ILLEGAL_CHARS = {'\\', '/', ':', '*', '?', '"', '<', '>', '|'};
+
+    static int utf8Len(String s) {
+        try {
+            return s.getBytes("UTF-8").length;
+        } catch (java.io.UnsupportedEncodingException e) {
+            return s.length();
+        }
+    }
+
+    /** @return null = 通过；否则为不含主语的原因（调用方拼「文件名 / 文件夹名 / 成员」前缀） */
+    static String checkName(String raw) {
+        String name = raw == null ? "" : raw.trim();
+        if (name.isEmpty()) {
+            return "为空";
+        }
+        if (!name.equals(raw)) {
+            return "不能以空格开头或结尾";
+        }
+        int bytes = utf8Len(name);
+        if (bytes > MAX_NAME_BYTES) {
+            return "过长（" + bytes + " 字节，上限 " + MAX_NAME_BYTES + " 字节）";
+        }
+        for (int i = 0; i < name.length(); i++) {
+            char ch = name.charAt(i);
+            boolean bad = ch < 0x20 || ch == 0x7F;
+            for (char c : ILLEGAL_CHARS) {
+                if (ch == c) {
+                    bad = true;
+                    break;
+                }
+            }
+            if (bad) {
+                String show = ch < 0x20 || ch == 0x7F
+                        ? String.format("\\x%02X", Integer.valueOf(ch)) : String.valueOf(ch);
+                return "含特殊字符「" + show + "」，可能影响 Linux/Windows 文件系统";
+            }
+        }
+        if (".".equals(name) || "..".equals(name)) {
+            return "不能是「" + name + "」";
+        }
+        if (name.endsWith(".")) {
+            return "不能以点结尾";
+        }
+        if (RESERVED_NAME.matcher(name).matches()) {
+            return "「" + name + "」是系统保留名";
+        }
+        return null;
+    }
+
+    static String fileNameError(String name) {
+        String r = checkName(name);
+        return r == null ? null : "文件名" + r;
+    }
+
+    static String folderNameError(String name) {
+        String r = checkName(name);
+        return r == null ? null : "文件夹名" + r;
+    }
+
+    /** 逐段校验成员相对路径（只有 '/' 才是分隔符：段内出现 '\' 本身就是非法字符，必须被查出来） */
+    static String relPathError(String relPath) {
+        String[] segs = relPath.split("/");
+        java.util.List<String> kept = new ArrayList<String>();
+        for (String seg : segs) {
+            if (!seg.isEmpty()) {
+                kept.add(seg);
+            }
+        }
+        if (kept.isEmpty()) {
+            return "成员「" + relPath + "」文件名为空";
+        }
+        String full = String.join("/", kept);
+        for (int i = 0; i < kept.size(); i++) {
+            String reason = checkName(kept.get(i));
+            if (reason == null) {
+                continue;
+            }
+            return i == kept.size() - 1
+                    ? "成员「" + full + "」的文件名" + reason
+                    : "成员「" + full + "」的目录段「" + kept.get(i) + "」" + reason;
+        }
+        return null;
+    }
+
+    /** 文件夹整体校验：目录名 + 全部成员相对路径 */
+    static String folderError(String folderName, java.util.List<String> relPaths) {
+        String e = folderNameError(folderName);
+        if (e != null) {
+            return e;
+        }
+        for (String rel : relPaths) {
+            String r = relPathError(rel);
+            if (r != null) {
+                return r;
+            }
+        }
+        return null;
+    }
+
+    /** 按码点截断到 maxBytes（UTF-8），不劈开代理对 */
+    static String trimToBytes(String s, int maxBytes) {
+        if (maxBytes <= 0) {
+            return "";
+        }
+        if (utf8Len(s) <= maxBytes) {
+            return s;
+        }
+        StringBuilder sb = new StringBuilder();
+        int used = 0;
+        int i = 0;
+        while (i < s.length()) {
+            int cp = s.codePointAt(i);
+            int n = cp < 0x80 ? 1 : (cp < 0x800 ? 2 : (cp < 0x10000 ? 3 : 4));
+            if (used + n > maxBytes) {
+                break;
+            }
+            sb.appendCodePoint(cp);
+            used += n;
+            i += Character.charCount(cp);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 接收端 [MAX_NAME_BYTES] 字节兜底（超长保留扩展名 + 预留 8 字节给 " (n)" 序号）。
+     */
+    static String clampName(String name) {
+        if (utf8Len(name) <= MAX_NAME_BYTES) {
+            return name;
+        }
+        String ext = "";
+        int dot = name.lastIndexOf('.');
+        if (dot > 0 && name.length() - dot - 1 >= 1 && name.length() - dot - 1 <= 12) {
+            ext = name.substring(dot);
+        }
+        String stem = ext.isEmpty() ? name : name.substring(0, dot);
+        int budget = MAX_NAME_BYTES - utf8Len(ext) - 8;
+        if (budget < 4) {
+            budget = 4;
+        }
+        return trimToBytes(stem, budget) + ext;
+    }
+
     static String sanitize(String name) {
         String base = name;
         int i = Math.max(base.lastIndexOf('/'), base.lastIndexOf('\\'));
@@ -36,17 +194,17 @@ final class LinkNames {
                 return "file_" + randomTag() + cleaned.substring(dot);
             }
         }
-        return cleaned;
+        return clampName(cleaned);
     }
 
-    /** 目录名/相对路径段清洗（比 sanitize 更狠：/ \ 都换掉，防路径穿越） */
+    /** 目录名/相对路径段清洗（比 sanitize 更狠：/ \ 都换掉，防路径穿越；并受 MAX_NAME_BYTES 上限约束） */
     static String segSanitize(String s) {
         String base = stripEmoji(s).replaceAll("[\\\\/:*?\"<>|]", "_").trim();
         base = winSafe(base);
         if (base.isEmpty() || ".".equals(base) || "..".equals(base)) {
             base = "_" + System.currentTimeMillis();
         }
-        return base;
+        return clampName(base);
     }
 
     /** Windows 保留设备名与结尾的点/空格（对端可能是 PC，这些名字在 NTFS 上创建不了） */
@@ -202,7 +360,9 @@ final class LinkNames {
     /**
      * 递归枚举目录内全部文件（相对路径），跳过不可读项。
      *
-     * @param emptyDirs 收集「整棵子树一个文件都没有」的目录（相对路径），随 dir_meta 发给对端重建空目录
+     * @param emptyDirs 收集「整棵子树一个文件都没有」的目录（相对路径）
+     *                  —— ⚠ 本轮起**不再随 dir_meta 下发**（空文件夹一律忽略、不记清单），
+     *                  参数保留只为既有调用点签名不变；发送侧请在组帧时传空列表。
      * @param skipped   [0] 累计因深度/数量上限被跳过的分支数——绝不让内容无声消失
      * @return 子树内文件数
      */
@@ -219,6 +379,12 @@ final class LinkNames {
         Arrays.sort(kids, Comparator.comparing(File::getName));
         int count = 0;
         for (File k : kids) {
+            if (Files.isSymbolicLink(k.toPath())) {
+                // 目录符号链接会被 File.isDirectory() 跟随，一路递归出去能把整盘扫进来
+                // （甚至自引用成环）→ 一律跳过并计数，绝不跟随
+                skipped[0]++;
+                continue;
+            }
             if (k.isDirectory()) {
                 count += listFilesRecursive(k,
                         prefix.isEmpty() ? k.getName() : prefix + "/" + k.getName(),

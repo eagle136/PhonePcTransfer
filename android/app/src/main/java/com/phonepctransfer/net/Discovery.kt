@@ -1,5 +1,7 @@
 package com.phonepctransfer.net
 
+import android.content.Context
+import android.net.wifi.WifiManager
 import android.util.Log
 import org.json.JSONObject
 import java.net.DatagramPacket
@@ -9,16 +11,23 @@ import java.net.InetSocketAddress
 import java.net.NetworkInterface
 
 /**
- * UDP 28766 广播发现(低噪声):启动只广播一次,此后纯被动接收对端 beacon,收到谁就把谁回调(自动进设备列表);
- * [scanOnce] 是唯一主动扫描(广播询问 + 本机 /24 逐地址单播,询问带 q:1,对端回应 2s 限频、不反弹)
+ * UDP 28766 广播发现:启动广播一次、之后每 20s 补一次(轻量兜底),其余时间被动接收对端 beacon,
+ * 收到谁就把谁回调(自动进设备列表);[scanOnce] 主动扫描(广播询问 + 本机各私网 /24 逐地址单播,
+ * 询问带 q:1,对端**单播**回应、2s 限频、不反弹)
  */
 class Discovery(
+    context: Context,
     private val deviceId: String,
     private val deviceName: String,
     private val tcpPort: Int,
     private val udpPort: Int,
     private val onPeer: (ip: String, name: String, id: String, port: Int) -> Unit
 ) {
+
+    private val appContext = context.applicationContext
+
+    /** A12 等 ROM 的 WiFi 广播接收闸门；只随 Discovery 生命周期持有一把，退出立即释放。 */
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     @Volatile
     private var running = false
@@ -28,15 +37,15 @@ class Discovery(
     /** 串行化 beacon 发送：启动广播与主动扫描（scanOnce）可能并发调用 */
     private val sendLock = Any()
 
-    /** 主动扫描期间收集"回应"的设备 IP；null = 无扫描在进行（recvLoop 收到对端 beacon 就往里丢） */
-    @Volatile
-    private var scanCollector: MutableSet<String>? = null
+    /** 正在进行的扫描各自的收集器（可并存：两次扫描并发时互不顶替） */
+    private val scanCollectors = java.util.concurrent.CopyOnWriteArrayList<MutableSet<String>>()
 
     /** 扫描询问回应限频表:IP→上次回应时刻(2s 限频);超 1h 条目在 shouldReply 入口清扫 */
     private val lastReplyAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     fun start() {
         if (running) return
+        acquireMulticastLock()
         running = true
         Thread({ recvLoop() }, "pp-discovery-recv").apply { isDaemon = true }.start()
         Thread({ sendLoop() }, "pp-discovery-send").apply { isDaemon = true }.start()
@@ -48,6 +57,29 @@ class Discovery(
         runCatching { sendSocket?.close() }
         recvSocket = null
         sendSocket = null
+        releaseMulticastLock()
+    }
+
+    /** 部分 A12/厂商 ROM 不过滤权限声明本身，但会在未持锁时丢弃广播回应；失败不阻断单播扫描。 */
+    private fun acquireMulticastLock() {
+        if (multicastLock?.isHeld == true) return
+        runCatching {
+            val wm = appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                ?: error("WifiManager unavailable")
+            wm.createMulticastLock("PhonePcTransfer:discovery").apply {
+                setReferenceCounted(false)
+                acquire()
+                multicastLock = this
+            }
+            Log.i(TAG, "WiFi 多播锁已持有，启用广播发现兼容路径")
+        }.onFailure { Log.w(TAG, "WiFi 多播锁获取失败，继续单播扫描: ${it.message}") }
+    }
+
+    private fun releaseMulticastLock() {
+        val lock = multicastLock ?: return
+        multicastLock = null
+        runCatching { if (lock.isHeld) lock.release() }
+            .onFailure { Log.w(TAG, "WiFi 多播锁释放失败: ${it.message}") }
     }
 
     private fun beacon(): ByteArray = beacon(false)
@@ -64,13 +96,21 @@ class Discovery(
         return o.toString().toByteArray(Charsets.UTF_8)
     }
 
-    /** 启动广播线程:只发一次(本端唯一主动广播),发完待命纯被动 */
+    /**
+     * 周期广播线程：启动先广播一次，之后每 [ANNOUNCE_INTERVAL_MS] 补一次。
+     *
+     * 早先「只广播一次」在真机上会漏设备：谁先开机、或者启动那个广播被 AP 丢掉，
+     * 就会出现「PC 看得见手机、手机看不见 PC」。周期广播是最便宜的兜底（每 20s 一个几十字节的包）。
+     */
     private fun sendLoop() {
         runCatching { sendBeaconOnce(false) }
-            .onSuccess { Log.i(TAG, "启动广播已发出（仅此一次，之后纯被动接收对端广播）") }
+            .onSuccess { Log.i(TAG, "启动广播已发出（此后每 ${ANNOUNCE_INTERVAL_MS / 1000}s 补发一次）") }
             .onFailure { Log.w(TAG, "启动广播发送失败: ${it.message}") }
         while (running) {
-            sleep(60_000)
+            sleep(ANNOUNCE_INTERVAL_MS)
+            if (!running) break
+            runCatching { sendBeaconOnce(false) }
+                .onFailure { Log.w(TAG, "周期广播发送失败: ${it.message}") }
         }
     }
 
@@ -95,6 +135,16 @@ class Discovery(
             ?.also { sendSocket = it }
     }
 
+    /** 单播回应对端的扫描询问（直接打回询问方 IP:udpPort，绕开广播被丢的链路） */
+    private fun sendBeaconTo(target: InetAddress) {
+        synchronized(sendLock) {
+            val s = ensureSendSocket() ?: return
+            val payload = beacon(false)
+            runCatching { s.send(DatagramPacket(payload, payload.size, target, udpPort)) }
+                .onFailure { Log.w(TAG, "单播回应失败（${target.hostAddress}）: ${it.message}") }
+        }
+    }
+
     /**
      * 主动扫描一轮:先广播带 q 询问,窗口内(默认 3000ms,对端回应 2s 限频,留够往返余量)
      * 每 800ms 补发、先扫一遍本机 /24(.1~.254)、窗口过半对未回应地址补扫(首轮可能 ARP 丢包),
@@ -110,19 +160,22 @@ class Discovery(
     ): Set<String> {
         if (!running) return emptySet()
         val seen = java.util.Collections.synchronizedSet(LinkedHashSet<String>())
-        scanCollector = seen
+        scanCollectors.add(seen)
         val startedAt = System.currentTimeMillis()
         try {
             // ① 先广播一轮（老路径，别丢：网段扫描漏掉的地址靠它兜）
             runCatching { sendBeaconOnce(true) }
 
-            // ② 网段扫描：只扫本网段 /24
-            val prefix = subnetPrefixOf(ownIpv4)
-            val own = (skipIps + listOfNotNull(ownIpv4)).toSet()
-            val targets = if (prefix == null) emptyList() else subnetTargets(prefix, own)
+            // ② 网段扫描：本机每一块网卡的私网 /24 都扫（WiFi + 热点/以太网可能同时存在）
+            val own = (skipIps + listOfNotNull(ownIpv4)).filter { it.isNotBlank() }.toSet()
+            val prefixes = LinkedHashSet<String>()
+            subnetPrefixOf(ownIpv4)?.let { prefixes.add(it) }
+            for (ip in own) subnetPrefixOf(ip)?.let { prefixes.add(it) }
+            val targets = ArrayList<String>()
+            for (p in prefixes.take(MAX_SWEEP_PREFIXES)) targets.addAll(subnetTargets(p, own))
             var retryDone = targets.isEmpty()
             if (targets.isNotEmpty()) {
-                Log.i(TAG, "网段扫描 $prefix.1-254（${targets.size} 个地址，跳过本机 ${own.joinToString()}）")
+                Log.i(TAG, "网段扫描 ${prefixes.joinToString(" + ")}.1-254（${targets.size} 个地址，跳过本机 ${own.joinToString()}）")
                 sweepSubnet(targets)
             }
 
@@ -143,7 +196,7 @@ class Discovery(
                 }
             }
         } finally {
-            scanCollector = null
+            scanCollectors.remove(seen)
         }
         return synchronized(seen) { seen.toSet() }
     }
@@ -195,35 +248,55 @@ class Discovery(
         return out
     }
 
+    /**
+     * 收包循环（S30）：单次嗅探异常不再让发现能力永久停摆。
+     * 老写法把整段 while 包在一个 try/catch 里，任何一次 IOException（网卡切换 / 内存压力 /
+     * 绑端口瞬时冲突）就直接结束线程，之后再也发现不了新设备。
+     * 现在：内层 receive 出错 → 关掉旧 socket、退避 2s→30s 重建重来；[running]=false 才真退出。
+     */
     private fun recvLoop() {
-        try {
-            val s = DatagramSocket(null).apply {
-                reuseAddress = true
-                bind(InetSocketAddress(udpPort))
-            }
-            recvSocket = s
-            val buf = ByteArray(2048)
-            while (running) {
-                val pkt = DatagramPacket(buf, buf.size)
-                s.receive(pkt)
-                val text = String(pkt.data, 0, pkt.length, Charsets.UTF_8)
-                val j = runCatching { JSONObject(text) }.getOrNull() ?: continue
-                if (j.optString("app") != Protocol.APP_TAG) continue
-                val id = j.optString("id")
-                if (id.isEmpty() || id == deviceId) continue
-                val ip = pkt.address?.hostAddress ?: continue
-                if (ip.startsWith("127.")) continue
-                // 正在主动扫描时，把这个"回应"记进本轮结果
-                scanCollector?.add(ip)
-                onPeer(ip, j.optString("name", ip), id, j.optInt("port", Protocol.DEFAULT_TCP_PORT))
-                // 对方在扫描(带q)→回一次自己的 beacon(回应帧不带 q 不反弹;按 IP 2s 限频不刷屏)
-                if (j.optInt("q", 0) == 1 && shouldReply(ip)) {
-                    Log.i(TAG, "回应 $ip 的扫描询问")
-                    sendBeaconOnce(false)
+        var backoff = 0L
+        while (running) {
+            var sock: DatagramSocket? = null
+            try {
+                val s = DatagramSocket(null)
+                sock = s
+                s.reuseAddress = true
+                s.bind(InetSocketAddress(udpPort))
+                recvSocket = s
+                backoff = 0L
+                val buf = ByteArray(2048)
+                while (running) {
+                    val pkt = DatagramPacket(buf, buf.size)
+                    s.receive(pkt)
+                    val text = String(pkt.data, 0, pkt.length, Charsets.UTF_8)
+                    val j = runCatching { JSONObject(text) }.getOrNull() ?: continue
+                    if (j.optString("app") != Protocol.APP_TAG) continue
+                    val id = j.optString("id")
+                    if (id.isEmpty() || id == deviceId) continue
+                    val ip = pkt.address?.hostAddress ?: continue
+                    if (ip.startsWith("127.")) continue
+                    // 正在主动扫描时，把这个"回应"记进各轮扫描结果
+                    for (c in scanCollectors) c.add(ip)
+                    onPeer(ip, j.optString("name", ip), id, j.optInt("port", Protocol.DEFAULT_TCP_PORT))
+                    // 对方在扫描(带q)→回一次自己的 beacon。**单播回给询问方**：
+                    // 广播回应在 AP 隔离/无线广播抑制下常常到不了对方 → PC 端表现就是「扫不到手机」。
+                    // 回应帧不带 q 不反弹;按 IP 2s 限频不刷屏
+                    if (j.optInt("q", 0) == 1 && shouldReply(ip)) {
+                        Log.i(TAG, "回应 $ip 的扫描询问（单播）")
+                        pkt.address?.let { sendBeaconTo(it) }
+                    }
                 }
+            } catch (t: Throwable) {
+                if (!running) break
+                Log.w(TAG, "广播监听异常: ${t.message}，${backoff / 1000}s 后重建 socket")
+            } finally {
+                runCatching { sock?.close() }
+                recvSocket = null
             }
-        } catch (t: Throwable) {
-            if (running) Log.w(TAG, "广播监听退出: ${t.message}")
+            if (!running) break
+            runCatching { Thread.sleep(backoff) }
+            backoff = if (backoff <= 0L) 2_000L else minOf(backoff * 2, 30_000L)
         }
     }
 
@@ -257,6 +330,12 @@ class Discovery(
 
         /** 扫描窗口内补发广播询问的间隔 */
         private const val RESEND_TICK_MS = 800L
+
+        /** 周期广播间隔：启动广播之后每 20s 补一次（兜住「谁先开机 / 广播被 AP 丢掉」的漏设备） */
+        private const val ANNOUNCE_INTERVAL_MS = 20_000L
+
+        /** 一轮扫描最多扫几个网段 /24（多网卡/热点时避免把 254×N 个包全打出去） */
+        private const val MAX_SWEEP_PREFIXES = 3
 
         /** 限频表清扫阈值：超过 1h 的条目直接删（见 [sweepStaleReplies]） */
         private const val REPLY_TTL_MS = 3_600_000L

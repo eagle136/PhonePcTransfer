@@ -43,10 +43,13 @@ internal fun AppCore.onAppResumed() {
         appVisible = true
         refreshLan()
         link.flushPending()
-        // 回前台自愈：选定设备无健康会话（被冻结/息屏掐断）→ 重扫一轮，扫描末尾自动连回上次设备
+        // 回前台：清掉后台保活被闸门挡下时留下的「后台不允许连接…」旧文案
+        // （否则用户点设备时看到的仍是上一轮后台重连的拒绝提示，误以为点不出去）
+        runCatching { link.clearGateNote() }
+        // 回前台自愈：选定设备无健康会话（被冻结/息屏掐断）→ 先直连它（预算 1s），失败再重扫一轮
         if (running && selectedPeerIp != null && !link.isConnected()) {
-            appendLog("回前台自愈：$selectedPeerIp 无健康会话，重新扫描并尝试连接")
-            startScan()
+            appendLog("回前台自愈：$selectedPeerIp 无健康会话，先直连再按需扫描")
+            bootConnectThenScan()
         }
         val now = android.os.SystemClock.elapsedRealtime()
         if (now - lastForegroundAt < 2000L) return
@@ -158,6 +161,11 @@ internal fun AppCore.startCallWithConsent(ip: String, video: Boolean, levelIdx: 
                     DataConsent.REMOTE_REFUSED -> {
                         addCallRecord(ip, video, 0L, "对方拒绝了使用数据流量", true)
                         toast(DataConsentText.peerRefusedText(kind))
+                    }
+                    // P2-1：90s 无应答 ≠ 拒绝，通话记录里必须写清「未确认」
+                    DataConsent.REMOTE_TIMEOUT -> {
+                        addCallRecord(ip, video, 0L, "对方未确认（90 秒无响应）", true)
+                        toast(DataConsentText.peerTimeoutText(kind))
                     }
                     DataConsent.NO_SESSION -> toast("设备未连接，无法发起$label")
                 }

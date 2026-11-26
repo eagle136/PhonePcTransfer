@@ -19,6 +19,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- A12 等部分 ROM 只有持有 MulticastLock 才把 WiFi 广播/组播包交给应用；
+         这是安装期普通权限，不需要运行时弹窗。 -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
     <!-- ===== 本地网络（Android 16/API 36+ 的硬前提）=====
          未声明且未经用户允许的 App，它发出的**局域网包会被系统按 uid 直接丢弃**：
@@ -36,6 +39,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 电池优化白名单：Doze（深度休眠）期间只有白名单应用还能用网络 + 不被掐定时器。
+         不申请时实测息屏几分钟链路就被系统掐断（电脑端显示「连接失败」）。
+         只在引导页跳系统设置申请，不在后台偷偷申请。 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- 锁屏来电弹界面的主路径：AOSP 的「显示悬浮窗」管理列表只列
          清单里声明了此权限的应用——不声明则列表里没有本应用、也没法单独跳转授权页 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
@@ -137,17 +144,30 @@
         <!-- foregroundServiceType 必须是 runtime 请求类型的**超集**：
              多声明一个 camera 不会报错（未使用即忽略），但 runtime 多要一个 manifest
              没声明的类型 → startForeground 抛异常 → 进程崩（本项目已有此坑）。
-             camera 类型用于视频通话期间前台保活（Android 9+ 后台相机限制的豁免）。 -->
+             camera 类型用于视频通话期间前台保活（Android 9+ 后台相机限制的豁免）；
+             microphone（P2-8）用于**通话中**后台收音：只在 RECORD_AUDIO 已授予且处于
+             TALKING 时才随 runtime 类型申报，非通话期绝不申报（避免后台偷录音的系统判定）。 -->
         <service
             android:name=".TransferService"
             android:exported="false"
-            android:foregroundServiceType="dataSync|mediaPlayback|camera" />
+            android:foregroundServiceType="dataSync|mediaPlayback|camera|microphone" />
 
         <!-- ===== 锁屏来电：通知上的「接听 / 挂断」按钮 =====
              广播型入口，**锁屏上点一下即生效、不需要先解锁**（点 Activity 型会先弹解锁框）；
              全屏意图被 ROM 拦掉时靠这条路兜底。非导出，只由本应用自己的通知按钮触发。 -->
         <receiver
             android:name=".CallActionReceiver"
+            android:exported="false" />
+
+        <!-- Doze 兜底拨号：断链后由 WAKEUP 型闹钟唤醒一次拨号（不持 wake lock）。
+             只在本应用自己 set 的闹钟上触发，不导出。见 net/KeepAliveAlarm.kt -->
+        <receiver
+            android:name=".net.KeepAliveAlarmReceiver"
+            android:exported="false" />
+
+        <!-- 熄屏后台心跳：Doze 兜底闹钟落点（只由本应用自己 set 的闹钟触发）。见 net/IdleHeartbeat.kt -->
+        <receiver
+            android:name=".net.IdleHeartbeatReceiver"
             android:exported="false" />
 
         <!-- ===== 文件「打开方式」的点选回调 =====

@@ -29,7 +29,10 @@ import com.phonepctransfer.net.DataConsent
 import com.phonepctransfer.net.DataConsentText
 import com.phonepctransfer.net.Discovery
 import com.phonepctransfer.net.Link
+import com.phonepctransfer.net.PairUi
 import com.phonepctransfer.net.TransferKeywords
+import com.phonepctransfer.net.fastConnect
+import com.phonepctransfer.util.BusyLock
 import com.phonepctransfer.util.Clip
 import com.phonepctransfer.util.FileIO
 import com.phonepctransfer.util.LanGate
@@ -50,6 +53,8 @@ object AppCore {
 
     /** 主动扫描收集窗口 */
     internal const val SCAN_WINDOW_MS = 3000L
+    /** 扫描后逐台主动连接的单台预算（每台只试一次：握手成功即放行，超时视为不可达/非本应用） */
+    internal const val SCAN_DIAL_BUDGET_MS = 1500L
 
     /** 分享内容转存目录 */
     internal const val INBOX_DIR = "share_inbox"
@@ -119,6 +124,9 @@ object AppCore {
 
     var linkState by mutableStateOf(Link.State.STOPPED)
         internal set
+    /** P4-5：需要显示配对覆盖层时非空（显示 6 位码 / 数字键盘输入） */
+    var pairUi by mutableStateOf<PairUi?>(null)
+        internal set
     var peerLabel by mutableStateOf("")
         internal set
     var lanInfo by mutableStateOf(LanGate.Info(false, "NONE", "未初始化"))
@@ -136,6 +144,18 @@ object AppCore {
         internal set
     var pendingCount by mutableStateOf(0)
         internal set
+
+    /**
+     * 「真的还在等」的待发条数 = 待发台账条数 − 正在传的文件条数。
+     *
+     * 待发台账是防强杀用的：doSendFile 开传**之前**就把自己写进去了，所以待发条数在正常传输时
+     * 也是 >0。界面若直接拿 pendingCount 提示「待发送 N 条，连接后自动补发」，就会把「正在发」
+     * 误报成「未连接」（用户口径里的"取消后还是显示未连接"就是这个）。
+     */
+    val waitingCount: Int
+        get() = (pendingCount - messages.count {
+            it.kind == Kind.FILE && it.status == Status.SENDING
+        }).coerceAtLeast(0)
     var lastLog by mutableStateOf("")
         internal set
     var inputText by mutableStateOf("")
@@ -153,6 +173,10 @@ object AppCore {
     /** 当前通话状态（供界面显示「正在通话」条与弹窗） */
     var callState by mutableStateOf(CallManager.State.IDLE)
         internal set
+
+    /** P2-8：前台服务类型重申报入口（TransferService 创建时注入，销毁时清空）；通话起止各调一次 */
+    @Volatile
+    internal var fgsTypeRefresher: (() -> Unit)? = null
 
     /** 当前通话对端 IP（空 = 无通话） */
     var callPeerIp by mutableStateOf("")
@@ -270,6 +294,7 @@ object AppCore {
         synchronized(this) {
             if (initialized) return
             app = ctx.applicationContext
+            BusyLock.init(app)
             prefs = Prefs(app)
             clipSyncOn = prefs.clipSyncMode
             // 旧全局旋转角一次性播种给上次选中设备
@@ -319,6 +344,17 @@ object AppCore {
             // 待发队列变化时重算横幅/通知（主线程）
             store.onPendingChanged = { ui { pendingCount = store.loadPending().size } }
             trusted = TrustedPeers(app)
+            // 启动补种：本机已配对过的设备 = 用户已授权 → 直接进「已知设备」名单。
+            // 否则老版本升级上来、或「配对完还没发消息」的设备，后台重连会被自己的白名单挡掉
+            runCatching {
+                val pairedIds = prefs.pairedDeviceIds()
+                for (id in pairedIds) {
+                    trusted.markPaired(id, prefs.pairedNameOf(id), id)
+                }
+                if (pairedIds.isNotEmpty()) {
+                    appendLog("已知设备：补入 ${pairedIds.size} 台已配对设备，当前后台可连接 ${trusted.count()} 台")
+                }
+            }
             clip = Clip(app)
             gate = LanGate(app)
             link = Link(app, prefs)
@@ -336,18 +372,20 @@ object AppCore {
             call = CallManager(link, app)
             call.maxVideoLevelIdx = prefs.videoMaxLevel
             // 出向闸门：后台只放行已知设备
+            // 判定键用**设备组键（deviceId）**而不是裸 IP：同设备换地址 / DHCP 变了照样认得，
+            // 不然配对成功后 IP 一变就被当成陌生设备踢掉
             link.outgoingGate = { ip ->
                 if (appVisible) {
                     false
-                } else if (trusted.isTrusted(ip)) {
-                    appendLog("后台放行连接：$ip 是已知设备（${trusted.describe(ip)}）")
+                } else if (trusted.isTrusted(trustKeyOf(ip))) {
+                    appendLog("后台放行连接：$ip 是已知设备（${trusted.describe(trustKeyOf(ip))}）")
                     false
                 } else {
                     true
                 }
             }
-            // 入向闸门：后台不接受陌生设备
-            link.incomingGate = { ip -> !appVisible && !trusted.isTrusted(ip) }
+            // 入向闸门：后台不接受陌生设备（同口径：配对过或有往来才放行）
+            link.incomingGate = { ip -> !appVisible && !trusted.isTrusted(trustKeyOf(ip)) }
             // 传输/通话中保活不转纯被动
             link.keepAliveBusy = { call.isBusy() || link.hasAnyActiveTransfer() }
             // 数据流量确认：按本机是否运营商数据网
@@ -372,6 +410,8 @@ object AppCore {
                     speedsAt[mid] = System.currentTimeMillis()
                 }
             }
+            // 发送前校验失败等必须让用户看见的提示（toast 内部已切主线程）
+            link.notice = { msg -> toast(msg) }
             link.listener = object : Link.Listener {
                 override fun onState(state: Link.State, peer: String) {
                     ui {
@@ -413,7 +453,38 @@ object AppCore {
                     if (cp.isNotEmpty() && !link.isConnectedIp(cp)) call.onPeerDisconnected(cp)
                 }
 
+                /** P4-5：配对覆盖层（显示 8 位码 / 数字键盘输入）；null = 关掉 */
+                override fun onPairState(uiState: PairUi?) = ui {
+                    pairUi = uiState
+                }
                 override fun onMessageAdded(m: MsgItem) = ui { addMessage(m) }
+                /**
+                 * hsync 成批补齐：链路侧**已经在帧线程上整批落盘**，这里只做界面合并。
+                 * 以前是逐条回调 addMessage，在主线程上每条都写一次历史文件、还和帧线程抢 Store 锁，
+                 * 配对成功后一次补几百条 ⇒ 界面几秒~几十秒无响应（用户看到的「输入配对码后卡死」）。
+                 */
+                override fun onMessagesAdded(list: List<MsgItem>) = ui {
+                    if (list.isEmpty()) return@ui
+                    // mid → 下标一次建好：逐条 indexOfFirst 在几百条一起补入时是 O(n²)，主线程会明显迟钝
+                    val idxByMid = HashMap<String, Int>(messages.size)
+                    messages.forEachIndexed { i, x -> if (x.mid.isNotEmpty()) idxByMid[x.mid] = i }
+                    for (m in list) {
+                        if (m.mid.isNotEmpty() && m.peerIp.isNotEmpty()) midPeer[m.mid] = m.peerIp
+                        maybeHintBigTransfer(m)
+                        // 本机明确删过的 mid 不许被补回来（墓碑已在链路侧过滤，这里再兜一道）
+                        if (removedMids.containsKey(m.mid)) continue
+                        if (!belongsToCurrent(m)) continue
+                        val idx = idxByMid[m.mid] ?: -1
+                        if (idx >= 0 && idx < messages.size) {
+                            messages[idx] = merge(messages[idx], m)
+                        } else {
+                            messages.add(m)
+                            if (m.mid.isNotEmpty()) idxByMid[m.mid] = messages.size - 1
+                        }
+                    }
+                    while (messages.size > MAX_UI_MSGS) messages.removeAt(0)
+                    pendingCount = store.loadPending().size
+                }
                 override fun onMessageUpdated(m: MsgItem) = ui { updateMessage(m) }
                 override fun onMessageRemoved(mid: String) = ui { removeMessage(mid) }
 
@@ -511,6 +582,8 @@ object AppCore {
             // 通话状态机装配：把状态变化/呼入/结束映射到 UI 状态
             call.setListener(object : CallManager.Listener {
                 override fun onStateChanged(state: CallManager.State, peerIp: String, peerName: String) {
+                    // P2-8：通话状态一变就重申报 FGS 类型（TALKING 起加 microphone、结束时去掉）
+                    runCatching { fgsTypeRefresher?.invoke() }
                     ui {
                         callState = state
                         callPeerIp = peerIp
@@ -621,6 +694,7 @@ object AppCore {
         running = true
         link.start()
         val d = Discovery(
+            context = app,
             deviceId = prefs.deviceId,
             deviceName = prefs.deviceName,
             tcpPort = prefs.tcpPort,
@@ -634,8 +708,8 @@ object AppCore {
         d.start()
         discovery = d
         appendLog("传输已启动（${lanInfo.kind}）")
-        // 启动即主动扫一轮：有局域网（WiFi/热点/以太网）+ 本机在私网段才真的发（见 startScan 的闸门）
-        startScan()
+        // 启动顺序（用户指定）：先直连「已有设备」（预算 1s），连上就不再扫；连不上才扫局域网（见 bootConnectThenScan）
+        bootConnectThenScan()
     }
 
     fun stopRun() {
@@ -655,6 +729,113 @@ object AppCore {
             if (initialized) refreshLan()
             main.postDelayed(this, LAN_TICK_MS)
         }
+    }
+
+    // ==================== 启动直连（先连已有设备，再扫局域网） ====================
+
+    /** 启动直连预算：1s 内 TCP+握手都没成，就当「已有设备」暂时不可达，转局域网扫描（用户指定 1s） */
+    internal const val BOOT_CONNECT_TIMEOUT_MS = 1000L
+
+    /** 启动直连流程是否在跑（@Volatile：startRun 可能在 pp-load 线程、回前台在 main，两处都可能触发） */
+    @Volatile
+    private var bootFlowRunning = false
+
+    /**
+     * 启动链路顺序（用户要求）：**先直连「已有设备」**（上次选中的那台，预算 [BOOT_CONNECT_TIMEOUT_MS]）——
+     * 1s 内握手成功就直接恢复会话、不扫局域网；超时/失败才走原来的「主动扫一轮 + 扫描末尾自动连接」。
+     * 只试一次、不重试：设备换了 IP 的兜底仍由扫描后的 [autoConnectLast] 负责。
+     * 冷启动与回前台自愈都走这里（两处可能并发触发，bootFlowRunning 挡住第二次）。
+     */
+    internal fun bootConnectThenScan() {
+        if (bootFlowRunning || scanning) return
+        val target = bootConnectTarget()
+        if (target.isEmpty()) {
+            appendLog("启动直连：没有「已有设备」记录，直接扫局域网")
+            startScan()
+            return
+        }
+        // 链路没起来 / 没有可用局域网（数据网络、非私网段）：拨号注定失败，交给 startScan 走它自己的跳过分支并给出原因
+        if (!running || !lanInfo.available || Discovery.subnetPrefixOf(localIp) == null) {
+            startScan()
+            return
+        }
+        if (link.isDeviceConnected(target)) {
+            // 服务重入等场景：已经连着就直接用，不重复拨号也不扫（反正扫出来也连不了第二遍）
+            appendLog("启动直连：${peerLabelOf(target)}（$target）已是健康会话，跳过局域网扫描")
+            ui {
+                scanMessage = ""
+                syncSelectionTo(target)
+            }
+            return
+        }
+        // 复用 scanning 挡住扫描重入（扫描文案区同时显示「正在连接…」）；全部在主线程改，避免与 startScan 抢标志位
+        bootFlowRunning = true
+        ui {
+            scanning = true
+            scanMessage = "正在连接 ${peerLabelOf(target)}…"
+        }
+        appendLog(
+            "启动直连 ${peerLabelOf(target)}（$target），超时 ${BOOT_CONNECT_TIMEOUT_MS}ms，" +
+                "失败再扫局域网"
+        )
+        Thread({
+            val ok = runCatching { link.fastConnect(target, BOOT_CONNECT_TIMEOUT_MS) }.getOrDefault(false)
+            bootFlowRunning = false
+            if (ok) {
+                appendLog("启动直连成功：${peerLabelOf(target)}（$target），跳过局域网扫描")
+                ui {
+                    scanning = false
+                    scanMessage = ""
+                    syncSelectionTo(target)
+                }
+            } else {
+                appendLog("启动直连 ${target} 未在 ${BOOT_CONNECT_TIMEOUT_MS}ms 内完成，转局域网扫描")
+                // scanning 先复位再扫描，两步都在主线程顺序执行，startScan 不会误判「已在扫描」
+                ui {
+                    scanning = false
+                    scanMessage = ""
+                    startScan()
+                }
+            }
+        }, "pp-boot-connect").apply { isDaemon = true }.start()
+    }
+
+    /**
+     * 启动直连的「已有设备」：优先上次选中的那台（[Prefs.lastSelectedIp]）；
+     * 没有记录时列表里只有一台就用它，多台则不猜（交给扫描按 online 结果挑）。
+     *
+     * 设备身份是 deviceId+token，地址只是它当下的接入点：重启/换 WiFi 后 DHCP 换了 IP，
+     * 记忆里的旧地址就是废的（拨它只会白等 1s）。同一台设备组里最近出现过哪个局域网地址就用哪个。
+     */
+    private fun bootConnectTarget(): String {
+        val remembered = prefs.lastSelectedIp.trim()
+        if (remembered.isNotEmpty()) {
+            // 只在「记忆本身是局域网地址」时跟随迁移：手动添加的公网 IP 是用户明确配置的接入点，不抢
+            if (!prefs.isLanIpv4(remembered)) return remembered
+            val key = prefs.convKeyOf(remembered)
+            val fresh = prefs.freshestLanIpOf(key)
+            if (fresh.isNotEmpty() && fresh != remembered) {
+                prefs.lastSelectedIp = fresh
+                prefs.setGroupCurIp(key, fresh)
+                appendLog("启动直连：${peerLabelOf(key)} 换了局域网地址 $remembered → $fresh（同一设备，身份不变）")
+                return fresh
+            }
+            return remembered
+        }
+        val list = prefs.peers
+        return if (list.size == 1) list.first().ip else ""
+    }
+
+    /** 直连成功后把界面/记忆对齐到这台设备（聊天记录按设备组键载入）；必须在主线程调用 */
+    private fun syncSelectionTo(ip: String) {
+        if (selectedPeerIp != ip) {
+            selectedPeerIp = ip
+            reloadConversation(ip)
+        }
+        // 用户/启动直连选定了这台 → 启动恢复保护到此结束
+        restoredPeerIp = ""
+        prefs.lastSelectedIp = ip
+        prefs.setGroupCurIp(prefs.convKeyOf(ip), ip)
     }
 
     // ==================== 局域网扫描（启动即扫） ====================
@@ -697,23 +878,81 @@ object AppCore {
             } else {
                 appendLog("扫描结束：发现 ${found.size} 台设备（${found.joinToString(", ")}）")
             }
-            // 扫描结束后自动尝试连接「上次选中的设备」——冷启动无需手动点设备即可恢复会话
-            autoConnectLast(found)
+            // 扫描结束后：先把「上次选中的设备」接上（冷启动无需手动点设备即可恢复会话），
+            // 再把扫到的其余地址挨个主动拨一次（每台只试一次、串行，互不顶掉）
+            val primary = autoConnectLast(found)
+            dialScannedOnce(found, primary)
         }, "pp-scan").apply { isDaemon = true }.start()
     }
 
-    /** 启动扫描结束后自动连接一台设备（只试一次）：优先上次选中的，其次列表唯一的一台，否则不猜 */
-    internal fun autoConnectLast(found: Set<String>) {
+    /**
+     * 扫描到的每个地址都主动拨一次（串行、每台只试一次，不弹配对码）。
+     *
+     * 为什么不用 selectAndConnect 逐个调：[LinkConn] 的 pendingConnectIps 只有一个槽，
+     * 后一次会把前一次的候选顶掉，实际效果是"只有最后一台被拨"。
+     * [fastConnect] 是阻塞式单次尝试（共享预算、不占队列、不查后台闸门），正好当"拨一次"的原语。
+     *
+     * 结果口径：
+     * - 之前配对过的：hello 带 token → 对端核对通过 → 直接放行，并把它的历史地址换成这次这条
+     *   （替换动作在 [Link.onSessionReady] 里，验证通过之后才做）。
+     * - 没连接过的：握手成功但停在「未配对」进列表，等用户点它才出示配对码。
+     * - 不是本应用的地址（扫描 UDP 应答来源可能是别的程序）：握手失败，直接丢弃会话，不进列表。
+     */
+    private fun dialScannedOnce(found: Set<String>, primary: String) {
+        val candidates = found.filter { it.isNotBlank() }
+        if (candidates.isEmpty()) return
+        Thread({
+            val own = localIps.toSet()
+            var tried = 0
+            var okCount = 0
+            for (addr in candidates.sorted()) {
+                if (!running) return@Thread
+                val ip = addr.trim()
+                if (ip.isEmpty() || ip in own || ip == primary) continue
+                if (link.isConnectedIp(ip)) continue
+                // 同一台设备已经在别的地址上连通了（换过 IP 的常见情形）：不必再拨，也不去扰它
+                val key = runCatching { prefs.convKeyOf(ip) }.getOrDefault(ip)
+                if (key.isNotEmpty() && key != ip && link.isPeerConnected(key)) {
+                    appendLog("扫描后逐台连接：$ip 所属设备已有会话，跳过")
+                    continue
+                }
+                tried++
+                val ok = runCatching { link.fastConnect(ip, SCAN_DIAL_BUDGET_MS) }.getOrDefault(false)
+                if (ok) {
+                    okCount++
+                    appendLog("扫描后逐台连接：$ip 握手成功")
+                } else {
+                    appendLog("扫描后逐台连接：$ip 未响应（不是本应用/不可达），跳过")
+                }
+            }
+            if (tried > 0) appendLog("扫描后逐台连接结束：共试 $tried 台，握手成功 $okCount 台")
+        }, "pp-scan-dial").apply { isDaemon = true }.start()
+    }
+
+    /** 启动扫描结束后自动连接一台设备（只试一次）：优先上次选中的，其次列表唯一的一台，否则不猜。
+     *  返回选中并已拨号的目标地址（没有明确目标时为空串），供 [dialScannedOnce] 跳过重复拨号 */
+    internal fun autoConnectLast(found: Set<String>): String {
         if (link.isConnected()) {
             appendLog("启动自动连接：已有会话，跳过")
-            return
+            return ""
         }
         val remembered = prefs.lastSelectedIp
         val list = prefs.peers
         val online = found.filter { it.isNotEmpty() }
+        // 设备身份按 deviceId 认：扫描到的地址即使和记忆里那条不同，只要落在同一设备组，就直接切过去连
+        val rememberedKey = if (remembered.isNotEmpty()) prefs.convKeyOf(remembered) else ""
+        val sameDevOnline = if (remembered.isNotEmpty() && prefs.isLanIpv4(remembered)
+            && rememberedKey.isNotEmpty() && rememberedKey != remembered
+        ) {
+            online.firstOrNull { prefs.convKeyOf(it) == rememberedKey }
+        } else null
         val ip = when {
             remembered.isNotEmpty() && remembered in online -> remembered
+            sameDevOnline != null -> sameDevOnline
             remembered.isNotEmpty() && list.any { it.ip == remembered } -> remembered
+            prefs.isLanIpv4(remembered) && rememberedKey.isNotEmpty() &&
+                prefs.freshestLanIpOf(rememberedKey).isNotEmpty() ->
+                prefs.freshestLanIpOf(rememberedKey)
             online.size == 1 -> online.first()
             list.size == 1 -> list.first().ip
             else -> ""
@@ -723,18 +962,19 @@ object AppCore {
                 "启动自动连接：无明确目标，跳过" +
                     "（记录=${remembered.ifEmpty { "无" }}，扫描到 ${online.size} 台，列表 ${list.size} 台）"
             )
-            return
+            return ""
         }
         if (link.isConnectedIp(ip)) {
             appendLog("$ip 已有会话，无需自动连接")
-            return
+            return ip
         }
         ui { selectedPeerIp = ip }
         reloadConversation(ip)
         // 记住它：下次启动优先按「上次设备」走，不再依赖「列表里只有一台」这种巧合
         prefs.lastSelectedIp = ip
-        link.selectAndConnect(ip, peerLabelOf(ip))
+        link.selectAndConnect(ip, peerLabelOf(ip), fromUser = false)
         appendLog("启动自动连接 $ip（本轮扫描到 ${online.size} 台）")
+        return ip
     }
 
     // ==================== 设备列表（左侧栏） ====================
@@ -742,6 +982,18 @@ object AppCore {
     internal fun reloadPeers() {
         peers.clear()
         peers.addAll(prefs.peers)
+        // 设备换地址（旧地址被删/链路已切到同设备的新地址）：当前对话跟上，
+        // 否则聊天、待发队列会挂在一条已经不存在的地址上（组键不变，内容不用重载）
+        val sel = selectedPeerIp
+        // init() 里首刷设备列表时 link 还没 new（见 init 中 reloadPeers 早于 link = Link(...)），
+        // 直接读 link.selectedIp 会抛「lateinit property link has not been initialized」= 启动必崩
+        val linkSel = if (::link.isInitialized) link.selectedIp.trim() else ""
+        if (!sel.isNullOrBlank() && linkSel.isNotEmpty() && sel != linkSel
+            && peers.any { it.ip == linkSel } && !link.isDeviceConnected(sel)
+        ) {
+            selectedPeerIp = linkSel
+            restoredPeerIp = ""
+        }
         refreshGroups()
         reopenConversationIfKeyChanged()
     }
@@ -799,6 +1051,8 @@ object AppCore {
         restoredPeerIp = ""
         prefs.lastSelectedIp = v
         link.selectAndConnect(v, peerLabelOf(v))
+        // 用户主动切到该设备的某个地址：未配对同样出示配对码
+        runCatching { link.requestPair(v) }
         reloadConversation(v)
         refreshGroups()
         appendLog("切换设备地址：${peerLabelOf(v)} → $v")
@@ -818,6 +1072,27 @@ object AppCore {
                 reloadPeers()
                 // 被动接收唤醒:不在扫描窗口内也要刷新状态文案,否则会停在"无新设备"与列表自相矛盾
                 if (!scanning) scanMessage = "发现设备 ${name.ifEmpty { ip }}，已加入列表"
+            }
+        }
+        // 同一台设备换了局域网地址（重启 / 换 WiFi 后 DHCP 换 IP）：身份（deviceId+token）不变，
+        // 直接把「当前地址」切到新地址，下次连接就拨它，不会拿着旧地址白等、也更不会因此重新配对。
+        // 只切记忆/组当前地址，不在发现回调里主动拨号（拨号仍由启动直连 / 扫描末尾的自动连接负责）
+        val remembered = prefs.lastSelectedIp.trim()
+        if (remembered.isNotEmpty() && remembered != ip && prefs.isLanIpv4(ip)
+            && prefs.isLanIpv4(remembered) && !link.isDeviceConnected(remembered)
+        ) {
+            val key = prefs.convKeyOf(remembered)
+            if (key.isNotEmpty() && key != remembered && prefs.convKeyOf(ip) == key) {
+                prefs.setGroupCurIp(key, ip)
+                prefs.lastSelectedIp = ip
+                appendLog("设备换地址：${peerLabelOf(key)} $remembered → $ip（同一设备，身份不变）")
+                ui {
+                    if (selectedPeerIp == remembered) {
+                        selectedPeerIp = ip
+                        reloadConversation(ip)
+                    }
+                    refreshGroups()
+                }
             }
         }
         return changed
@@ -884,10 +1159,25 @@ object AppCore {
         appendLog("已不再显示这台设备记录（$k）")
     }
 
+    /** 是否本机地址（本机局域网地址 / 全部本机地址 / 环回）：这类地址不能当作"对方设备" */
+    internal fun isSelfAddress(ip: String): Boolean {
+        val v = ip.trim()
+        if (v.isEmpty()) return false
+        if (v == "localhost" || v == "::1" || v == "0.0.0.0") return true
+        if (v.startsWith("127.")) return true
+        if (v == localIp) return true
+        return localIps.any { it.trim() == v }
+    }
+
     /** 按地址连接（设备组切换地址时复用同一入口） */
     internal fun connectTo(ip: String, label: String?) {
         val v = ip.trim()
         if (v.isEmpty()) return
+        // 自连闸门：本机地址/环回地址不是"对方设备"，拨过去只会连到自己（握手也会被 toLink 侧拒掉）
+        if (isSelfAddress(v)) {
+            appendLog("忽略：$v 是本机地址/环回地址，不能作为连接目标")
+            return
+        }
         selectedPeerIp = v
         // 用户主动点设备 → 启动恢复的保护到此结束
         restoredPeerIp = ""
@@ -896,10 +1186,34 @@ object AppCore {
         // 记住「这台设备当前用的地址」，顶栏地址菜单据此回显
         prefs.setGroupCurIp(prefs.convKeyOf(v), v)
         link.selectAndConnect(v, label ?: peerLabelOf(v))
+        // 用户主动点设备 → 若这台还没配对就出示配对码（双端都不再随连接自动弹）
+        runCatching { link.requestPair(v) }
         reloadConversation(v)
         refreshGroups()
         appendLog("当前对话设备：${label ?: peerLabelOf(v)}（$v）")
     }
+
+    // ==================== P4-5 配对覆盖层动作 ====================
+
+    /** 发起方在覆盖层数字键盘上输完 6 位码后提交 */
+    fun submitPairCode(code: String) {
+        val uiNow = pairUi ?: return
+        if (uiNow.done || uiNow.showCode) return
+        link.submitPairCode(uiNow.ip, code)
+    }
+
+    /** 覆盖层「取消」：只关弹窗、保留连接；下次点设备再重新出示配对码 */
+    fun cancelPairing() {
+        val uiNow = pairUi ?: return
+        if (uiNow.done) {
+            pairUi = null
+            return
+        }
+        link.cancelPairing(uiNow.ip)
+        // 兜底：链路侧找不到会话时也必须把覆盖层关掉（旧实现会在这里卡住）
+        pairUi = null
+    }
+
 
     /** 载入某台设备的聊天记录到聊天区：历史/待发均按设备组键（deviceId）过滤，同设备多地址共用同一份记录 */
     internal fun reloadConversation(peerIp: String?) {
@@ -939,6 +1253,11 @@ object AppCore {
     fun savePeer(oldIp: String?, ip: String, remark: String) {
         val v = ip.trim()
         if (v.isEmpty()) return
+        // 「添加设备」填的是本机地址/环回：存下来会绑出"自己连自己"的组，之后每次启动都自连且删不掉
+        if (oldIp.isNullOrEmpty() && isSelfAddress(v)) {
+            appendLog("忽略：$v 是本机地址/环回地址，不能作为设备地址添加")
+            return
+        }
         if (oldIp.isNullOrEmpty()) {
             prefs.upsertPeer(v, remark = remark)
         } else {
@@ -982,33 +1301,63 @@ object AppCore {
         appendLog("已移除地址 $v")
     }
 
-    /** 删除整台设备（组内所有地址 + 该设备的备注记忆） */
+    /**
+     * 删除设备前的会话清理：必须在解绑前执行，才能按 deviceId 找到同组会话和历史文件。
+     * 在线时先发 msg_del 让对端同步删文本/图片；否则只删设备行，重连后 hsync 会把旧消息补回来。
+     * 已落盘的实际文件不动。
+     */
+    private fun purgeConversationForDeviceDelete(ip: String): Int {
+        val part = planConversation(ip).firstOrNull()
+        val all = part?.all.orEmpty()
+        val sync = part?.sync.orEmpty()
+        val notified = if (sync.isEmpty()) 0 else link.deleteMessages(ip, sync)
+        // P2-7：删整台设备同样落墓碑，防止重新发现后 hsync 又把旧消息补回来
+        sync.forEach { store.addTomb(ip, it, sent = notified > 0) }
+        if (all.isNotEmpty()) store.removePending(all)
+        // planConversation 不枚举旧版 CLIP 历史；删整台设备时连文件一起清掉，避免留下孤儿记录。
+        store.clearHistory(ip)
+        for (mid in all) removedMids[mid] = true
+        pendingCount = store.loadPending().size
+        return notified
+    }
+
+    /** 删除整台设备（先清会话并通知在线对端，再删组内地址、绑定与备注记忆） */
     fun deleteGroup(g: PeerGroup) {
+        val clearSelection = selectedPeerIp?.let { prefs.convKeyOf(it) == g.key } == true
+        val clearRemembered = prefs.lastSelectedIp in g.ips
+        val notified = purgeConversationForDeviceDelete(g.curIp)
         g.ips.forEach { prefs.removePeer(it) }
         prefs.setGroupRemark(g.key, "")
-        if (selectedPeerIp != null && prefs.convKeyOf(selectedPeerIp!!) == g.key) {
+        if (clearSelection) {
             selectedPeerIp = null
             messages.clear()
         }
+        if (clearRemembered) prefs.lastSelectedIp = ""
         reloadPeers()
-        appendLog("已删除设备 ${g.displayName}（${g.ips.size} 个地址）")
+        appendLog("已删除设备 ${g.displayName}（${g.ips.size} 个地址，通知对端删除 $notified 条文本/图片）")
     }
 
     /** 从设备列表删除一台设备（保留旧入口：按单个地址删） */
     fun deletePeer(p: Peer) {
+        val notified = purgeConversationForDeviceDelete(p.ip)
         prefs.removePeer(p.ip)
         if (selectedPeerIp == p.ip) {
             // 只是把"当前对话"清空；已连着的会话交给 Link 自己判定（断了就是断了）
             selectedPeerIp = null
             messages.clear()
         }
+        if (prefs.lastSelectedIp == p.ip) prefs.lastSelectedIp = ""
         reloadPeers()
-        appendLog("已删除设备 ${p.displayName}（${p.ip}）")
+        appendLog("已删除设备 ${p.displayName}（${p.ip}，通知对端删除 $notified 条文本/图片）")
     }
 
     /** 某台设备当前是否在线（组内任意地址有会话即在线；设备列表逐台打点） */
     fun isGroupOnline(g: PeerGroup): Boolean =
         if (g.alt) link.isPeerConnected(g.key) else g.ips.any { it in connectedPeers }
+
+    /** 某台设备已连上但还没配对（列表里提示「未配对，点一下配对」，避免用户以为已经能传） */
+    fun isGroupUnpaired(g: PeerGroup): Boolean =
+        if (g.alt) link.isPeerUnpaired(g.key) else g.ips.any { link.isDeviceUnpaired(it) }
 
     /** 本机设备名：唯一允许出现在出网字段里的名字（私有备注绝不外发） */
     val myDeviceName: String get() = prefs.deviceName
@@ -1136,7 +1485,11 @@ object AppCore {
         val m = messages.firstOrNull { it.mid == mid } ?: return
         val syncable = syncableKind(m)
         if (syncable) {
-            link.deleteMessage(m.peerIp.ifEmpty { selectedPeerIp ?: "" }, mid)
+            val ip = m.peerIp.ifEmpty { selectedPeerIp ?: "" }
+            val online = link.canSendMsgDel(ip)
+            // P2-7：先落墓碑（sent=false 时握手会补发一次 msg_del），删了才不会被 hsync 补回来
+            store.addTomb(ip, mid, sent = online)
+            link.deleteMessage(ip, mid)
         }
         removeMessage(mid)
         appendLog(if (syncable) "已删除（对端在线时同步删除）" else "已删除记录")
@@ -1223,10 +1576,13 @@ object AppCore {
                 )
                 if (consent != DataConsent.OK) {
                     ui {
-                        if (consent == DataConsent.REMOTE_REFUSED) {
-                            toast(DataConsentText.peerRefusedText(DataConsentText.KIND_FILE))
-                        } else {
-                            toast("已取消本次发送")
+                        when (consent) {
+                            DataConsent.REMOTE_REFUSED ->
+                                toast(DataConsentText.peerRefusedText(DataConsentText.KIND_FILE))
+                            // P2-1：对端 90s 无应答不是拒绝，提示要区分
+                            DataConsent.REMOTE_TIMEOUT ->
+                                toast("对方未确认（90 秒无响应），本次批量发送已取消")
+                            else -> toast("已取消本次发送")
                         }
                     }
                     appendLog("批量发送已取消（$consent）")
@@ -1277,16 +1633,31 @@ object AppCore {
     // ==================== 数据流量确认（双向） ====================
 
     /** 本机数据流量提醒（发起方向）：非空时界面弹确认框，用户选择经 done 唤醒等待线程 */
-    class DataConsentAsk(val peerIp: String, val label: String, val done: (Boolean) -> Unit)
+    class DataConsentAsk(
+        val id: String, val peerIp: String, val label: String, val done: (Boolean) -> Unit
+    )
 
-    var dataNetConfirm by mutableStateOf<DataConsentAsk?>(null)
+    /**
+     * 发起方向的确认队列（P2-1）：原先只有一个槽位，两路并发（文件 + 通话/分享）时后者覆盖前者，
+     * 先来的线程只能等 120s 超时被取消。改成队列后按 id 精确定位、逐个处理。
+     */
+    var dataNetConfirms by mutableStateOf<List<DataConsentAsk>>(emptyList())
         internal set
+
+    /** 界面只渲染队首，处理完自动补位 */
+    val dataNetConfirm: DataConsentAsk? get() = dataNetConfirms.firstOrNull()
 
     /** 对端请求"用数据流量发给我"（接收方向）：非空时弹接收提醒框（本机非数据网络时不会到这里） */
-    class DataConsentIncoming(val peerIp: String, val mid: String, val label: String)
+    class DataConsentIncoming(val peerIp: String, val mid: String, val label: String) {
+        /** 同一台设备的同一条请求只入队一次 */
+        fun sameAs(o: DataConsentIncoming) = peerIp == o.peerIp && mid == o.mid
+    }
 
-    var dataNetIncoming by mutableStateOf<DataConsentIncoming?>(null)
+    /** 接收方向的确认队列（P2-1）：同上，多台对端同时请求时不再互相覆盖 */
+    var dataNetIncomings by mutableStateOf<List<DataConsentIncoming>>(emptyList())
         internal set
+
+    val dataNetIncoming: DataConsentIncoming? get() = dataNetIncomings.firstOrNull()
 
     /** 本机当前是否在运营商数据网络;每次使用都重新判定、绝不记忆(每次用就提醒一次) */
     fun onCellular(): Boolean =
@@ -1300,9 +1671,11 @@ object AppCore {
         }
         val latch = java.util.concurrent.CountDownLatch(1)
         val ok = java.util.concurrent.atomic.AtomicBoolean(false)
+        val id = java.util.UUID.randomUUID().toString()
         ui {
-            appendLog("本机走数据网络，发起「$label」前需确认数据流量")
-            dataNetConfirm = DataConsentAsk(peerIp, label) { r ->
+            appendLog("本机走数据网络，发起「$label」前需确认数据流量" +
+                if (dataNetConfirms.isEmpty()) "" else "（前面还有 ${dataNetConfirms.size} 条待确认）")
+            dataNetConfirms = dataNetConfirms + DataConsentAsk(id, peerIp, label) { r ->
                 ok.set(r)
                 latch.countDown()
             }
@@ -1311,36 +1684,37 @@ object AppCore {
             latch.await(DATA_CONSENT_WAIT_SEC, java.util.concurrent.TimeUnit.SECONDS)
         }.getOrDefault(false)
         if (!waited) {
-            ui { dataNetConfirm = null }
+            // 只摘掉自己这一条，不能把并发进来的别的请求一起清掉
+            ui { dataNetConfirms = dataNetConfirms.filterNot { it.id == id } }
             appendLog("数据流量提醒 $DATA_CONSENT_WAIT_SEC 秒未确认，本次操作已取消")
         }
         return ok.get()
     }
 
     /** 用户同意本机使用数据流量（本次操作继续） */
-    fun acceptDataNet() = finishDataConsent(true)
+    fun acceptDataNet(id: String) = finishDataConsent(id, true)
 
     /** 用户拒绝本机使用数据流量（本次操作取消；文件会留在聊天里带红色叹号可重试） */
-    fun cancelDataNet() = finishDataConsent(false)
+    fun cancelDataNet(id: String) = finishDataConsent(id, false)
 
-    internal fun finishDataConsent(ok: Boolean) {
-        val c = dataNetConfirm ?: return
-        dataNetConfirm = null
+    internal fun finishDataConsent(id: String, ok: Boolean) {
+        val c = dataNetConfirms.firstOrNull { it.id == id } ?: return
+        dataNetConfirms = dataNetConfirms.filterNot { it.id == id }
         c.done(ok)
     }
 
     /** 接收方向：同意对端用数据流量发过来（对方才开始发；本机此时才创建/接收消息） */
-    fun acceptIncomingData() {
-        val c = dataNetIncoming ?: return
-        dataNetIncoming = null
+    fun acceptIncomingData(peerIp: String, mid: String) {
+        val c = dataNetIncomings.firstOrNull { it.peerIp == peerIp && it.mid == mid } ?: return
+        dataNetIncomings = dataNetIncomings.filterNot { it.sameAs(c) }
         link.replyDataAsk(c.peerIp, c.mid, true)
         appendLog("已同意对端「${c.label}」使用数据流量传输")
     }
 
     /** 接收方向拒绝:本机什么都不记录(不生成气泡、不写历史)——只回一帧让对端如实提示 */
-    fun rejectIncomingData() {
-        val c = dataNetIncoming ?: return
-        dataNetIncoming = null
+    fun rejectIncomingData(peerIp: String, mid: String) {
+        val c = dataNetIncomings.firstOrNull { it.peerIp == peerIp && it.mid == mid } ?: return
+        dataNetIncomings = dataNetIncomings.filterNot { it.sameAs(c) }
         link.replyDataAsk(c.peerIp, c.mid, false)
         appendLog("已拒绝对端「${c.label}」使用数据流量（本机不记录）")
     }
@@ -1355,7 +1729,14 @@ object AppCore {
             appendLog("对端请求「$label」：本机非数据网络，已自动同意")
             return
         }
-        dataNetIncoming = DataConsentIncoming(peerIp, mid, label)
+        // P2-1：接收方向也排队（原先单槽位，多台对端同时请求会互相覆盖）
+        val c = DataConsentIncoming(peerIp, mid, label)
+        ui {
+            if (dataNetIncomings.none { it.sameAs(c) }) {
+                dataNetIncomings = dataNetIncomings + c
+                appendLog("对端请求「$label」使用数据流量，等待本机确认")
+            }
+        }
     }
 
     // ==================== 系统「分享」进来：选设备 → 开始传 ====================
@@ -1406,10 +1787,12 @@ object AppCore {
                 )
                 if (consent != DataConsent.OK) {
                     ui {
-                        if (consent == DataConsent.REMOTE_REFUSED) {
-                            toast(DataConsentText.peerRefusedText(DataConsentText.KIND_FILE))
-                        } else {
-                            toast("已取消本次分享发送")
+                        when (consent) {
+                            DataConsent.REMOTE_REFUSED ->
+                                toast(DataConsentText.peerRefusedText(DataConsentText.KIND_FILE))
+                            DataConsent.REMOTE_TIMEOUT ->
+                                toast("对方未确认（90 秒无响应），本次分享发送已取消")
+                            else -> toast("已取消本次分享发送")
                         }
                     }
                     appendLog("分享发送已取消（$consent）")
@@ -1496,11 +1879,14 @@ object AppCore {
             val parts = if (ip.isNullOrEmpty()) planAllConversations() else planConversation(ip)
             if (parts.isEmpty()) {
                 appendLog("没有可清空的聊天记录")
+                // 顶栏「清空」是静默入口，没记录时只写日志=点了没反应，补一句 toast
+                toast("没有可清空的聊天记录")
                 return@Thread
             }
             val busy = parts.filter { link.hasActiveTransfer(it.ip) }
             if (busy.isNotEmpty()) {
                 appendLog("还有传输任务进行中（${busy.size} 台设备）：等传完再清空")
+                toast("还有传输任务进行中，等传完再清空")
                 return@Thread
             }
             val total = parts.sumOf { it.all.size }
@@ -1525,33 +1911,45 @@ object AppCore {
         clearConfirm = null
     }
 
-    /** 用户点了「清空」：[clearConfirm] 里的计划真正执行 —— 本地一次清完 + 逐条通知对端 */
+    /** 用户点了「清空」：[clearConfirm] 里的计划真正执行 —— 本地一次清完 + 逐条通知对端。
+     *  必须整体在工作线程跑：deleteMessages 里的 io{} 在主线程会转投异步执行并立即返回，
+     *  这里若继续拿返回值就会恒得 0（误报"删除命令没发出去"），墓碑也被错误标成 sent=false；
+     *  历史文件整读整写同样不该压在主线程。 */
     fun confirmClearHistory() {
         val p = clearConfirm ?: return
         clearConfirm = null
-        var notified = 0
-        val cleared = HashSet<String>()
-        for (part in p.parts) {
-            cleared.addAll(part.all)
-            if (part.sync.isNotEmpty() && part.addr.isNotEmpty()) {
-                // 返回 0 = 对端不在线 / 不支持 hd：这时只清了本机，下面会如实提示
-                notified += link.deleteMessages(part.addr, part.sync)
+        Thread({
+            var notified = 0
+            val cleared = HashSet<String>()
+            for (part in p.parts) {
+                cleared.addAll(part.all)
+                if (part.sync.isNotEmpty() && part.addr.isNotEmpty()) {
+                    // 返回 0 = 对端不在线 / 不支持 hd：这时只清了本机，下面会如实提示
+                    val sent = link.deleteMessages(part.addr, part.sync)
+                    // P2-7：每条同步删除都落墓碑；没发出去的 sent=false，下次握手补发 msg_del
+                    part.sync.forEach { store.addTomb(part.addr, it, sent = sent > 0) }
+                    notified += sent
+                } else if (part.sync.isNotEmpty()) {
+                    part.sync.forEach { store.addTomb(part.addr.ifEmpty { part.ip }, it, sent = false) }
+                }
+                store.removePending(part.all)
+                store.removeFromHistory(part.ip, part.all)
             }
-            store.removePending(part.all)
-            store.removeFromHistory(part.ip, part.all)
-        }
-        if (p.whole) messages.clear() else messages.removeAll { it.mid in cleared }
-        // 清掉的记进 removedMids：防止期间排进来的在途传输终态帧把气泡补回来
-        for (id in cleared) removedMids[id] = true
-        pendingCount = store.loadPending().size
-        appendLog("已逐条删除 ${p.total} 条记录（通知对端 $notified 条）")
-        val missed = p.syncable - notified
-        if (missed > 0) {
-            clearWarn = "已清掉本机的 ${p.total} 条记录。\n\n" +
-                "但其中 $missed 条文本/图片的删除命令没能发给对方（对方不在线，" +
-                "或这台设备已不在名单里）—— 对方下次连上时，它们可能被历史同步补回来。\n" +
-                "要彻底清掉，请在对端在线时再清空一次。"
-        }
+            ui {
+                if (p.whole) messages.clear() else messages.removeAll { it.mid in cleared }
+                // 清掉的记进 removedMids：防止期间排进来的在途传输终态帧把气泡补回来
+                for (id in cleared) removedMids[id] = true
+                pendingCount = store.loadPending().size
+                appendLog("已逐条删除 ${p.total} 条记录（通知对端 $notified 条）")
+                val missed = p.syncable - notified
+                if (missed > 0) {
+                    clearWarn = "已清掉本机的 ${p.total} 条记录。\n\n" +
+                        "但其中 $missed 条文本/图片的删除命令没能发给对方（对方不在线，" +
+                        "或这台设备已不在名单里）—— 对方下次连上时，它们可能被历史同步补回来。\n" +
+                        "要彻底清掉，请在对端在线时再清空一次。"
+                }
+            }
+        }, "pp-clear-run").apply { isDaemon = true }.start()
     }
 
     /** 枚举一台设备要清的 mid：历史全量+待发，分出参与删除同步的部分（文本+图片），同组另一地址一并清掉 */
@@ -1617,6 +2015,11 @@ object AppCore {
 
     // ==================== 已知设备（后台可连接名单） ====================
 
+    /** 已知设备名单的查询键：优先**设备身份**（deviceId），拿不到身份才退回地址。
+     *  名单按身份存 → 同设备换 IP、同设备多地址都认得出，不会被当成陌生设备 */
+    private fun trustKeyOf(ip: String): String =
+        runCatching { prefs.convKeyOf(ip) }.getOrDefault("").ifEmpty { ip.trim() }
+
     /** 设置界面展示用：哪些设备在后台也允许连本机 */
     fun trustedSummary(): String = trusted.summary()
 
@@ -1670,6 +2073,57 @@ object AppCore {
         }
         toast(hint)
         appendLog("复制文本（${text.length} 字）到本机剪贴板")
+    }
+
+    // ==================== 版本变更 → 是否清除数据 ====================
+
+    /** 当前软件版本号（versionName）；取不到返回空串（此时一律不提示、不动数据） */
+    fun currentVersionName(): String = runCatching {
+        app.packageManager.getPackageInfo(app.packageName, 0).versionName ?: ""
+    }.getOrDefault("")
+
+    /** 数据里记录的旧版本号（提示文案用；空 = 老版本升级/从未记录） */
+    fun recordedDataVersion(): String = prefs.dataVersion.ifBlank { "未知（旧版本）" }
+
+    /**
+     * 版本变更检查（启动时调一次）：
+     * 数据记录的版本号与当前版本不一致 → true，界面负责询问「是否需要清除应用数据」；
+     * 首次安装（无记录且无任何旧数据）静默对齐，不问；
+     * **老版本升级**（没有记录但磁盘上已有历史/待发/台账）同样返回 true —— 旧版本从没写过记录。
+     */
+    fun needAskDataVersionChange(): Boolean {
+        val cur = currentVersionName()
+        if (cur.isEmpty()) return false
+        val rec = prefs.dataVersion
+        if (rec.isEmpty()) {
+            if (!store.hasAnyData()) {
+                prefs.dataVersion = cur
+                return false
+            }
+            appendLog("版本检查：检测到旧数据但没有版本记录，按版本变化处理")
+            return true
+        }
+        return rec != cur
+    }
+
+    /** 选「否」：只把数据记录的版本号改成当前版本，之后不再提示 */
+    fun keepDataAndAlignVersion() {
+        val cur = currentVersionName()
+        // 同步落盘：用户答完可能马上划掉应用，apply() 的异步写丢了就又会弹
+        prefs.commitDataVersion(cur)
+        appendLog("版本变更（$cur）：保留本地数据，已把数据版本记录更新为当前版本")
+    }
+
+    /** 选「是」：清除软件数据（**不影响已接收的文件**），并把数据版本记录写成当前版本 */
+    fun clearDataAndAlignVersion() {
+        val cur = currentVersionName()
+        // 必须 clearAllSync：这个函数后面紧接着 restartApp() 杀进程，
+        // apply() 的异步落盘会被打断 → 旧 data_version 还在 → 下次启动再弹一次「检测到版本变化」
+        runCatching { prefs.clearAllSync() }.onFailure { Log.w("PP", "清空设置失败: ${it.message}") }
+        runCatching { store.clearAllData() }.onFailure { Log.w("PP", "清空台账失败: ${it.message}") }
+        runCatching { trusted.clear() }.onFailure { Log.w("PP", "清空信任设备失败: ${it.message}") }
+        prefs.commitDataVersion(cur)
+        appendLog("版本变更（$cur）：已清除软件数据（下载目录里已接收的文件保留）")
     }
 
     /** 短提示：主线程弹 Toast，用于操作无可见反馈时给用户明确回应（避免「点了没反应」错觉） */

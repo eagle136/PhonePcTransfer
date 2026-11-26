@@ -1,0 +1,7 @@
+# PhonePcTransfer 版本号 —— 全项目唯一的版本来源
+# 改这一行，再跑 build_apk.py / build_jar.py / build_msi.py 即可，脚本自动按此版本打包
+# 格式：VERSION=主版本.次版本.补丁版本
+# Android versionCode 自动按 主*10000 + 次*100 + 补丁 计算（1.2.6 -> 10206）
+# 如需强制指定 versionCode，取消下一行注释并填写：
+# VERSION_CODE=10207
+VERSION=1.2.13

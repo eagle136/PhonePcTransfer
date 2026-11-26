@@ -14,18 +14,47 @@ import java.io.OutputStream
  */
 object Protocol {
 
-    const val PROTO_VER = 2
+    /** v3：分片 1MB→4MB（传输提速一期）。两端必须同值，靠 hello.chunk 校验，不一致直接拒连 */
+    const val PROTO_VER = 4
     const val DEFAULT_TCP_PORT = 28765
     const val DEFAULT_UDP_PORT = 28766
 
     /** JSON 控制帧上限 8 MB（载荷长度字段也用它约束二进制帧） */
     const val MAX_FRAME = 8 * 1024 * 1024
 
-    /** 文件分片大小（原始字节，二进制帧） */
-    const val CHUNK_SIZE = 1 * 1024 * 1024
+    /**
+     * 文件分片大小（原始字节，二进制帧）。
+     * <p>v3 起 4MB：帧数降到 1/4，帧头/刷缓冲/syscall 次数同步下降，长肥管道下单帧窗口利用率更高。
+     * ⚠️ 该值参与接收端 offset 换算（{@code seq * CHUNK_SIZE}），收发两端必须一致，改动等于换协议。
+     * <p>注意：**这不是线上每帧的实际大小**。单文件发送走 [AdaptiveFrame]（1M 起步、8M 封顶），
+     * 这里的 4MB 只是「续传偏移/多通道单元」的换算单位与 hello 兼容闸门。
+     */
+    const val CHUNK_SIZE = 4 * 1024 * 1024
 
-    /** 接收端双缓冲：每块 4MB，一块写满切另一块、满块交给落盘线程 */
-    const val RX_BUF_SIZE = 4 * 1024 * 1024
+    /** 续传/传输校验块：32MB（P4-1，双端同值） */
+    const val BLOCK_SIZE = 32 * 1024 * 1024
+
+    /** 单条文本上限（16k 字符，P4-6；不做送达验证） */
+    const val MAX_TEXT_CHARS = 16384
+
+    fun limitText(s: String?): String {
+        val t = s ?: return ""
+        return if (t.length > MAX_TEXT_CHARS) t.substring(0, MAX_TEXT_CHARS) else t
+    }
+
+    /** 对端可控时间戳只允许「不晚于本机时钟 5 分钟」；非法/未来值回落到 now（防止未来消息永久占住排序与裁剪） */
+    fun saneTs(ts: Long): Long {
+        val now = System.currentTimeMillis()
+        return if (ts <= 0L || ts > now + 5 * 60_000L) now else ts
+    }
+
+    /**
+     * 接收端缓冲池单块大小：每块 8MB（2026-11-22 由 4MB 抬到 8MB，与发送端自适应顶档齐平），
+     * 3 块轮转（见 LinkReceive.RX_BUF_COUNT），攒满 1MB 即交落盘线程。
+     * <p>必须 ≥ 发送端最大帧，否则大帧走不进「直接读进轮转缓冲」的零拷贝路径，退化成每帧现分配。
+     * ⚠️ 该值不进 hello 校验，单端改了不会拒连，只会让对端退化成逐帧分配 —— 所以仍要双端一起改。
+     */
+    const val RX_BUF_SIZE = 8 * 1024 * 1024
 
     /** 二进制帧标志位（长度字段最高位） */
     const val BIN_FLAG = 0x80000000.toInt()
@@ -158,7 +187,12 @@ object Protocol {
 
     // ==================== 帧编解码 ====================
 
-    @Synchronized
+    /**
+     * 写一帧 JSON。
+     * <p>**不加全局锁**（原 `@Synchronized` 锁的是 Protocol 单例，跨会话串行，一个半死连接会拖住
+     * 所有设备的文本/ack/ping）：写与写的互斥已由调用方 [Link.Session.writeLock] 按会话保证，
+     * 本函数只操作传入的 out，不碰任何共享可变状态（`chunkHeader` 用 ThreadLocal）。
+     */
     @Throws(IOException::class)
     fun write(out: OutputStream, msg: JSONObject) {
         val body = msg.toString().toByteArray(Charsets.UTF_8)
@@ -175,39 +209,80 @@ object Protocol {
     }
 
     /**
+     * 分片帧头缓存（每线程一份）：同一 mid 的 6 字节前缀（子类型/midLen/mid）只算一次，
+     * 之后每帧只覆盖 4B 帧长与 4B seq —— 不再每帧 new 两个数组（原实现每帧 2 次分配 + 3 次 write）。
+     * <p>用 ThreadLocal 而不是全局缓存：写线程之间不共享可变数组，免加锁、免串包。
+     */
+    private class ChunkHead {
+        var mid: String = ""
+        var buf: ByteArray = ByteArray(0)
+        var seqOff: Int = 0
+    }
+
+    private val chunkHeadTl = ThreadLocal.withInitial { ChunkHead() }
+
+    /**
+     * 生成一块分片帧头（复用线程私有缓冲）：[4B 帧长][1B 子类型][1B midLen][mid][4B seq]。
+     * 普通发送路径由 [writeChunk] 直接写；零拷贝路径（P1-4）拿它走 SocketChannel 一次写出。
+     */
+    @Throws(IOException::class)
+    fun chunkHeader(mid: String, seq: Int, len: Int): ByteArray {
+        val ch = chunkHeadTl.get()
+        var buf = ch.buf
+        if (ch.mid != mid) {
+            val midB = mid.toByteArray(Charsets.UTF_8)
+            if (midB.size > 255) throw IOException("mid 过长")
+            ch.mid = mid
+            // [0..3] 帧长 | [4] 子类型 | [5] midLen | [6..] mid | [seqOff..seqOff+3] seq
+            buf = ByteArray(10 + midB.size)
+            buf[4] = BIN_CHUNK
+            buf[5] = midB.size.toByte()
+            System.arraycopy(midB, 0, buf, 6, midB.size)
+            ch.buf = buf
+            ch.seqOff = 6 + midB.size
+        }
+        val payloadLen = (buf.size - 4) + len
+        if (payloadLen > MAX_FRAME) throw IOException("分片帧过大: $payloadLen")
+        val fl = BIN_FLAG or payloadLen
+        buf[0] = (fl ushr 24).toByte()
+        buf[1] = (fl ushr 16).toByte()
+        buf[2] = (fl ushr 8).toByte()
+        buf[3] = fl.toByte()
+        val so = ch.seqOff
+        buf[so] = (seq ushr 24).toByte()
+        buf[so + 1] = (seq ushr 16).toByte()
+        buf[so + 2] = (seq ushr 8).toByte()
+        buf[so + 3] = seq.toByte()
+        return buf
+    }
+
+    /**
      * 写一个二进制文件分片帧。
-     * 载荷 = [1B 子类型][1B midLen][mid UTF-8][4B seq 大端][data...]，一次性写出后 flush。
+     * <p>线上字节序列与原实现逐字节相同（4B 帧长｜子类型｜midLen｜mid｜seq｜载荷），
+     * 只是把「帧长 + 帧头」合并成一次 write，并去掉逐帧 flush：
+     * 大载荷（≥ 缓冲）走 BufferedOutputStream 的直写分支，小尾块才需要 flush 把缓冲推出去。
      */
     @Throws(IOException::class)
     fun writeChunk(out: OutputStream, mid: String, seq: Int, data: ByteArray, off: Int, len: Int) {
-        val midB = mid.toByteArray(Charsets.UTF_8)
-        if (midB.size > 255) throw IOException("mid 过长")
-        val payloadLen = 1 + 1 + midB.size + 4 + len
-        if (payloadLen > MAX_FRAME) throw IOException("分片帧过大: $payloadLen")
-        val fl = BIN_FLAG or payloadLen
-        out.write(
-            byteArrayOf(
-                (fl ushr 24).toByte(), (fl ushr 16).toByte(), (fl ushr 8).toByte(), fl.toByte()
-            )
-        )
-        val head = ByteArray(2 + midB.size + 4)
-        head[0] = BIN_CHUNK
-        head[1] = midB.size.toByte()
-        System.arraycopy(midB, 0, head, 2, midB.size)
-        head[2 + midB.size] = (seq ushr 24).toByte()
-        head[3 + midB.size] = (seq ushr 16).toByte()
-        head[4 + midB.size] = (seq ushr 8).toByte()
-        head[5 + midB.size] = seq.toByte()
-        out.write(head)
-        out.write(data, off, len)
-        out.flush()
+        val buf = chunkHeader(mid, seq, len)
+        out.write(buf)
+        if (len > 0) out.write(data, off, len)
+        // 尾块（< 8KB 会话缓冲）留在缓冲里不会自己出去；大块已直写，无需再刷
+        if (len < 8192) out.flush()
     }
 
     /** 一帧：JSON 控制帧、二进制文件分片帧、或二进制语音帧 */
     sealed class Frame {
         class Json(val j: JSONObject) : Frame()
-        /** data 为原始分片字节（有效范围 [0, len)） */
-        class Chunk(val mid: String, val seq: Int, val data: ByteArray, val len: Int) : Frame()
+        /**
+         * data 为分片字节；有效范围 [off, off+len)。
+         * [direct] = true 表示载荷由读循环**直接读进** [data]（接收端 4MB 轮转缓冲），
+         * 已省掉「先分配到临时数组再 memcpy 进缓冲」的一次分配 + 一次拷贝。
+         */
+        class Chunk(
+            val mid: String, val seq: Int, val data: ByteArray, val len: Int,
+            val off: Int = 0, val direct: Boolean = false
+        ) : Frame()
         /**
          * 语音音频帧：seq 单调递增；ts 为发送端**通话相对**时间戳（对端起呼=0 的 ms，4B 无符号；
          * 抖动缓冲对时/帧龄用。两端各自零点，接收端不拿它与本端墙钟相减）。
@@ -225,9 +300,36 @@ object Protocol {
         }
     }
 
+    /** 分片载荷落点：接收端在拿到分片头后指定「直接写进哪块缓冲的哪个偏移」 */
+    class ChunkSink(val buf: ByteArray, val off: Int)
+
+    /** 把 len 字节直接读进 buf 的 off 处（不分配、不二次拷贝） */
+    @Throws(IOException::class)
+    private fun readFullyInto(input: InputStream, buf: ByteArray, off: Int, len: Int) {
+        var at = off
+        var remain = len
+        while (remain > 0) {
+            val n = input.read(buf, at, remain)
+            if (n < 0) throw EOFException()
+            at += n
+            remain -= n
+        }
+    }
+
     /** @return 帧内容；流正常结束返回 null */
     @Throws(IOException::class)
-    fun readFrame(input: InputStream): Frame? {
+    fun readFrame(input: InputStream): Frame? = readFrameInto(input) { _, _, _ -> null }
+
+    /**
+     * 带直读落点的帧读取：解析到文件分片头时先问 [resolve]「这块要落到哪」。
+     * <p>[resolve] 返回非空 → 载荷不分配临时数组，直接读进指定缓冲（快路径）；
+     * 返回 null → 退回原逻辑（分配 ByteArray），保证乱序/未知 mid/跨缓冲等异常路径行为不变。
+     */
+    @Throws(IOException::class)
+    fun readFrameInto(
+        input: InputStream,
+        resolve: (mid: String, seq: Int, len: Int) -> ChunkSink?
+    ): Frame? {
         val dis = if (input is DataInputStream) input else DataInputStream(input)
         val v = try {
             dis.readInt()
@@ -253,9 +355,17 @@ object Protocol {
                 val seq = dis.readInt()
                 val dataLen = n - 2 - midLen - 4
                 if (dataLen < 0) throw IOException("二进制帧长度不符: $n")
-                val data = ByteArray(dataLen)
-                if (dataLen > 0) dis.readFully(data)
-                Frame.Chunk(String(midB, Charsets.UTF_8), seq, data, dataLen)
+                val mid = String(midB, Charsets.UTF_8)
+                val sink = resolve(mid, seq, dataLen)
+                if (sink != null) {
+                    if (dataLen > 0) readFullyInto(dis, sink.buf, sink.off, dataLen)
+                    Frame.Chunk(mid, seq, sink.buf, dataLen, sink.off, true)
+                } else {
+                    val data = ByteArray(dataLen)
+                    TxStats.alloc(1)
+                    if (dataLen > 0) dis.readFully(data)
+                    Frame.Chunk(mid, seq, data, dataLen)
+                }
             }
             BIN_AUDIO -> {
                 val seq = dis.readInt()
@@ -290,12 +400,19 @@ object Protocol {
 
     fun hello(
         id: String, name: String, model: String,
-        vid: Boolean = false, cam: Boolean = false, vcodec: List<String> = emptyList()
+        vid: Boolean = false, cam: Boolean = false, vcodec: List<String> = emptyList(),
+        lanes: Int = 1, lane: Int = 0, tok: String = ""
     ): JSONObject = msg("hello")
         .put("id", id)
         .put("name", name)
         .put("model", model)
         .put("ver", PROTO_VER)
+        // 分片大小协商：老端不带该字段 → 按 1MB 处理，onHello 直接拒连，避免错位写坏文件
+        .put("chunk", CHUNK_SIZE)
+        // 2 期：多通道能力协商。lanes = 本端最多能同时用的通道数（1 = 不支持）；
+        // lane = 本条连接的角色（0 = 主连接，>0 = 纯数据通道）。老端忽略这两个字段 → 自动单通道。
+        .put("lanes", lanes)
+        .put("lane", lane)
         // ===== 能力协商（老端不认识这些字段，直接忽略；本端凭对端的 vid 决定敢不敢发视频帧）=====
         .put("vid", vid)           // 本端可**接收**视频
         .put("cam", cam)           // 本端有摄像头、可**发送**视频
@@ -304,6 +421,10 @@ object Protocol {
         .put("hd", true)           // 本端支持「消息删除同步」（msg_del，v2.4 起；老端忽略）
         .put("dl", true)           // 本端支持「文件夹完整性校验」（dir_meta.list/dir_end/dir_missing，v2.6 起；老端忽略）
         .put("dm", true)           // 本端支持「数据流量确认」（data_ask/data_ans，v2.7 起；老端忽略）
+        // P4-1 32MB 分块校验 / P4-5 配对能力；老端不带 → onHello 拒连并提示同时升级
+        .put("blk", BLOCK_SIZE)
+        .put("pr", true)
+        .put("tok", tok)
 
     // ==================== 数据流量确认（v2.7，仅双方 dm=1 时使用）====================
 
@@ -357,6 +478,18 @@ object Protocol {
     fun busy(holder: String): JSONObject = msg("busy")
         .put("holder", holder)
 
+    /**
+     * 设备忙（单任务槽，v3.x）：本机正在传 [holder] 描述的任务，拒绝本次 [mid]/[name]。
+     * 带 mid 的 busy 与老格式（只有 holder）区分开：新端收到后只把该条目留在待发队列，
+     * 等对端发 `sync_req`（任务槽释放）再自动补发，**不关会话**。
+     * kind: file / dir / member（member=文件夹成员，接收端按目录 mid 回绝）。
+     */
+    fun busy(mid: String, name: String, holder: String, kind: String = "file"): JSONObject = msg("busy")
+        .put("mid", mid)
+        .put("name", name)
+        .put("holder", holder)
+        .put("kind", kind)
+
     fun text(mid: String, text: String): JSONObject = msg("text")
         .put("mid", mid)
         .put("text", text)
@@ -407,6 +540,33 @@ object Protocol {
         .put("mid", mid)
         .put("sha256", sha256)
 
+    // ==================== 多通道传输（2 期，v4）====================
+
+    /**
+     * 多通道开传声明：**必须在 file_meta 之前**发，接收端据此把该文件的接收通道建成
+     * 「3 槽重排环」而不是 1 期的双缓冲顺序缓冲。
+     * unit = 单元字节数（当前 = CHUNK_SIZE）；lanes = 本次实际并发的通道数。
+     */
+    fun xeBegin(mid: String, unit: Int, lanes: Int, startAt: Long): JSONObject =
+        msg("xe_begin")
+            .put("mid", mid)
+            .put("unit", unit)
+            .put("lanes", lanes)
+            .put("startAt", startAt)
+
+    /** 多通道收尾：所有单元已发完（file_done 紧跟其后） */
+    fun xeEnd(mid: String): JSONObject = msg("xe_end").put("mid", mid)
+
+    /**
+     * 接收上下文就绪应答：接收端已把该 mid 的 Rx（多通道时含 3 槽重排环）建好并登记进 rxMap，
+     * 发送端收到后才允许起数据通道发分片；否则先到的分片会因「未知 mid」被丢弃，
+     * 留下补不齐的单元缺口（2 期首测 1GB 卡死 30s 的根因）。
+     */
+    fun xeReady(mid: String): JSONObject = msg("xe_ready").put("mid", mid)
+
+    /** 数据通道就绪应答（对端挂载成功后回发，拨号方据此确认该 lane 可用） */
+    fun laneOk(lane: Int): JSONObject = msg("lane_ok").put("lane", lane)
+
     /**
      * 发送方取消某个文件/文件夹传输。
      * 接收端收到后中止接收、删除半成品文件，并把该条消息从聊天界面移除（两端同步不显示）。
@@ -425,20 +585,72 @@ object Protocol {
      * sha256 为前缀摘要（对端自行维护/重算，可能为空）；ok=false 从头传。
      */
     fun fileResume(mid: String, ok: Boolean, offset: Long, sha256: String): JSONObject =
-        msg("file_resume")
-            .put("mid", mid)
-            .put("ok", ok)
-            .put("offset", offset)
-            .put("sha256", sha256)
+        fileResume(mid, ok, offset, sha256, false)
 
-    /** 文件夹传输开始：name=文件夹名，fileCount=成员数，totalSize=总字节 */
+    /**
+     * 断点续传应答（大小校验版）。
+     * needBlk=true：对端命中了磁盘上的半成品，offset 已向下对齐到 32MB 边界；
+     * 发送端发 [blkVerify] 请求按块核对大小，等 [blkAck] 回到最终偏移后再发数据。
+     */
+    fun fileResume(
+        mid: String, ok: Boolean, offset: Long, sha256: String, needBlk: Boolean
+    ): JSONObject = msg("file_resume")
+        .put("mid", mid)
+        .put("ok", ok)
+        .put("offset", offset)
+        .put("sha256", sha256)
+        .put("needBlk", needBlk)
+
+    // ==================== 32MB 分块大小校验（不做 hash） ====================
+
+    /**
+     * 发送端 → 接收端：发起前缀大小校验——按 32MB 一块核对 [0, offset) 是否都在盘上，
+     * 接收端截断到最后一个完整块边界、建好续传通道后回 [blkAck]（带实际核验偏移）。
+     * offset=0 表示放弃续传、从头接收（接收端清掉半成品）。
+     */
+    fun blkVerify(mid: String, offset: Long): JSONObject = msg("blk_verify")
+        .put("mid", mid)
+        .put("offset", offset)
+
+    /**
+     * 接收端 → 发送端：大小校验结果。ok=false 请从 0 重来；
+     * offset = 实际核验通过的续传起点（可能小于请求值：盘上字节不够时退到最后一个完整块边界）。
+     */
+    fun blkAck(mid: String, idx: Int, ok: Boolean, offset: Long): JSONObject = msg("blk_ack")
+        .put("mid", mid)
+        .put("idx", idx)
+        .put("ok", ok)
+        .put("offset", offset)
+
+    // ==================== P4-5 设备配对（6 位码）====================
+
+    /** 接收方 → 发起方：未配对/ token 不匹配，请在发起方输入本机显示的 6 位码 */
+    fun pairNeed(ttlMs: Long): JSONObject = msg("pair_need").put("ttl", ttlMs)
+
+    /** 发起方 → 接收方：用户输入的 6 位配对码 */
+    fun pairSubmit(code: String): JSONObject = msg("pair_submit").put("code", code)
+
+    /** 接收方 → 发起方：配对成功（token 为空 = 仅确认既有 hello.tok 校验通过） */
+    fun pairOk(token: String): JSONObject = msg("pair_ok").put("token", token)
+
+    /** 接收方 → 发起方：配对码错误，left=剩余次数 */
+    fun pairFail(left: Int): JSONObject = msg("pair_fail").put("left", left)
+
+    /** 任一端 → 对端：用户点了弹窗「取消」，请对端也把配对弹窗关掉（连接保留，未配对） */
+    fun pairCancel(): JSONObject = msg("pair_cancel")
+
+    /** 文件夹传输开始：name=文件夹名，fileCount=成员数，totalSize=总字节。
+     *  先给清单再发数据：list=成员相对路径（目录结构），sizes=与 list 逐项对应的文件字节数，
+     *  接收端按清单存放并核对每个成员的大小 */
     fun dirMeta(
         mid: String, name: String, fileCount: Int, totalSize: Long,
         emptyDirs: List<String> = emptyList(),
         /** 成员相对路径清单（接收端据此核对缺失）。为空 = 不带清单，退化为「只按数量核对」 */
         list: List<String> = emptyList(),
         /** 因深度/数量上限被跳过的分支数（>0 时对端明确提示，不再无声消失） */
-        skipped: Int = 0
+        skipped: Int = 0,
+        /** 成员大小清单（与 list 逐项对应；为空 = 不带大小，只按路径核对） */
+        sizes: List<Long> = emptyList()
     ): JSONObject {
         val m = msg("dir_meta")
             .put("mid", mid)
@@ -448,6 +660,7 @@ object Protocol {
             .put("dirs", org.json.JSONArray(emptyDirs))
         if (list.isNotEmpty()) m.put("list", org.json.JSONArray(list))
         if (skipped > 0) m.put("skipped", skipped)
+        if (sizes.isNotEmpty() && sizes.size == list.size) m.put("sizes", org.json.JSONArray(sizes))
         return m
     }
 
@@ -471,12 +684,20 @@ object Protocol {
         .put("items", org.json.JSONArray(items))
 
     /**
-     * 续传完成核对：接收端把落盘文件的 MD5 回发给发送端比对（端到端完整性）。
-     * 只对触发过续传的普通单文件发送；发送端异步核对，不阻塞任何线程。
+     * 接收端在收到 dir_meta 后立刻回报「本机已经在盘上的成员」：
+     * 断链重发整目录时发送端据此跳过这些成员，只补真正缺的文件（局域网按文件粒度即可）。
      */
-    fun fileVerify(mid: String, md5: String): JSONObject = msg("file_verify")
+    fun dirHave(mid: String, items: List<String>): JSONObject = msg("dir_have")
         .put("mid", mid)
-        .put("md5", md5)
+        .put("items", org.json.JSONArray(items))
+
+    /**
+     * 续传完成核对（大小版）：接收端把落盘文件的实际字节数回发给发送端比对。
+     * 只对触发过续传的普通单文件发送；发送端按整文件 10s 超时等待，不阻塞任何线程。
+     */
+    fun fileVerify(mid: String, size: Long): JSONObject = msg("file_verify")
+        .put("mid", mid)
+        .put("size", size)
 
     fun syncReq(): JSONObject = msg("sync_req")
 
@@ -914,6 +1135,12 @@ enum class DataConsent {
     /** 对端拒绝用数据流量接收 */
     REMOTE_REFUSED,
 
+    /**
+     * 对端 [DATA_ANS_WAIT_MS] 内**没有应答**（进程被杀/半死/帧丢了）。
+     * 与 REMOTE_REFUSED 必须分开：超时不是用户拒绝，不许投票③、也不该提示「对方拒绝」。
+     */
+    REMOTE_TIMEOUT,
+
     /** 目标设备当前没有健康会话（退化为待发/直接失败） */
     NO_SESSION
 }
@@ -944,5 +1171,12 @@ object DataConsentText {
         KIND_VOICE -> "对方拒绝了使用数据流量接受语音通话"
         KIND_VIDEO -> "对方拒绝了使用数据流量接受视频通话"
         else -> "对方拒绝了使用数据流量接受文件"
+    }
+
+    /** 对端 90s 无应答（≠拒绝）：提示语必须区分，避免用户误以为对方点了拒绝 */
+    fun peerTimeoutText(kind: String): String = when (kind) {
+        KIND_VOICE -> "对方未确认（90 秒无响应），语音通话未发起"
+        KIND_VIDEO -> "对方未确认（90 秒无响应），视频通话未发起"
+        else -> "对方未确认（90 秒无响应），已留在待发队列"
     }
 }

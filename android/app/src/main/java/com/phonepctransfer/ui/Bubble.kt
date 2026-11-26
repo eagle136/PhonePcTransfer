@@ -462,7 +462,8 @@ private const val SPEED_TICK_MS = 400L
 private fun statusSuffix(m: MsgItem): String = when (m.status) {
     Status.OK -> ""
     Status.PENDING -> " · 待发送"
-    Status.SENDING -> " · 发送中"
+    // P2-2：推完字节但还没收到落盘回执 → 100% + 「待对方确认」，不提前显示成功
+    Status.SENDING -> if (m.progress >= 100) " · 待对方确认" else " · 发送中"
     Status.FAILED -> " · 失败"
     // 「数据流量未同意」的说明已经写在气泡里（文件名下方 + 末尾红色叹号），
     // 这里不再叠一串字，避免把一行挤成两行。

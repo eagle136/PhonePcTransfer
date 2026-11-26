@@ -112,12 +112,42 @@ data class PeerGroup(
 }
 
 /** 轻量配置存储（SharedPreferences） */
-class Prefs(ctx: Context) {
+class Prefs(private val ctx: Context) {
 
     private val sp = ctx.getSharedPreferences("pp_prefs", Context.MODE_PRIVATE)
 
     /** ip→组键解析缓存（convKeyOf 在发送热路径上）；改变绑定关系的写操作都要清表 */
     private val keyCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * 数据记录的版本号：与当前软件版本不一致时，启动会问一次
+     * 「是否需要清除应用数据（不影响已接收的文件）」；回答后写回当前版本，之后不再询问。
+     */
+    var dataVersion: String
+        get() = sp.getString(K_DATA_VERSION, "") ?: ""
+        set(v) { sp.edit().putString(K_DATA_VERSION, v).apply() }
+
+    /** 清空全部软件数据（设置/设备/历史都在这个 SharedPreferences 里；历史文件由 Store.clearAllData 删） */
+    fun clearAll() {
+        sp.edit().clear().apply()
+        keyCache.clear()
+    }
+
+    /**
+     * 同步清空（commit）。「版本变化 → 清除数据」之后会**立刻自杀重启**，
+     * apply() 的异步落盘来不及写完就被 killProcess 打断 → 下次启动仍读到旧的 data_version/旧设置，
+     * 于是又弹一次「检测到版本变化」，用户可以一直点「清除数据」（实测的无限循环）。
+     * 重启前必须用这个版本。
+     */
+    fun clearAllSync() {
+        sp.edit().clear().commit()
+        keyCache.clear()
+    }
+
+    /** 同步写数据版本号（同上：自杀重启前必须已经落盘，否则下次启动还会问） */
+    fun commitDataVersion(v: String) {
+        sp.edit().putString(K_DATA_VERSION, v).commit()
+    }
 
     init {
         // 身份绑定与组备注的一次性播种（老数据升级）
@@ -131,13 +161,120 @@ class Prefs(ctx: Context) {
         get() = sp.getString(K_NAME, null) ?: defaultName()
         set(v) = sp.edit().putString(K_NAME, v).apply()
 
+    /**
+     * 本机设备 id。
+     *
+     * 关键约束：**清数据（`pm clear`）/重装之后必须还是同一个 id**，否则对端会把它当成全新设备，
+     * 按 deviceId 分文件的聊天记录永远对不上账（hsync 补齐彻底失效，旧消息变孤儿）。
+     * 因此首次生成时不再用随机 UUID，而是从 `Settings.Secure.ANDROID_ID` 派生
+     * （同一签名 + 同一用户下该值清数据/重装都不变，Android 8+）。
+     * 已存在的旧随机 id **原样保留**，避免升级后身份突变把现有配对与历史搞丢。
+     */
     val deviceId: String by lazy {
         val exist = sp.getString(K_ID, null)
         if (exist.isNullOrEmpty()) {
-            val id = "android-" + UUID.randomUUID().toString().substring(0, 8)
+            val id = "android-" + stableTail()
             sp.edit().putString(K_ID, id).apply()
             id
         } else exist
+    }
+
+    /** 由 ANDROID_ID 派生的 8 位十六进制尾巴；取不到就退回随机（极端兜底，不改变行为） */
+    private fun stableTail(): String {
+        val raw = runCatching {
+            android.provider.Settings.Secure.getString(ctx.contentResolver, android.provider.Settings.Secure.ANDROID_ID)
+        }.getOrNull()
+        // 9774d56d682e549c 是早期设备/模拟器共用的假值，不具区分性
+        if (raw.isNullOrEmpty() || raw == "9774d56d682e549c") {
+            return UUID.randomUUID().toString().substring(0, 8)
+        }
+        val dig = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(("ppdev|" + raw).toByteArray(Charsets.UTF_8))
+        val sb = StringBuilder(8)
+        for (i in 0 until 4) sb.append(String.format("%02x", dig[i]))
+        return sb.toString()
+    }
+
+    // ==================== P4-5 设备配对库（deviceId → 共享 token）====================
+
+    /** 已配对设备的共享 token；未配对返回空串 */
+    fun pairedTokenOf(deviceId: String): String {
+        if (deviceId.isEmpty()) return ""
+        return sp.getString("pair_tok_" + deviceId, "") ?: ""
+    }
+
+    fun pairedNameOf(deviceId: String): String = sp.getString("pair_name_" + deviceId, "") ?: ""
+
+    /** 发起连接时还不知道对端 deviceId，先按 IP 取上次配对留下的 token；没有就返回空串（仅作 [pairedTokenFor] 的兜底） */
+    fun pairedTokenForIp(ip: String): String {
+        val v = ip.trim()
+        if (v.isEmpty()) return ""
+        return sp.getString("pair_tokip_" + v, "") ?: ""
+    }
+
+    /**
+     * 发起连接时取 token：**先按设备身份（deviceId），再按地址兜底**。
+     *
+     * 设备身份 = deviceId + token（配对码即授权），地址只是这台设备当下的一个接入点。
+     * 重启 / 换 WiFi / DHCP 续租后 IP 一变，按 IP 查就查空 → hello 不带 token → 对端被拖回配对流程。
+     * 按组键（[convKeyOf]：已识别身份时就是 deviceId）查则完全不受地址变化影响。
+     */
+    fun pairedTokenFor(any: String): String {
+        val v = any.trim()
+        if (v.isEmpty()) return ""
+        val byDev = pairedTokenOf(convKeyOf(v))
+        if (byDev.isNotEmpty()) return byDev
+        return pairedTokenForIp(v)
+    }
+
+    fun isPaired(deviceId: String): Boolean = pairedTokenOf(deviceId).isNotEmpty()
+
+    /** 本机所有已配对设备的 deviceId（用于启动时把「配对过」补进已知设备名单） */
+    fun pairedDeviceIds(): List<String> = sp.all.keys
+        .filter { it.startsWith("pair_tok_") }
+        .map { it.removePrefix("pair_tok_") }
+        .filter { it.isNotEmpty() }
+
+    /**
+     * 配对成功 / 已有配对再次校验通过：登记/覆盖 token。
+     *
+     * 一个 token 只属于一台设备，所以它的 `pair_tokip_*` 地址缓存全部可以按 token 值认出来：
+     * 写入前把该设备的旧地址缓存（旧 token 与本 token 命中的那几条）清掉，再写本次地址。
+     * 不清的话，设备换 IP 后旧地址那条缓存会被 DHCP 复用给别的设备，按 IP 兜底查表就会拿错 token。
+     */
+    fun markPaired(deviceId: String, name: String, token: String, ip: String = "") {
+        if (deviceId.isEmpty() || token.isEmpty()) return
+        val old = pairedTokenOf(deviceId)
+        val v = ip.trim()
+        // 什么都没变就别写 prefs（每次重连都会走这里，没必要反复落盘）
+        if (old == token && (v.isEmpty() || pairedTokenForIp(v) == token)
+            && (name.isEmpty() || pairedNameOf(deviceId) == name)
+        ) {
+            return
+        }
+        val ipKey = "pair_tokip_" + v
+        val e = sp.edit().putString("pair_tok_$deviceId", token)
+        if (name.isNotEmpty()) e.putString("pair_name_$deviceId", name)
+        for ((k, tok) in sp.all) {
+            if (!k.startsWith("pair_tokip_")) continue
+            if (k == ipKey) continue
+            if (tok == token || (old.isNotEmpty() && tok == old)) e.remove(k)
+        }
+        if (v.isNotEmpty()) e.putString(ipKey, token)
+        e.apply()
+    }
+
+    fun unpair(deviceId: String) {
+        if (deviceId.isEmpty()) return
+        // IP 维度的 token 缓存必须一并清掉，否则同 IP 重连会自动重新配对（"解除配对"失效）
+        val token = pairedTokenOf(deviceId)
+        val e = sp.edit().remove("pair_tok_" + deviceId).remove("pair_name_" + deviceId)
+        if (token.isNotEmpty()) {
+            for ((k, v) in sp.all) {
+                if (k.startsWith("pair_tokip_") && v == token) e.remove(k)
+            }
+        }
+        e.apply()
     }
 
     var tcpPort: Int
@@ -232,6 +369,7 @@ class Prefs(ctx: Context) {
     val peerIps: List<String> get() = peers.map { it.ip }
 
     /** 新增/更新一台设备。同 IP 多设备三规则：活动设备→常规刷新；还在（30s 内有动静）→只登记别名，绝不改 lastId/绑定/组状态；已离开（≥30s）→允许接管。@return true=用户可见的结构变化（纯时间戳刷新不算） */
+    @Synchronized
     fun upsertPeer(
         ip: String,
         remark: String? = null,
@@ -278,13 +416,20 @@ class Prefs(ctx: Context) {
         }
         if (did.isNotEmpty() && did != active && (active.isEmpty() || devGone(old, active))) {
             // 接管：身份换成它。组状态（备注/当前地址/旋转角/标记）由 bindDevice 搬家 + 清 keyCache
-            val (dv, _) = if (active.isEmpty() || p.dev(active) != null
+            //
+            // 「同地址 + 同广播名 + 换了 deviceId」基本只可能是同一台机器清了数据/重装（身份变了）。
+            // 这时**不能**把旧身份留成别名行：留了列表就是「名字」+「名字-2」两行，
+            // 而且点旧行还能把地址绑定抢回一个不再存在的身份（用户视角＝"再也连不上"）。
+            val sameHostNewIdentity = active.isNotEmpty() && dn.isNotEmpty() && old.lastName.trim() == dn
+            val dv = if (sameHostNewIdentity) {
+                p.devs.filterNot { it.id == active }
+            } else if (active.isEmpty() || p.dev(active) != null
                 || devStaleForAlias(old.lastSeenAt, DEV_ALIAS_KEEP_MS)
             ) {
                 // 升级兼容：给旧活动设备补一条记录（太久没出现的不补，免幽灵行）
-                p.devs to false
+                p.devs
             } else {
-                noteDev(p.devs, active, old.lastName, old.lastSeenAt)
+                noteDev(p.devs, active, old.lastName, old.lastSeenAt).first
             }
             p = p.copy(lastId = did, devs = dv)
             // 它真的占到地址了 → 用户之前「不再显示」的标记作废
@@ -339,8 +484,14 @@ class Prefs(ctx: Context) {
     /** 接管时「被顶下去的旧活动设备」还值不值得留一条别名行（超过时限 = 多半是旧 deviceId，不留） */
     private val DEV_ALIAS_KEEP_MS = 10 * 60_000L
 
-    /** 别名行显示时限：换/重装后 deviceId 变更的旧身份永不广播，太久没露面的不再列出；真正在场的设备记录一直新鲜，不会误藏 */
-    private val DEV_ALIAS_SHOW_MS = 60 * 60_000L
+    /**
+     * 别名行显示时限：只在「这台身份最近确实还活着」时列出来。
+     * 广播/握手周期是 2s、兜底广播 20s，5 分钟足够覆盖扫描空窗；
+     * 旧实现给 60 分钟 ⇒ 对端「清除数据/重装」换了 deviceId 后，同一 IP 上会同时挂着
+     * 旧身份别名行 + 新身份主行（同名→显示成「名字」「名字-2」），而且点旧行还能把绑定抢回去，
+     * 用户看到的就是「两个对方名称、再也连不上」。
+     */
+    private val DEV_ALIAS_SHOW_MS = 5 * 60_000L
 
     /** 某个设备身份是否已经超过 [limitMs] 没出现过 */
     private fun devStaleForAlias(seenAt: Long, limitMs: Long): Boolean =
@@ -352,6 +503,7 @@ class Prefs(ctx: Context) {
     private fun ignoredDevsMap(): MutableMap<String, String> = jsonMap(K_IGNORED_DEVS)
 
     /** 忘掉「这台设备在此地址出现过」的别名记录并记入忽略表（否则对方下次广播又加回来）；它真占到地址时标记自动解除 */
+    @Synchronized
     fun forgetDev(deviceId: String): Boolean {
         val d = deviceId.trim()
         if (d.isEmpty()) return false
@@ -382,6 +534,7 @@ class Prefs(ctx: Context) {
     }
 
     /** 修改一台设备的 IP 与备注（长按编辑弹窗用）。oldIp 定位原条目，newIp 可改。 */
+    @Synchronized
     fun updatePeer(oldIp: String, newIp: String, remark: String): Boolean {
         val cur = peers.toMutableList()
         val idx = cur.indexOfFirst { it.ip == oldIp }
@@ -402,6 +555,7 @@ class Prefs(ctx: Context) {
     }
 
     /** 解除某地址的身份绑定（只动绑定表与解析缓存，设备行由调用方处理） */
+    @Synchronized
     fun unbindDevice(ip: String): Boolean {
         val v = ip.trim()
         if (v.isEmpty()) return false
@@ -420,6 +574,7 @@ class Prefs(ctx: Context) {
     private fun blockedGroups(): MutableMap<String, String> = jsonMap(K_BLOCKED_GROUPS)
 
     /** 标记一台设备（键用 [convKeyOf] 的派生键：已识别身份是 deviceId，否则是该地址本身） */
+    @Synchronized
     fun markBlockedGroup(key: String) {
         val k = key.trim()
         if (k.isEmpty()) return
@@ -441,6 +596,7 @@ class Prefs(ctx: Context) {
     }
 
     /** 删除一个地址并一并解除身份绑定（只删行留绑定的话，重新加回同一地址会立刻并入老设备的组） */
+    @Synchronized
     fun removePeer(ip: String): Boolean {
         val v = ip.trim()
         val key = convKeyOf(v)
@@ -591,6 +747,7 @@ class Prefs(ctx: Context) {
     private fun bindingsMap(): MutableMap<String, String> = jsonMap(K_BINDINGS)
 
     /** 把某 IP 绑定到对端设备 id（一对多=自动成组）；@return true = 绑定关系变化（调用方据此刷新界面） */
+    @Synchronized
     fun bindDevice(ip: String, deviceId: String): Boolean {
         val v = ip.trim()
         val d = deviceId.trim()
@@ -620,6 +777,7 @@ class Prefs(ctx: Context) {
     }
 
     /** 握手/发现带来的被动绑定：仅当地址还没有别的活动设备（或那台已离开）才绑，后来者只登记别名；手动 bindDevice 仍是强绑定。@return true = 绑定关系变化 */
+    @Synchronized
     fun bindDeviceIfFree(ip: String, deviceId: String): Boolean {
         val v = ip.trim()
         val d = deviceId.trim()
@@ -643,6 +801,7 @@ class Prefs(ctx: Context) {
     }
 
     /** 把旧组键上的本机状态（备注/当前地址/旋转角/设备标记）搬到新组键（新地址并入已有设备时调用）；目标组已有值不覆盖，只补空缺 */
+    @Synchronized
     private fun migrateGroupState(oldKey: String, newKey: String) {
         if (oldKey.isEmpty() || newKey.isEmpty() || oldKey == newKey) return
         val rem = jsonMap(K_REMARKS)
@@ -688,6 +847,85 @@ class Prefs(ctx: Context) {
     /** 组内当前使用的地址（没记过就用组内第一条 / 上次选中的那条） */
     private fun groupCurMap(): MutableMap<String, String> = jsonMap(K_GROUP_CUR)
 
+    // ==================== 设备换局域网地址（一台设备只留一个局域网接入点）====================
+
+    /**
+     * 一台设备已经通过**新地址**连上了（[deviceId] = 对端身份，[newIp] = 本次握手用的地址）：
+     * 当前地址切到 [newIp]，同组其它**局域网 IPv4** 地址一并删掉。
+     *
+     * 口径（用户指定）：设备身份是 deviceId+token，IP 只是它当下的接入点；重启/换 WiFi 后 DHCP 换了 IP，
+     * 旧地址就该自动消失，不能留在列表里让人点到死地址。**手动添加的公网地址 / IPv6 全局地址不动**
+     * （它们不可能是 DHCP 换出来的那个，删了就是删用户自己的配置）。
+     *
+     * @param isConnected 该地址此刻是否还有健康会话（有就不删：绝不清理正在用的地址）
+     * @return true = 地址列表有变化（界面需要刷新）
+     */
+    @Synchronized
+    fun syncGroupLanIp(
+        deviceId: String,
+        newIp: String,
+        isConnected: (String) -> Boolean = { false }
+    ): Boolean {
+        val d = deviceId.trim()
+        val n = newIp.trim()
+        if (d.isEmpty() || n.isEmpty() || !isLanIpv4(n)) return false
+        // 身份还没落在这个地址上（同 IP 多设备时 bindDeviceIfFree 会拒绝抢绑）⇒ 什么都不做
+        if (convKeyOf(n) != d) return false
+        val rows = peers
+        val keys = rows.associate { it.ip to convKeyOf(it.ip) }
+        val drop = rows.filter { p ->
+            p.ip != n && keys[p.ip] == d && isLanIpv4(p.ip) && !isConnected(p.ip)
+        }.map { it.ip }
+        var changed = false
+        // 先把新地址登记上，再删旧地址：removePeer 在"组内一个地址都不剩"时会清掉「不再显示」标记，
+        // 顺序反了就会因为这个中间态把用户设置丢了
+        if (rows.none { it.ip == n }) {
+            // 只有握手/广播报过身份、列表里还没这行时才会走到这（例如直连中继/手工地址首次握手）
+            upsertPeer(n, lastId = d, seenAt = System.currentTimeMillis())
+            changed = true
+        }
+        for (ip in drop) if (removePeer(ip)) changed = true
+        // 组内"当前地址"只在它本来就是局域网地址（或还没记过）时才跟着迁移；
+        // 用户手动选的公网接入点是明确配置，不抢
+        val cur = groupCurMap()[d].orEmpty()
+        if (cur.isEmpty() || isLanIpv4(cur)) {
+            if (cur != n) {
+                setGroupCurIp(d, n)
+                changed = true
+            }
+        }
+        val sel = lastSelectedIp.trim()
+        if (sel.isEmpty() || sel in drop) {
+            lastSelectedIp = n
+            changed = true
+        }
+        if (changed) {
+            android.util.Log.i(
+                "PP-Prefs",
+                "设备换地址：$d 局域网地址 → $n（清掉 ${drop.size} 个旧地址${if (drop.isEmpty()) "" else "：" + drop.joinToString(",")}）"
+            )
+        }
+        return changed
+    }
+
+    /** 该设备组里最近出现过的**局域网 IPv4** 地址（重启/换 IP 后启动直连按它拨，不再拿旧地址白等 1s） */
+    fun freshestLanIpOf(key: String): String {
+        val k = key.trim()
+        if (k.isEmpty()) return ""
+        return peers
+            .filter { it.ip.isNotBlank() && isLanIpv4(it.ip) && convKeyOf(it.ip) == k }
+            .maxByOrNull { it.lastSeenAt }
+            ?.ip
+            .orEmpty()
+    }
+
+    /** 是不是「局域网 IPv4」地址（只有这类地址会被 DHCP 换掉、才按"一台设备一个"清理；公网 IP/IPv6 地址不动） */
+    fun isLanIpv4(s: String): Boolean {
+        val v = s.trim()
+        return v.isNotEmpty() && !v.contains(':') && com.phonepctransfer.util.LanGate.isLanPeerIp(v)
+    }
+
+    @Synchronized
     fun setGroupCurIp(key: String, ip: String) {
         val k = key.trim()
         if (k.isEmpty() || ip.isBlank()) return
@@ -815,6 +1053,7 @@ class Prefs(ctx: Context) {
         peers.firstOrNull { it.ip == ip.trim() }?.lastId?.trim().orEmpty()
 
     /** 切换某地址的活动设备（同 IP 多设备冲突：用户确认「断开之前的连接」后调用）：旧设备降为别名，新设备升为活动，旧组键上的本机状态搬到新组键；@return true = 切换成功 */
+    @Synchronized
     fun promoteDev(ip: String, deviceId: String): Boolean {
         val v = ip.trim()
         val d = deviceId.trim()
@@ -823,6 +1062,13 @@ class Prefs(ctx: Context) {
         val idx = cur.indexOfFirst { it.ip == v }
         if (idx < 0) return false
         val p = cur[idx]
+        // 目标身份必须「此刻还在」：别名行可能是对端换/重装前的旧 deviceId 残行，
+        // 把地址绑回一个不再存在的身份 ⇒ 这个地址之后连谁都对不上组键（用户视角＝"再也连不上"）
+        val seen = p.dev(d)?.seenAt ?: if (d == p.lastId.trim()) p.lastSeenAt else 0L
+        if (seen <= 0L || System.currentTimeMillis() - seen > DEV_ALIAS_SHOW_MS) {
+            android.util.Log.w("PP-Prefs", "切换设备被拒：$d 在 $v 上已超时未出现（残行不能抢绑定）")
+            return false
+        }
         // 组键必须在动绑定 / 动 peer.lastId **之前**取：convKeyOf 的兜底会读 peer.lastId
         val old = convKeyOf(v)
         if (d == old) {
@@ -875,6 +1121,7 @@ class Prefs(ctx: Context) {
     }
 
     /** 写「对某设备」的备注（组级），同组所有 peer 行一起同步 */
+    @Synchronized
     fun setGroupRemark(key: String, remark: String) {
         val k = key.trim()
         if (k.isEmpty()) return
@@ -920,6 +1167,7 @@ class Prefs(ctx: Context) {
         return -1
     }
 
+    @Synchronized
     private fun setRotOf(isRemote: Boolean, key: String, front: Boolean, deg: Int) {
         val k = key.trim()
         if (k.isEmpty()) return
@@ -955,6 +1203,7 @@ class Prefs(ctx: Context) {
     }
 
     /** 一次性播种：老数据（lastId / remark / 组当前地址）提升为组级字段（幂等） */
+    @Synchronized
     private fun seedIdentity() {
         val rows = peers
         if (rows.isEmpty()) return
@@ -1014,6 +1263,8 @@ class Prefs(ctx: Context) {
         const val K_TCP = "tcp_port2"
         const val K_UDP = "udp_port2"
         const val K_IPS = "peer_ips"
+        /** 数据记录的版本号（版本变化时据此询问是否清除软件数据，见 Prefs.dataVersion） */
+        const val K_DATA_VERSION = "data_version"
         const val K_PEERS = "peer_list"
         const val K_CLIP_SYNC_MODE = "clip_sync_mode"
         const val K_AUTO_SYNC = "auto_sync_on_send"
@@ -1062,3 +1313,4 @@ class Prefs(ctx: Context) {
         const val K_ROT_REMOTE_RESET_0922B = "video_rot_remote_reset_0922b"
     }
 }
+

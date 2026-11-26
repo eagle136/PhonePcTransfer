@@ -45,22 +45,38 @@
 
 ## 从源码构建
 
-```bash
-# Android（JDK 17+，Android SDK Platform 37）
-cd android && ./gradlew :app:assembleRelease
-# 产物：android/app/build/outputs/apk/release/app-release.apk
+版本号只在根目录 `var` 文件里维护，三个打包脚本都会自动按它打包：
+
+```ini
+VERSION=1.2.13
 ```
 
 ```bat
-:: PC（Windows + Git Bash + JDK 21 + WiX 3.11）
-build.bat
+:: PC 可运行 jar（JDK 17+）
+py build_jar.py
+
+:: PC MSI 安装包（Windows + Git Bash + JDK 21 + WiX 3.11，普通用户窗口运行）
+py build_msi.py
+
+:: Android APK（JDK 17+，Android SDK Platform 37）
+py build_apk.py
+py build_apk.py no-r8     :: 不打 R8 的真机回归包
 ```
+
+产物统一在 `out\`：`手机电脑互传-<版本号>.apk`、`手机电脑互传-<版本号>.msi`、`PhonePcTransfer-PC.jar`（同一份 jar 也会写到 `pc\dist\`，供 `pc\run.bat` 直接启动）。
+
+`build_apk.py` 的 APK 打包约定（2026-11-25 起）：
+
+- **强制离线**：Gradle 恒定带 `--offline`，只用本机已解压的发行版（`%USERPROFILE%\.gradle\wrapper\dists`）；
+  找不到就直接报错，不再回退 `gradlew.bat` 联网下载。首次请先正常联网构建一次，把依赖灌进缓存。
+- **temp 中转**：APK 先落到项目根 `temp\`，再从 `temp\` 移动到 `out\`。
+- **回收站收尾**：`temp\` 整个移入回收站（成功/失败都执行），比逐文件删除快得多，误删也能还原。
 
 ## 目录
 
 ```
 android/      Android 端（Kotlin + Jetpack Compose）
 pc/           PC 端（Java Swing + 系统托盘，零第三方运行时依赖）
-tools/        IP 库生成等辅助工具
+tools/        IP 库生成等辅助工具、MSI 打包内核（make-msi.sh）
 .github/      CI：推送 v* tag 自动构建两端并发布 Release
 ```

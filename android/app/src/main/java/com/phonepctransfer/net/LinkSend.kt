@@ -11,6 +11,7 @@ import com.phonepctransfer.data.Prefs
 import com.phonepctransfer.data.Status
 import com.phonepctransfer.data.TextUtil
 import com.phonepctransfer.util.Clip
+import com.phonepctransfer.util.BusyLock
 import com.phonepctransfer.util.FileIO
 import com.phonepctransfer.util.LanGate
 import org.json.JSONObject
@@ -27,18 +28,35 @@ import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
-import java.security.MessageDigest
+import java.nio.channels.FileChannel
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 
 
 import com.phonepctransfer.net.Link.Session
 
 // 发送管线(拆分自 Link.kt):文件夹/文件发送、断点续传协商、md5 核对、BlockReader;全部为 Link 扩展函数
+
+/**
+ * 一个分片帧里**最多能装多少载荷字节**。
+ *
+ * [Protocol.MAX_FRAME] 是整帧（4B 帧长字段的值 = 子类型 1B + midLen 1B + mid + seq 4B + 载荷）的上限，
+ * 不是载荷上限：帧头固定占 `6 + midLen` 字节（见 [Protocol.chunkHeader] 的 `(buf.size - 4) + len`）。
+ * 自适应顶档 8M 若原样当载荷发，8*1024*1024 + 6 + midLen 必然越界 → 抛「分片帧过大」→
+ * 发送线程 catch 后关会话 → 重连再爬档再炸（大文件永远传不完）。所以在发送侧按 mid 的真实
+ * UTF-8 长度让位，一帧正好卡在 MAX_FRAME 上，既不改协议常量也不降档。
+ */
+internal fun framePayloadCap(mid: String): Int =
+    Protocol.MAX_FRAME - 6 - mid.toByteArray(Charsets.UTF_8).size
+
+/** 单文件等对端 ack 的上限：超时只撤登记，不判失败、不出队（见 [scanAckTimeout]） */
+private const val ACK_WAIT_TIMEOUT_MS = 60_000L
 
 /**
  * 文件/文件夹发送的唯一入队口:把整段发送流程(数据流量确认+传输)丢进单线程队列 [Link.fileSendExec],
@@ -50,11 +68,14 @@ internal fun Link.enqueueFileSend(tag: String, task: () -> Unit) {
     if (depth > 0) log("$tag 已排队（前面还有 $depth 个在等）")
     try {
         fileSendExec.execute {
+            // 传输期持 CPU/WiFi 锁：息屏后 WiFi 进省电档会把发送窗口挂起，长传必断
+            BusyLock.begin("send")
             try {
                 task()
             } catch (t: Throwable) {
                 log("$tag 队列任务异常(${t.javaClass.simpleName}: ${t.message})")
             } finally {
+                BusyLock.end("send")
                 // 队列空了(最后一个任务跑完)就补跑一次超龄半成品回收(「取消帧丢失+会话一直不断」的孤儿条目不必等到下次启动)
                 if (fileSendQueueDepth() == 0) store?.purgeStalePartials(Link.PARTIAL_MAX_AGE_MS)
             }
@@ -77,9 +98,33 @@ internal fun Link.doSendFolder(
         treeUri: Uri, item: MsgItem, files: List<FileIO.TreeFile>, emptyDirs: List<String>,
         skipped: Int = 0
     ) {
-        // 开传前先入待发队列(防强杀):整目录发送成功后才移除,重启重连后自动补发;
-        // dirSendState 是内存态,重启后为空——成员凭各自半成品(partials)续传,已完整送达的成员会整文件重传一遍(对端生成重复副本,可手动删)
+        // 与 doSendFile 同理：排在队列里的补发任务要认取消墓碑，取消后不许再入账、再开传
+        if (isCanceled(item.mid)) {
+            log("文件夹 ${item.fileName} 已被取消，跳过后到的发送任务")
+            store?.removePending(item.mid)
+            return
+        }
+        // 开传前先入待发队列(防强杀):整目录发送成功后才移除,重启重连后自动补发。
+        // 补发时走「按清单逐个核对」:对端先回报已在盘上的成员(dir_have),本端只补缺的文件 ——
+        // 不再有半成品偏移/完成记号表,重启丢状态也不影响正确性(最多把没到的重发一遍)
+        // 已完整送达过(同一个 mid)就直接跳过:断链会同时触发「握手补发」和「原先在队列里的补发任务」,
+        // 前一趟跑成功时 inFlight 已摘下,后一趟会把整个目录再全量传一遍(实测每次断链多一整轮)
+        if (isFileDelivered(item.mid, item.peerIp)) {
+            log("文件夹 ${item.fileName} 本机已完整送达该设备，跳过重复发送")
+            store?.removePending(item.mid)
+            okUpdate(item.copy(progress = 100, status = Status.OK))
+            return
+        }
         queuePending(item)
+        // 单任务槽：本机正在收别的任务就排队等槽位（串行队列线程里等，安全）；等不到=被取消/已停止
+        if (!awaitTaskSlot(item.mid, item.peerIp, "send", item.fileName) { isCanceled(item.mid) }) return
+        // 对端在传别的任务（busy 早于本任务入队）：直接留待发队列，等对端释放槽位的 sync_req
+        if (consumePeerBusy(item.mid)) {
+            okUpdate(item.copy(status = Status.PENDING))
+            releaseTask(item.mid)
+            log("对端设备忙，文件夹 ${item.fileName} 已排队，等对端空闲后自动补发")
+            return
+        }
         if (!inFlight.add(item.mid)) {
             return
         }
@@ -90,6 +135,8 @@ internal fun Link.doSendFolder(
             inFlight.remove(item.mid)
             inFlightPeer.remove(item.mid)
             dirMissingBox.remove(item.mid)
+            // 文件夹任务结束（成功/失败/取消/忙）/释放单任务槽，并让对端把被拦下的待发条目重试一次
+            releaseTask(item.mid)
         }
     }
 
@@ -104,7 +151,7 @@ internal fun Link.doSendFolderInner(
     ) {
         val s = sessionForPending(item.peerIp)
         if (s == null) {
-            setFileVote(Link.VOTE_NO_NETWORK, true)   // 2.12 / D16：文件夹同一条口径（"原本没网络"票）
+            setFileVote(Link.VOTE_NO_NETWORK, true, item.peerIp)   // 2.12 / D16：文件夹同一条口径（"原本没网络"票）
             queuePending(item)
             return
         }
@@ -112,45 +159,83 @@ internal fun Link.doSendFolderInner(
             cancelled.remove(item.mid)
             return
         }
+        // 对端在传别的任务：dir_meta 刚发出去就会被回 busy；先看一眼记号，别白推一轮
+        if (consumePeerBusy(item.mid)) {
+            okUpdate(item.copy(status = Status.PENDING))
+            log("对端设备忙，文件夹 ${item.fileName} 已排队（等对端空闲后自动整目录补发）")
+            return
+        }
         // 只有对端也支持（hello dl=1）才启用清单/收尾/核对；老端保持原行为，不引入未知帧
         val verifyPeer = s.caps.dl
         val relPaths = files.map { it.relPath }
         val wireList =
             if (verifyPeer && relPaths.isNotEmpty() && wireListFits(relPaths)) relPaths else emptyList()
+        // 清单带大小：与 list 逐项对应，接收端按清单存放并核对每个成员的字节数
+        val wireSizes = if (wireList.isNotEmpty()) files.map { it.size } else emptyList()
         if (verifyPeer && wireList.isEmpty() && relPaths.isNotEmpty()) {
             log("成员清单过长（${relPaths.size} 项），本次改用「按数量核对」完整性")
         }
+        // 空文件夹一律忽略、不记清单：dir_meta 里的 dirs 恒为空（双端统一规则）
+        val emptyDirsWire = emptyList<String>()
+        // ⚠ 信箱**必须先登记再发送**：对端收到 dir_meta 后会立刻回 dir_have，
+        //   先 send 后登记会与这条回执赛跑 —— 回执投进还不存在的信箱被丢掉，本端白等 1s、整目录重传
+        val haveBox: java.util.concurrent.ArrayBlockingQueue<List<String>>? =
+            if (verifyPeer) java.util.concurrent.ArrayBlockingQueue<List<String>>(1) else null
+        if (haveBox != null) dirHaveBox[item.mid] = haveBox
         try {
             s.send(
                 Protocol.dirMeta(
-                    item.mid, item.fileName, files.size, item.fileSize, emptyDirs, wireList, skipped
+                    item.mid, item.fileName, files.size, item.fileSize, emptyDirsWire, wireList, skipped, wireSizes
                 )
             )
+        } catch (e: Throwable) {
+            // 发送失败：信箱立刻撤掉，别留一个永不投递的空信箱
+            if (haveBox != null) dirHaveBox.remove(item.mid)
+            throw e
+        }
+        try {
             val agg = DirProgress(this, item, item.fileSize)
-            val state = dirSendState.getOrPut(item.mid) { ConcurrentHashMap() }
+            // 对端「已经在盘上」的成员：断链重连后对端会在 dir_meta 之后立刻回报，跳过它们只补缺的
+            val already: Set<String> = if (haveBox != null) {
+                try {
+                    haveBox.poll(DIR_HAVE_WAIT_MS, TimeUnit.MILLISECONDS)?.toSet() ?: emptySet()
+                } catch (e: InterruptedException) {
+                    emptySet()
+                } finally {
+                    dirHaveBox.remove(item.mid)
+                }
+            } else emptySet()
+            if (already.isNotEmpty()) {
+                log("对端已有 ${already.size} 个成员，本次跳过，只补缺的（${item.fileName}）")
+            }
             // 本地不可读而跳过的成员（本地问题，补发也无用 —— 最后如实汇报）
             val unreadable = ArrayList<String>()
             var pendingSet = files
             var round = 0
             var peerMissing: List<String> = emptyList()
             var peerAllOk = true
+            var unconfirmed = false
             while (true) {
                 for (f in pendingSet) {
                     if (cancelled.contains(item.mid)) {
                         cancelled.remove(item.mid)
-                        // 防竞态残留：cancelFile 已 remove 后，成员完成钩子 getOrPut 可能重建 map
-                        dirSendState.remove(item.mid)
+                        clearMemberAcks(item.mid)
                         log("文件夹发送已取消 ${item.fileName}（已发 ${files.size - pendingSet.size}/${files.size}）")
                         return
                     }
-                    // 2.12 / D16：投票 = 1 ⇒ 在成员边界结束整目录这次尝试;
-                    // 不清 dirSendState:已完成成员的记号要留着,拦截解除后整目录续发时跳过它们
-                    if (fileGateBlocked()) {
+                    // 2.12 / D16：投票 = 1 ⇒ 在成员边界结束整目录这次尝试
+                    if (fileGateBlocked(item.peerIp)) {
                         pauseInFlight(item, "", null)
                         return
                     }
-                    if (state[f.relPath] == true) {
-                        // 重发时跳过已完成的成员（进度也要补上）
+                    // 对端被别的任务占着（dir_meta 回的 busy 在本轮途中才到）：整轮中止，条目留待发队列
+                    if (consumePeerBusy(item.mid)) {
+                        okUpdate(item.copy(status = Status.PENDING))
+                        log("对端设备忙，文件夹 ${item.fileName} 中止本轮（等对端空闲后自动整目录补发）")
+                        return
+                    }
+                    if (f.relPath in already) {
+                        // 对端已在盘上：不传，进度按已收补上
                         agg.add(f.size.coerceAtLeast(0))
                         continue
                     }
@@ -166,6 +251,11 @@ internal fun Link.doSendFolderInner(
                         // 本地读不了(文件已删/无权限/SAF 授权失效):只跳过这一个成员继续发其余(老逻辑会让整目录就此停摆)
                         unreadable.add(f.relPath)
                         log("成员本地不可读，跳过继续：${f.relPath}（${e.message}）")
+                    } catch (b: BusyError) {
+                        // 对端设备忙（成员 file_meta 被回 busy）：整轮中止，等对端释放槽位的 sync_req 再整目录补发
+                        okUpdate(item.copy(status = Status.PENDING))
+                        log("对端设备忙，文件夹 ${item.fileName} 中止本轮（等对端空闲后自动整目录补发）")
+                        return
                     }
                 }
                 if (!verifyPeer) break
@@ -180,8 +270,10 @@ internal fun Link.doSendFolderInner(
                     null
                 }
                 if (resp == null) {
-                    log("对端未在 ${DIR_MISSING_WAIT_MS / 1000}s 内回报文件夹核对结果，按已发送处理")
-                    peerAllOk = unreadable.isEmpty()
+                    // 无回执 ≠ 收齐：绝不默认成功。条目留在待发台账，下次握手可再核对/补发
+                    log("对端未在 ${DIR_MISSING_WAIT_MS / 1000}s 内回报文件夹核对结果，无法确认收齐，按失败处理（条目留在待发队列）")
+                    peerAllOk = false
+                    unconfirmed = true
                     break
                 }
                 if (resp.isEmpty()) break          // 空清单 = 对端确认收齐
@@ -206,10 +298,13 @@ internal fun Link.doSendFolderInner(
             if (bad.isEmpty() && peerAllOk) {
                 okUpdate(item.copy(progress = 100, status = Status.OK))
                 store?.removePending(item.mid)
+                // 落送达台账:断链后残留的补发任务凭这条记录直接出队,不再整目录重传(见 doSendFolder 入口)
+                markFileDelivered(item.mid, item.peerIp)
                 log("文件夹发送完成 ${item.fileName}（${files.size} 个文件，${TextUtil.humanSize(item.fileSize)}）")
             } else {
                 okUpdate(item.copy(status = Status.FAILED))
-                store?.removePending(item.mid)
+                // 对端未回报（无法确认）时保留待发台账，让下次握手有机会再核对；明确失败才出队
+                if (!unconfirmed) store?.removePending(item.mid)
                 val head = bad.take(20).joinToString(", ")
                 val tail = if (bad.size > 20) " …（略）" else ""
                 log(
@@ -218,16 +313,18 @@ internal fun Link.doSendFolderInner(
                         (if (unreadable.isNotEmpty()) "（其中 ${unreadable.size} 个本地不可读，请检查文件是否已被删除/授权是否失效）" else "")
                 )
             }
-            // 整目录收尾:同步丢掉本 mid 的发送状态表(防 dirSendState 无界增长)
-            dirSendState.remove(item.mid)
+            // 整目录收尾
+            dirHaveBox.remove(item.mid)
+            clearMemberAcks(item.mid)
         } catch (t: Throwable) {
             if (cancelled.contains(item.mid)) {
                 cancelled.remove(item.mid)
                 log("文件夹发送已取消 ${item.fileName}")
                 return
             }
-            // 失败收尾：同样丢掉状态表（重发走待发队列整目录补发，不依赖 entry 残留）
-            dirSendState.remove(item.mid)
+            // 失败收尾：重发走待发队列整目录补发，缺哪些由对端清单对账决定
+            dirHaveBox.remove(item.mid)
+            clearMemberAcks(item.mid)
             log("文件夹发送失败(${t.javaClass.simpleName}: ${t.message})")
             okUpdate(item.copy(status = Status.FAILED))
         } finally {
@@ -261,7 +358,9 @@ internal class DirProgress(private val link: Link, private val item: MsgItem, pr
      * >0 = 对端已有这么多字节(按分片边界对齐后从这里续);0 = 没有半成品(从头发);
      * -1 = 没发出问题或 3s 没收到应答 ⇒ 调用方保持暂停,不许退化成从头重发
      */
-internal fun Link.negotiateResume(s: Session, mid: String, name: String, size: Long): Long {
+internal fun Link.negotiateResume(
+        s: Session, mid: String, name: String, size: Long, uri: Uri? = null
+    ): Long {
         val q = java.util.concurrent.ArrayBlockingQueue<Long>(1)
         resumeWaiters[mid] = q
         try {
@@ -271,11 +370,62 @@ internal fun Link.negotiateResume(s: Session, mid: String, name: String, size: L
             val off = q.poll(3000, TimeUnit.MILLISECONDS)
             if (off == null) return -1L
             if (off <= 0L) return 0L
-            return if (off == size) off else off - (off % Protocol.CHUNK_SIZE)
+            // 自适应帧之后落盘是「按帧顺序追加」，偏移可以是任意值，不必再向下对齐到 4MB
+            var o = if (off > size) size else off
+            // 大小校验：接收端说半成品需要按块核对 → 请它按 32MB 块核对前缀大小，
+            // 回来的核验偏移就是重发起点（比「从 0 重传」省，比「信任裸偏移」稳；不做 hash）
+            if (resumeNeedBlk[mid] == true && o > 0L) {
+                o = verifyPrefixBlocks(s, mid, size, o)
+            }
+            return o
         } catch (t: Throwable) {
             return -1L
         } finally {
             resumeWaiters.remove(mid)
+            resumeNeedBlk.remove(mid)
+        }
+    }
+
+    /**
+     * 发送端前缀大小校验（不做 hash）：请接收端按 32MB 块核对 [0, offset) 是否都在盘上，
+     * 接收端截断到最后一个完整块边界、建好续传通道后回 blk_ack（带实际核验偏移），本端从该点续发。
+     * 单块超时 10s（总预算 = 块数 × 10s）；超时/失败退回从头重发
+     * （补发 blk_verify{0} 让接收端清掉半成品，避免与续传通道错位）。
+     */
+internal fun Link.verifyPrefixBlocks(
+        s: Session, mid: String, size: Long, offset: Long
+    ): Long {
+        val aq = java.util.concurrent.ArrayBlockingQueue<Link.BlkAckResult>(1)
+        blkAckWaiters[mid] = aq
+        try {
+            if (!sendOrDrop(s, Protocol.blkVerify(mid, offset), "blk_verify", quiet = true)) {
+                return 0L
+            }
+            val blocks = ((offset + Protocol.BLOCK_SIZE - 1) / Protocol.BLOCK_SIZE).coerceAtLeast(1L)
+            val budgetMs = blocks * 10_000L   // 单块超时 10s
+            val r = aq.poll(budgetMs, TimeUnit.MILLISECONDS)
+            if (r == null) {
+                log("大小校验：${budgetMs / 1000}s 没等到对端核验结果（mid=$mid），改从头重发")
+                runCatching { sendOrDrop(s, Protocol.blkVerify(mid, 0L), "blk_verify", quiet = true) }
+                return 0L
+            }
+            if (!r.ok) {
+                log("大小校验：对端无法截断半成品，改从头重发")
+                return 0L
+            }
+            val target = r.offset.coerceIn(0L, offset)
+            if (target != offset) {
+                log("大小校验：对端盘上字节不足，退到最后一个完整块边界 ${TextUtil.humanSize(target)} 续传")
+            }
+            log("大小校验完成（$blocks 块 × 32MB），从 ${TextUtil.humanSize(target)} 续传 ${TextUtil.humanSize(size)}")
+            return target
+        } catch (t: Throwable) {
+            // 异常同样不能沿用偏移：接收端没建好续传通道，按 offset 推流会错位
+            log("大小校验异常（${t.message}），改从头重发")
+            runCatching { sendOrDrop(s, Protocol.blkVerify(mid, 0L), "blk_verify", quiet = true) }
+            return 0L
+        } finally {
+            blkAckWaiters.remove(mid)
         }
     }
 
@@ -294,45 +444,32 @@ internal fun Link.pauseInFlight(
         )
     }
 
-    // ==================== 续传完成 MD5 核对（端到端） ====================
-
-    /** 一次续传核对的会话状态：两端 MD5 各自后台算，谁先就绪都不阻塞 */
-internal class VerifyState(val mid: String, val item: MsgItem) {
-        @Volatile var myMd5: String? = null
-        @Volatile var peerMd5: String? = null
-        @Volatile var finished = false
-    }
-
-    /** 流式计算 MD5（十六进制小写）；流打不开/读失败返回空串 */
-internal fun Link.md5Of(ins: InputStream?): String {
-        if (ins == null) return ""
-        return try {
-            val d = MessageDigest.getInstance("MD5")
-            val buf = ByteArray(1 shl 16)
-            ins.use { s ->
-                while (true) {
-                    val n = s.read(buf)
-                    if (n <= 0) break
-                    d.update(buf, 0, n)
-                }
-            }
-            hex(d.digest())
-        } catch (t: Throwable) {
-            ""
+    /** 对端设备忙（单任务槽被占）：单文件回待发队列；文件夹成员抛 [BusyError] 让目录整轮中止 */
+internal fun Link.pauseForPeerBusy(item: MsgItem, dirId: String, agg: DirProgress?) {
+        if (dirId.isEmpty() && agg == null) {
+            queuePending(item)
+            okUpdate(item.copy(status = Status.PENDING))
+            log("对端设备忙：文件 ${item.fileName} 停止推送，留在待发队列等对端空闲")
+        } else {
+            throw BusyError("对端设备忙，本轮文件夹发送中止")
         }
     }
 
+    // ==================== 续传完成大小核对（端到端，不做 hash） ====================
+
+    /** 一次续传核对的会话状态：本端大小即清单声明值（已知），等对端回发落盘字节数 */
+internal class VerifyState(val mid: String, val item: MsgItem) {
+        @Volatile var peerSize: Long = -1L
+        @Volatile var finished = false
+    }
+
     /**
-     * 发送端:续传文件发完后启动核对——后台算源文件 MD5,等对端回发落盘文件 MD5 比对;
-     * 超时(对端没回发/任一方没算完)只记日志跳过,绝不阻塞、不改传输状态
+     * 发送端:续传文件发完后启动核对——等对端回发落盘文件字节数,与清单声明大小比对;
+     * 整文件按一个验证单元计,10s 超时(对端没回发)只记日志跳过,绝不阻塞、不改传输状态
      */
 internal fun Link.startVerifyWatch(item: MsgItem, resumedFrom: Long) {
         val st = VerifyState(item.mid, item)
         if (verifyMap.putIfAbsent(item.mid, st) != null) return
-        Thread({
-            st.myMd5 = md5Of(openSource(Uri.parse(item.filePath)))
-            compareVerify(st)
-        }, "pp-tx-md5").apply { isDaemon = true }.start()
         Thread({
             try {
                 Thread.sleep(verifyTimeoutMs)
@@ -341,52 +478,59 @@ internal fun Link.startVerifyWatch(item: MsgItem, resumedFrom: Long) {
             if (!st.finished) {
                 st.finished = true
                 verifyMap.remove(item.mid)
-                log("MD5 核对超时 ${item.fileName}（对端未回发或双方未算完，自 ${resumedFrom} B 续传），跳过")
+                log("大小核对超时 ${item.fileName}（对端未回发落盘字节数，自 ${resumedFrom} B 续传），跳过")
             }
         }, "pp-verify-timeout").apply { isDaemon = true }.start()
-        log("续传文件发送完成，等待对端 MD5 核对 ${item.fileName}（自 ${TextUtil.humanSize(resumedFrom)} 起）")
+        log("续传文件发送完成，等待对端大小核对 ${item.fileName}（自 ${TextUtil.humanSize(resumedFrom)} 起）")
     }
 
-    /** 接收端回发的落盘 MD5 到了 → 尝试比对 */
+    /** 接收端回发的落盘字节数到了 → 与清单声明大小比对 */
 internal fun Link.onFileVerify(j: JSONObject) {
         val mid = j.optString("mid")
         val st = verifyMap[mid]
         if (st == null) {
-            log("收到 MD5 核对帧但无在途核对（mid=$mid 已超时/非续传/旧版本对端），忽略")
+            log("收到大小核对帧但无在途核对（mid=$mid 已超时/非续传/旧版本对端），忽略")
             return
         }
-        st.peerMd5 = j.optString("md5")
+        st.peerSize = j.optLong("size", -1L)
         compareVerify(st)
     }
 
-    /** 双方 MD5 都就绪才比对；比对一次性收尾（finished 原子防重入） */
+    /** 核对一次性收尾（finished 原子防重入）；大小不符 → 气泡标失败提醒用户重传 */
 internal fun Link.compareVerify(st: VerifyState) {
         synchronized(st) {
-            val mine = st.myMd5
-            val peer = st.peerMd5
-            if (st.finished || mine.isNullOrEmpty() || peer.isNullOrEmpty()) return
+            val peer = st.peerSize
+            if (st.finished || peer < 0L) return
             st.finished = true
             verifyMap.remove(st.mid)
-            if (mine.equals(peer, ignoreCase = true)) {
-                log("MD5 核对一致 ${st.item.fileName}（$mine）")
+            val mine = st.item.fileSize
+            if (mine <= 0L) {
+                log("大小核对 ${st.item.fileName}：对端落盘 $peer B（清单大小未知，跳过比对）")
+            } else if (peer == mine) {
+                log("大小核对一致 ${st.item.fileName}（$peer B）")
             } else {
-                log("MD5 核对不一致 ${st.item.fileName}：本地 $mine / 对端落盘 $peer")
+                log("大小核对不一致 ${st.item.fileName}：清单 $mine B / 对端落盘 $peer B")
                 // 气泡标失败提醒用户重传；接收端文件已在，是否删除由用户决定
                 okUpdate(st.item.copy(status = Status.FAILED))
             }
         }
     }
 
-    /** 读源文件前 offset 字节只做摘要(续传时补齐整文件 sha256 的前缀段),不发送;读失败返回 false,调用方改从头传 */
-internal fun Link.digestPrefix(ins: InputStream, len: Long, digest: MessageDigest): Boolean {
+    /** 续传时把源流推进到 offset（只跳过、不算摘要）；读失败返回 false,调用方改从头传 */
+internal fun Link.skipPrefix(ins: InputStream, len: Long): Boolean {
         return try {
             val buf = ByteArray(1 shl 16)
             var left = len
             while (left > 0) {
-                val n = ins.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
-                if (n <= 0) return false
-                digest.update(buf, 0, n)
-                left -= n
+                val n = ins.skip(left)
+                if (n > 0) {
+                    left -= n
+                } else {
+                    // 部分提供器不支持 skip：退化为读弃
+                    val r = ins.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                    if (r <= 0) return false
+                    left -= r
+                }
             }
             true
         } catch (t: Throwable) {
@@ -409,8 +553,13 @@ internal fun Link.digestPrefix(ins: InputStream, len: Long, digest: MessageDiges
     /** 在途发送的 mid → 最近一次写出新字节的时刻（发送停滞看门狗用） */
     internal val sendLastAt = ConcurrentHashMap<String, Long>()
 
-    /** 一次「字节已写出、等对端回报落盘」的登记：气泡快照 + 当时用的对端地址 */
-    internal class AckWait(internal val item: MsgItem, internal val peerIp: String)
+    /** 一次「字节已写出、等对端回报落盘」的登记：气泡快照 + 当时用的对端地址 + 登记时刻 */
+    internal class AckWait(
+        internal val item: MsgItem,
+        internal val peerIp: String,
+        /** 登记时刻：60s 没回执由 [scanAckTimeout] 撤登记（只清表，不动气泡/待发队列） */
+        internal val at: Long = System.currentTimeMillis()
+    )
 
     /**
      * 已把全部分片和 `file_done` 写出、但**对端还没回报落盘结果**的普通单文件:mid → 登记。
@@ -481,8 +630,60 @@ internal fun Link.onSendAck(mid: String, ok: Boolean): Boolean {
         }
         store?.removePending(mid)
         markFileDelivered(mid, w.peerIp)
+        // 成功气泡由这里落：收尾时若回执已经抢跑就不再写 OK（防把失败态盖回去），
+        // 所以这条路径必须补上，否则气泡会永远停在「发送中」
+        okUpdate(w.item.copy(progress = 100, status = Status.OK))
         log("对端已确认落盘 ${w.item.fileName}，出待发队列")
         return true
+    }
+
+    /**
+     * 普通单文件收尾：**先登记回执 → 再发 `file_done` → 按「是否还在等」写气泡**。
+     *
+     * 顺序颠倒就会漏回执：局域网 RTT(0.2~1ms) 远小于一次「写历史」的磁盘耗时，
+     * 对端 ok 回执常早于登记到达 → [onSendAck] 查不到条目（ok=true 直接 return false）→
+     * `removePending`/`markFileDelivered` 全都不执行：文件永久留守待发队列，每次重连多一轮 file_query。
+     * 另外 ack(false) 抢跑时 [onSendAck] 已把气泡改成失败并摘掉登记，这里再无条件写 OK 会把它盖回去。
+     */
+    internal fun Link.finishSingleSend(s: Session, item: MsgItem, sha: String, offset: Long) {
+        if (rejectedAck.remove(item.mid)) {
+            // 对端在推字节期间就回绝了（建接收通道失败：目录不可写/磁盘满）：不再发 file_done、也不登记
+            endSpeed(item.mid)
+            okUpdate(item.copy(progress = 100, status = Status.FAILED))
+            log("文件 ${item.fileName} 对端提前拒收，留在待发队列等补发")
+            return
+        }
+        awaitingAck[item.mid] = AckWait(item, s.remoteIp)   // ① 先登记，防 ack 抢跑
+        s.send(Protocol.fileDone(item.mid, sha))            // ② 再发
+        endSpeed(item.mid)
+        // ③ 还没收到回执 → 停在「已推完、待确认」，绝不提前写成功（P2-2）：
+        //    之前这里直接写 OK，ack(false) 到达才变红，用户先看到一次假的"已发送"
+        if (awaitingAck.containsKey(item.mid)) {
+            okUpdate(item.copy(progress = 100, status = Status.SENDING))
+        }
+        log("文件发送完成 ${item.fileName} ${TextUtil.humanSize(item.fileSize)}，等对端回报落盘")
+        // 触发过续传 → 等对端回发 MD5 做端到端核对（异步，不阻塞发送线程）
+        if (offset > 0) {
+            startVerifyWatch(item, offset)
+        }
+    }
+
+    /**
+     * 回执看门狗（心跳每 5s 调度）：登记超过 [ACK_WAIT_TIMEOUT_MS] 还没等到 ack 就撤掉登记。
+     * **只清表**：不改气泡（对端若是不回 ack 的老构建，保持原来的「已发送」表现），
+     * 也不出待发队列 —— 下次握手 `file_query` 一问（offset==size）就会补 ack 自愈。
+     */
+    internal fun Link.scanAckTimeout() {
+        if (awaitingAck.isEmpty()) return
+        val now = System.currentTimeMillis()
+        for ((mid, w) in awaitingAck) {
+            if (now - w.at < ACK_WAIT_TIMEOUT_MS) continue
+            if (awaitingAck.remove(mid, w)) {
+                // P2-2：超时**不再改气泡**（对端可能确实没存好，写成功就是假成功）；
+                // 气泡保持「发送中」，条目留待发台账，下次握手 file_query 一问（offset==size）补 ack 自愈
+                log("等对端落盘回执超时 ${w.item.fileName}（mid=$mid），气泡保持发送中，条目留待发台账等下次握手核对")
+            }
+        }
     }
 
     /**
@@ -497,6 +698,14 @@ internal fun Link.doSendFile(
         agg: DirProgress? = null,
         throwOnFail: Boolean = false
     ) {
+        // 队列里排着的任务（多为 syncNow→flushPendingNow 产生的「待发补发」）可能在用户取消之后才轮到：
+        // 取消墓碑命中就直接跳过，**不再入待发台账、不再开传**。曾经这里漏判 ⇒ 取消完过几秒
+        // 同一个 mid 又被重发一遍：对端冒出气泡继续收，本端气泡已删除、看不到进度。
+        if (isCanceled(item.mid, dirId)) {
+            log("文件 ${item.fileName} 已被取消，跳过后到的发送任务")
+            store?.removePending(item.mid)
+            return
+        }
         // 只有「普通单文件」由这里管待发队列；文件夹整体由 doSendFolder 管，成员不管
         if (dirId.isEmpty() && agg == null) {
             // 重复投递闸门(判据见 [isFileDelivered]):这条已经完整送达过,
@@ -509,6 +718,18 @@ internal fun Link.doSendFile(
                 return
             }
             queuePending(item)
+        }
+        // 单文件任务自己占槽（文件夹成员不算，槽归整目录任务）
+        val ownSlot = dirId.isEmpty() && agg == null
+        if (ownSlot) {
+            // 本机正在收别的任务就排队等槽位（串行队列线程里等，安全）；等不到=被取消/已停止
+            if (!awaitTaskSlot(item.mid, item.peerIp, "send", item.fileName) { isCanceled(item.mid) }) return
+            if (consumePeerBusy(item.mid)) {
+                okUpdate(item.copy(status = Status.PENDING))
+                releaseTask(item.mid)
+                log("对端设备忙，文件 ${item.fileName} 已排队，等对端空闲后自动补发")
+                return
+            }
         }
         if (!inFlight.add(item.mid)) {
             return  // 已有同 mid 在途（握手补发撞上在途传输），让在途的那个继续
@@ -523,6 +744,7 @@ internal fun Link.doSendFile(
             // 速率采样器统一收尾:一处覆盖 取消/失败/成功(含文件夹成员),
             // 成功路径里那次 endSpeed 只是提前收尾,这里重入幂等
             endSpeed(item.mid)
+            if (ownSlot) releaseTask(item.mid)
         }
     }
 
@@ -543,6 +765,12 @@ internal fun Link.scanStalledSends() {
         for (ip in staleIps) {
             val s = sessionByGroup(ip) ?: continue
             if (s.closed) continue
+            // 反向仍有收包 = 对端活着、只是读得慢（它在落盘/在忙别的任务）：这是单向背压，不是死链。
+            // 只让自适应帧降速，绝不关会话 —— 关掉会把同一条链路上正在跑的反向传输一起带走。
+            if (now - s.lastRx < Link.STALL_TIMEOUT_MS) {
+                log("发送停滞 ${Link.STALL_TIMEOUT_MS / 1000}s 但反向仍有收包（$ip），按对端背压处理，不关会话")
+                continue
+            }
             log("发送停滞 30s（$ip），关会话解阻塞；重连后自动续传")
             dropSession(s)
         }
@@ -556,11 +784,13 @@ internal fun Link.doSendFileInner(
         agg: DirProgress? = null,
         throwOnFail: Boolean = false
     ) {
+        // 首块计时起点：用来定位「链路已就绪」到「第一块数据真正出网」之间的空转
+        val tTask = System.currentTimeMillis()
         // 目的会话按条目自带的 peerIp 解析 —— 会话中途切换对话设备也不会发错人
         val s = sessionForPending(item.peerIp)
         if (s == null) {
             if (throwOnFail) throw java.io.IOException("未连接")
-            setFileVote(Link.VOTE_NO_NETWORK, true)   // 2.12 / D16：这就是"原本没网络"那一票
+            setFileVote(Link.VOTE_NO_NETWORK, true, item.peerIp)   // 2.12 / D16：这就是"原本没网络"那一票
             queuePending(item)
             return
         }
@@ -572,10 +802,20 @@ internal fun Link.doSendFileInner(
             val mime = FileIO.mimeOf(item.fileName)
             // 上一趟留下的「拒收」记号与本趟无关，先清掉
             rejectedAck.remove(item.mid)
-            // ① 断点续传协商：问对端「这条收到哪了」；普通单文件顺带就是重发前的送达询问
+            // 对端在传别的任务（busy 早于本任务开传）：单文件留待发队列；文件夹成员抛 BusyError 让目录整轮中止
+            if (consumePeerBusy(item.mid)) {
+                pauseForPeerBusy(item, dirId, agg)
+                return
+            }
+            // ① 断点续传协商：只给「普通单文件」用。文件夹成员一律从 0 整文件发 ——
+            //   局域网下按文件粒度补发足够快，不做半成品偏移，省掉每成员一次往返和一堆对账代码
             var offset = 0L
-            if (item.fileSize > 0) {
-                offset = negotiateResume(s, item.mid, item.fileName, item.fileSize)
+            if (item.fileSize > 0 && dirId.isEmpty() && agg == null) {
+                offset = negotiateResume(s, item.mid, item.fileName, item.fileSize, uri)
+                log(
+                    "[首块计时] ${item.fileName} 续传协商 ${System.currentTimeMillis() - tTask}ms" +
+                        " → offset=$offset（负数=无应答，将暂停）"
+                )
                 if (offset < 0L) {
                     // 2.12 / D16：这一趟的续传请求**没发出去或 3s 没应答** ⇒ 保持暂停，
                     // 绝不退化成从头重发（用户："对方收到了就继续传输，没收到就暂停，手动点继续才重试"）
@@ -596,33 +836,51 @@ internal fun Link.doSendFileInner(
                     log("断点续传 ${item.fileName}：对端已有 ${TextUtil.humanSize(offset)}，校验后续传")
                 }
             }
-            // 整文件 SHA-256 只服务「续传后复核」（设计口径）：一次性传完不再对每个字节做摘要。
-            // offset 只在续传协商命中时才 > 0，所以这里按它决定要不要开摘要器。
-            val digest = if (offset > 0) MessageDigest.getInstance("SHA-256") else null
+            // 校验口径：只核对大小，不做 hash。续传前缀由 32MB 分块大小校验负责，
+            // 正常传输收尾核对「磁盘字节数 == 实收 == 声明」，续传完成后再由 file_verify(size) 端到端核对。
+            // ①-a 多通道分支已停用（回到单连接：第二条 TCP 连接在千兆局域网无实测收益，
+            //   却多一条独立断链路径，且要求 4MB 单元的窗口重排）。保留 doSendUnitized 代码但不再调用。
+            // ①-b 零拷贝分支（P1-4）：非续传 + 源可 seek → 每块 transferTo 直送 socket，数据不进用户态内存。
+            // 续传需先把源流推进到 offset，走下面的流式路径；不可 seek 的源（云盘虚拟文档等）同样回落。
+            if (Link.ZC_SEND && offset == 0L && item.fileSize > 0) {
+                val zc = FileIO.openSourceChannel(ctx, uri)
+                if (zc != null) {
+                    try {
+                        log("零拷贝发送 ${item.fileName}（${TextUtil.humanSize(item.fileSize)}）" +
+                            "｜入队到首块 ${System.currentTimeMillis() - tTask}ms")
+                        doSendFileZeroCopy(s, item, zc.channel, mime, relPath, dirId, agg)
+                        return
+                    } finally {
+                        runCatching { zc.close() }
+                    }
+                }
+            }
             var ins: InputStream? = openSource(uri)
             // ⚠ 本地源打不开(SAF / 第三方 FileProvider 授权失效、文件已被删)**不是**网络故障:
             //   必须抛 SourceError。抛 IOException 会被下面的通用 catch 当成链路故障 → 关掉整条会话 → 双方保活重连 →
             //   握手补发同一条 → 又打不开 → 再关,形成「连上就断」死循环(真机实测:批量发文件时只要有一个 URI 失效,整批陷入 5s 一断的重连风暴)
             if (ins == null) throw SourceError("打不开源文件: $uri")
             if (offset > 0) {
-                // ② 前缀摘要（顺带把流推进到 offset，之后直接续着读，不用 reopen）
-                if (!digestPrefix(ins, offset, digest!!)) {
+                // ② 把源流推进到 offset（只跳过、不算摘要），之后直接续着读，不用 reopen
+                if (!skipPrefix(ins, offset)) {
                     offset = 0
-                    digest.reset()
-                    log("前缀读取失败，改从头发送 ${item.fileName}")
+                    log("前缀跳过失败，改从头发送 ${item.fileName}")
                     runCatching { ins.close() }
                     ins = openSource(uri)
                     if (ins == null) throw SourceError("打不开源文件: $uri")
                 }
             }
             ins.use { stream ->
-                // ③ 双 4MB 缓冲交替读源（后台线程读盘，与网络发送重叠），1MB 二进制分片发出
+                // ③ 双 8MB 缓冲交替读源（后台线程读盘，与网络发送重叠），分片长度由自适应帧决定
                 s.send(
                     Protocol.fileMeta(item.mid, item.fileName, item.fileSize, mime, "", offset, relPath, dirId)
                 )
                 val reader = BlockReader(stream, Protocol.RX_BUF_SIZE)
+                // 自适应帧：1M 起步，0.5s 一评估，抖了降两档，顶档 8M（见 AdaptiveFrame）
+                val frame = AdaptiveFrame(item.fileName)
                 try {
-                    var seq = (offset / Protocol.CHUNK_SIZE).toInt()
+                    // 帧序号只用于接收端按序校验，与文件偏移无关，续传也从 0 起
+                    var seq = 0
                     var sent = offset
                     var lastPct = -1
                     while (true) {
@@ -644,13 +902,29 @@ internal fun Link.doSendFileInner(
                             }
                             // 2.12 / D16：在传的遇到投票 = 1 ⇒ 在下一个分片边界就地结束本次尝试
                             //（不劈开已入队的字节、不进 cancelled，条目回待发台账等拦截解除自动续发一次）
-                            if (fileGateBlocked()) {
+                            if (fileGateBlocked(item.peerIp)) {
                                 pauseInFlight(item, dirId, agg)
                                 return
                             }
-                            val len = minOf(Protocol.CHUNK_SIZE, n - off)
+                            if (rejectedAck.remove(item.mid)) {
+                                // 对端建接收通道失败已提前回绝：立即停止推送，别把 GB 级字节倒进虚空
+                                log("文件 ${item.fileName} 对端提前拒收，停止推送（条目留在待发队列）")
+                                endSpeed(item.mid)
+                                okUpdate(item.copy(status = Status.FAILED))
+                                return
+                            }
+                            // 对端回 busy（单任务槽被占）：停推，条目留待发队列等 sync_req
+                            if (consumePeerBusy(item.mid)) {
+                                pauseForPeerBusy(item, dirId, agg)
+                                return
+                            }
+                            // 帧长自适应（读块 8MB 是上限，档位再高也按块切）
+                            // 单帧整帧上限是 MAX_FRAME，帧头(6B+mid)也要占额度 -> 载荷再多夹一道上限，
+                            // 否则顶档 8M 必然抛「分片帧过大」(见 [framePayloadCap])
+                            val len = minOf(frame.size(), n - off, framePayloadCap(item.mid))
+                            val w0 = System.nanoTime()
                             s.sendChunk(item.mid, seq, buf, off, len)
-                            digest?.update(buf, off, len)
+                            frame.onFrame(len, System.nanoTime() - w0)
                             seq++
                             off += len
                             sent += len
@@ -672,6 +946,13 @@ internal fun Link.doSendFileInner(
                         // 只有 2 块缓冲，不还的话发完 2×4MB 后读线程永远阻塞在 free.take()，消费端卡死在 ready.take() —— 大文件必然卡住
                         reader.recycle(buf)
                     }
+                    // 源文件实际可读字节少于声明（提供器虚报 / 云占位 / 中途被截断）：
+                    // 按本地源错误收尾（不重试、出队、通知对端清半成品），否则每轮「发完→对端判少→留队」永远出不去（S16）
+                    if (item.fileSize > 0 && sent < item.fileSize) {
+                        throw SourceError(
+                            "源文件实际可读 $sent B 少于声明 ${item.fileSize} B（可能被截断或提供器虚报）"
+                        )
+                    }
                 } finally {
                     reader.cancel()
                 }
@@ -681,37 +962,33 @@ internal fun Link.doSendFileInner(
                 log("文件发送已取消 ${item.fileName}")
                 return
             }
-            // 没开摘要（非续传）时发空串：接收端见空串即「对端未要求校验」，不做比对
-            val sha = digest?.let { hex(it.digest()) } ?: ""
-            s.send(Protocol.fileDone(item.mid, sha))
-            if (agg != null) {
-                // 文件夹成员：进度已由聚合器反映，气泡状态在整目录收尾时更新
-            } else {
-                // 传完即丢掉速率采样器：气泡那边靠「样本过期」自动隐藏数字，这里只是别留垃圾
-                endSpeed(item.mid)
-                okUpdate(item.copy(progress = 100, status = Status.OK))
-            }
-            if (dirId.isNotEmpty()) {
-                dirSendState.getOrPut(dirId) { ConcurrentHashMap() }[relPath] = true
-            }
-            log("文件发送完成 ${item.fileName} ${TextUtil.humanSize(item.fileSize)}，等对端回报落盘")
+            // 校验只核对大小：file_done 的 sha256 字段恒空串（保留字段仅为线上格式兼容）
             if (dirId.isEmpty() && agg == null) {
-                if (rejectedAck.remove(item.mid)) {
-                    // 对端在这趟开传前就回绝了（它那边存不下）：字节白推了，也不会再有第二份 ack ——
-                    // 气泡如实标失败，条目留在待发队列，下次握手重来（见 [onSendAck]）
-                    okUpdate(item.copy(progress = 100, status = Status.FAILED))
-                    log("文件 ${item.fileName} 对端拒收，留在待发队列等补发")
-                } else {
-                    // **不在此处出待发队列、也不记送达台账**:
-                    // 挂进 [awaitingAck],等对端的 `ack` 帧来说「我存好了」才算送达([onSendAck]);
-                    // 条目留在队列里的这段时间就是兜底——中途被杀、ack 丢帧,下次握手必会补发
-                    awaitingAck[item.mid] = AckWait(item, s.remoteIp)
+                // 普通单文件：登记回执 → 发 file_done → 气泡收尾（顺序不能颠倒，见 [finishSingleSend]）
+                finishSingleSend(s, item, "", offset)
+            } else {
+                // 先登记成员回执映射，再发 file_done：对端 ack(false) 到达时凭 mid 找回 (dirId, relPath) 记账
+                if (dirId.isNotEmpty()) {
+                    dirMemberAck[item.mid] = dirId + "\u0001" + relPath
                 }
-                // 触发过续传 → 等对端回发 MD5 做端到端核对（异步，不阻塞发送线程）
-                if (offset > 0) {
-                    startVerifyWatch(item, offset)
+                s.send(Protocol.fileDone(item.mid, ""))
+                if (agg == null) {
+                    // 文件夹成员：进度已由聚合器反映，气泡状态在整目录收尾时更新
+                    endSpeed(item.mid)
+                    okUpdate(item.copy(progress = 100, status = Status.OK))
                 }
+                log("文件发送完成 ${item.fileName} ${TextUtil.humanSize(item.fileSize)}，等对端回报落盘")
             }
+        } catch (b: BusyError) {
+            // 对端设备忙：链路是好的，绝不关会话 —— 条目留待发队列，等对端释放槽位的 sync_req 再补发
+            awaitingAck.remove(item.mid)
+            rejectedAck.remove(item.mid)
+            cancelled.remove(item.mid)
+            if (dirId.isEmpty() && agg == null) {
+                log("对端设备忙，文件 ${item.fileName} 已留在待发队列（等对端空闲后 sync_req 补发）")
+                return
+            }
+            throw b
         } catch (t: Throwable) {
             cancelled.remove(item.mid)
             // 没走到「等 ack」就别留在待确认表里（条目按各自分支回待发/出队）
@@ -721,6 +998,8 @@ internal fun Link.doSendFileInner(
                 // **本地**读不了源文件(被删/无权限/SAF 授权失效):链路本身是好的,
                 // 因此绝不关连接(老逻辑误杀连接,把后续所有传输一起带走),也不重试(重试同样是失败,只会无限循环)
                 log("文件发送失败（本地源不可读）${item.fileName}：${t.message}")
+                // 对端可能已建好半成品：通知它删掉，免得留下残缺文件在「已接收」里（与 PC 端同口径）
+                sendOrDrop(s, Protocol.fileCancel(item.mid), "file_cancel", quiet = true)
                 if (throwOnFail) throw t
                 // ⚠ 必须**出队**：doSendFile 入口已经 queuePending，这里不清掉的话
                 //   每次握手补发都会把这条读不了的文件重放一遍 —— 几十条积压就是反复雪崩。
@@ -748,7 +1027,238 @@ internal fun Link.doSendFileInner(
      */
     class SourceError(message: String, cause: Throwable? = null) : java.io.IOException(message, cause)
 
+    /**
+     * 对端设备忙（单任务槽被别的任务占着）。**不是链路故障**：不关会话、不标失败，
+     * 条目回待发队列，等对端释放槽位的 `sync_req` 再补发。文件夹成员用它中止整轮。
+     */
+    class BusyError(message: String) : RuntimeException(message)
+
 internal fun Link.openSource(uri: Uri): InputStream? = FileIO.openSource(ctx, uri)
+
+    /**
+     * 零拷贝发送（P1-4）：按 4MB 块把源文件直接 transferTo 进 socket，数据不经过用户态内存。
+     * 取消 / 数据流量闸门 / 进度 / 速率 / 收尾语义与流式路径逐条对齐；只用于非续传（offset=0），
+     * 续传要算整文件 SHA-256，必须逐块喂 digest，仍走流式路径。
+     */
+internal fun Link.doSendFileZeroCopy(
+        s: Session, item: MsgItem, src: FileChannel, mime: String,
+        relPath: String, dirId: String, agg: DirProgress?
+    ) {
+        val total = item.fileSize
+        // 源文件比声明小（提供器虚报 / 云占位 / 已被截断）：直接按本地源错误收尾，
+        // 别把半截文件当完整文件推完再让对端判少、留队无限重发（S16）
+        if (total > 0 && src.size() < total) {
+            throw SourceError("源文件实际 ${src.size()} B 少于声明 $total B（文件可能已被截断）")
+        }
+        s.send(Protocol.fileMeta(item.mid, item.fileName, total, mime, "", 0L, relPath, dirId))
+        var seq = 0
+        var sent = 0L
+        var lastPct = -1
+        // 自适应帧（与流式路径同规则）：1M 起步，0.5s 一评估，抖了降两档，顶档 8M
+        val frame = AdaptiveFrame(item.fileName)
+        while (sent < total) {
+            if (isCancelled(item.mid, dirId)) {
+                cancelled.remove(item.mid)
+                log("文件发送已取消 ${item.fileName}（已发 $sent B）")
+                return
+            }
+            // 2.12 / D16：在传的遇到投票 = 1 ⇒ 在下一个分片边界就地结束本次尝试
+            if (fileGateBlocked(item.peerIp)) {
+                pauseInFlight(item, dirId, agg)
+                return
+            }
+            // 与流式路径同口径：对端建接收通道失败已提前回绝 → 立即停推，别把 GB 级字节倒进虚空（S14/S21）
+            if (rejectedAck.remove(item.mid)) {
+                log("文件 ${item.fileName} 对端提前拒收，停止零拷贝推送（条目留在待发队列）")
+                endSpeed(item.mid)
+                okUpdate(item.copy(status = Status.FAILED))
+                return
+            }
+            // 对端回 busy（单任务槽被占）：停推，条目留待发队列等 sync_req
+            if (consumePeerBusy(item.mid)) {
+                pauseForPeerBusy(item, dirId, agg)
+                return
+            }
+            // 与块读路径同规则：8M 档的载荷要扣掉帧头(6B+mid)，见 [framePayloadCap]
+            val len = minOf(total - sent, minOf(frame.size().toLong(), framePayloadCap(item.mid).toLong())).toInt()
+            val w0 = System.nanoTime()
+            s.sendChunkFile(item.mid, seq, src, sent, len)
+            frame.onFrame(len, System.nanoTime() - w0)
+            seq++
+            sent += len
+            // 发送停滞看门狗：每写出一块刷新「最近进度时刻」
+            sendLastAt[item.mid] = System.currentTimeMillis()
+            markSpeed(item.mid, sent)
+            if (agg != null) {
+                agg.add(len.toLong())
+            } else if (total > 0) {
+                val pct = ((sent * 100) / total).toInt()
+                if (pct != lastPct) {
+                    lastPct = pct
+                    okUpdate(item.copy(progress = pct, status = Status.SENDING))
+                }
+            }
+        }
+        if (isCancelled(item.mid, dirId)) {
+            cancelled.remove(item.mid)
+            log("文件发送已取消 ${item.fileName}")
+            return
+        }
+        // 中途被截断的兜底（与流式路径同口径）：实际推出字节少于声明 → 按本地源错误收尾（S16）
+        if (item.fileSize > 0 && sent < item.fileSize) {
+            throw SourceError("零拷贝实际推出 $sent B 少于声明 ${item.fileSize} B（源文件被截断）")
+        }
+        // 非续传：sha 发空串，接收端见空串即「对端未要求校验」
+        if (dirId.isEmpty() && agg == null) {
+            finishSingleSend(s, item, "", 0L)
+        } else {
+            if (dirId.isNotEmpty()) {
+                dirMemberAck[item.mid] = dirId + "\u0001" + relPath
+            }
+            s.send(Protocol.fileDone(item.mid, ""))
+            if (agg == null) {
+                endSpeed(item.mid)
+                okUpdate(item.copy(progress = 100, status = Status.OK))
+            }
+            log("文件发送完成 ${item.fileName} ${TextUtil.humanSize(item.fileSize)}，等对端回报落盘")
+        }
+    }
+
+    /**
+     * 2 期多通道发送：4MB 单元逐个交给「谁空谁领」的 N 条通道，每条通道一个线程 + 一个独立 FileChannel，
+     * 整单元走 transferTo 零拷贝直发 —— 发送端一分用户态缓冲都不用。
+     * 接收端按 3 槽重排环乱序收、顺序落盘，因此单元到达顺序可以乱，但每个单元必须整块到达。
+     */
+internal fun Link.doSendUnitized(
+        s: Session, item: MsgItem, uri: Uri, mime: String,
+        relPath: String, dirId: String, agg: DirProgress?, lanes: List<Session>
+    ) {
+        val unit = Protocol.CHUNK_SIZE
+        val total = item.fileSize
+        val units = ((total + unit - 1) / unit).toInt()
+        val declared = lanes.size
+        val chans = ArrayList<FileIO.SeekableSource>(declared)
+        try {
+            for (i in 0 until declared) {
+                chans.add(FileIO.openSourceChannel(ctx, uri) ?: throw SourceError("打不开源文件: $uri"))
+            }
+            // 先登记「等就绪」的 latch，再发声明 + 元数据：接收端建好 Rx 会回 xe_ready，
+            // 收到之后才允许起数据通道。否则比 file_meta 更早到的分片在接收端查不到 mid 会被丢，
+            // 单元缺口补不齐 → 3 槽重排环卡到 30s 超时（1GB 首测卡死就是这么来的）。
+            val ready = java.util.concurrent.CountDownLatch(1)
+            expectXeReady(item.mid, ready)
+            val readyOk = try {
+                // 先声明后发元数据：接收端建 Rx 时要靠 xe_begin 决定用重排环还是 1 期双缓冲
+                s.send(Protocol.xeBegin(item.mid, unit, declared, 0L))
+                s.send(Protocol.fileMeta(item.mid, item.fileName, total, mime, "", 0L, relPath, dirId))
+                ready.await(Link.XE_READY_WAIT_MS, TimeUnit.MILLISECONDS)
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            } finally {
+                // 发送失败/中断也要摘掉登记，避免 map 里留一颗永不消费的 latch
+                clearXeReady(item.mid)
+            }
+            // 超时（对端不支持/异常）→ 只用主连接按单元顺序发；接收端重排环照样按序收
+            var use = lanes
+            if (!readyOk) {
+                log("多通道：等对端接收上下文就绪超时（${Link.XE_READY_WAIT_MS}ms 未见 xe_ready），" +
+                    "${item.fileName} 降级为主连接单通道")
+                use = listOf(s)
+            }
+            val n = use.size
+            log("多通道发送 ${item.fileName}（${TextUtil.humanSize(total)}，$n 条通道 × $units 个单元）")
+
+            val nextUnit = AtomicInteger(0)
+            /** 真正写完的单元数（错误信息用真实完成数，别拿“已分配”当“已发完”） */
+            val doneUnits = AtomicInteger(0)
+            val sentBytes = AtomicLong(0)
+            val lastPct = AtomicInteger(-1)
+            val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+            val errLock = Object()
+            var failed: Throwable? = null
+            var cancelledHere = false
+            var pausedHere = false
+
+            val threads = (0 until n).map { li ->
+                Thread({
+                    try {
+                        while (!stop.get()) {
+                            val u = nextUnit.getAndIncrement()
+                            if (u >= units) break
+                            if (isCancelled(item.mid, dirId)) {
+                                cancelled.remove(item.mid)
+                                cancelledHere = true
+                                stop.set(true)
+                                return@Thread
+                            }
+                            // 2.12 / D16：数据流量闸门在**单元边界**收手，已入队的字节不劈开
+                            if (fileGateBlocked(item.peerIp)) {
+                                pausedHere = true
+                                stop.set(true)
+                                return@Thread
+                            }
+                            val at = u.toLong() * unit
+                            val len = minOf(unit.toLong(), total - at).toInt()
+                            use[li].sendChunkFile(item.mid, u, chans[li].channel, at, len)
+                            doneUnits.incrementAndGet()
+                            sendLastAt[item.mid] = System.currentTimeMillis()
+                            val done = sentBytes.addAndGet(len.toLong())
+                            markSpeed(item.mid, done)
+                            if (agg != null) {
+                                agg.add(len.toLong())
+                            } else if (total > 0) {
+                                val pct = ((done * 100) / total).toInt()
+                                if (lastPct.get() != pct && lastPct.getAndSet(pct) != pct) {
+                                    okUpdate(item.copy(progress = pct, status = Status.SENDING))
+                                }
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        synchronized(errLock) { if (failed == null) failed = t }
+                        log("通道 lane=$li 发送中断：${t.message}（剩余单元交给其它通道）")
+                        stop.set(true)
+                    }
+                }, "pp-send-l$li").apply { isDaemon = true }.also { it.start() }
+            }
+            threads.forEach { runCatching { it.join() } }
+
+            if (cancelledHere || isCancelled(item.mid, dirId)) {
+                cancelled.remove(item.mid)
+                log("多通道发送已取消 ${item.fileName}（已发 ${TextUtil.humanSize(sentBytes.get())}）")
+                return
+            }
+            if (pausedHere) {
+                pauseInFlight(item, dirId, agg)
+                return
+            }
+            val miss = units - minOf(doneUnits.get(), units)
+            if (miss > 0 || failed != null) {
+                val t = failed
+                if (t is SourceError) throw t
+                throw java.io.IOException(
+                    "多通道发送中断（${units - miss}/$units 个单元）：${t?.message ?: "通道全部退出"}"
+                )
+            }
+            s.send(Protocol.xeEnd(item.mid))
+            // 非续传：sha 发空串，接收端见空串即「对端未要求校验」
+            if (dirId.isEmpty() && agg == null) {
+                finishSingleSend(s, item, "", 0L)
+            } else {
+                if (dirId.isNotEmpty()) {
+                    dirMemberAck[item.mid] = dirId + "\u0001" + relPath
+                }
+                s.send(Protocol.fileDone(item.mid, ""))
+                if (agg == null) {
+                    endSpeed(item.mid)
+                    okUpdate(item.copy(progress = 100, status = Status.OK))
+                }
+                log("文件发送完成（多通道）${item.fileName} ${TextUtil.humanSize(item.fileSize)}，等对端回报落盘")
+            }
+        } finally {
+            for (c in chans) runCatching { c.close() }
+        }
+    }
 
     /**
      * 发送端读源：双 4MB 缓冲交替，后台线程读盘，与网络发送重叠。

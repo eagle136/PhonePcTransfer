@@ -433,7 +433,7 @@ public final class CallManager {
         int mport = t0 == null ? 0 : t0.mediaPort();
         boolean mudp = t0 != null && t0.mediaIsUdp();
         String msid = t0 == null ? "" : t0.localMsid();
-        if (!link.sendCallInvite(name, Discovery.localIpv4(), false, 1,
+        if (!link.sendCallInvite(name, Discovery.localIpv4(), ip, false, 1,
                 VoiceEngine.VOICE_FRAME_MS_LOWLAT, mport, mudp, msid)) {
             Log.i("设备 " + localLabel + " 未连接，无法发起通话");
             closeTransport();
@@ -803,7 +803,7 @@ public final class CallManager {
         vRxFrames.set(0);
         setState(State.TALKING);
         // 进入TALKING⇒"通话中"这一票投1(**仅接通后**,振铃期不投,所以不是isBusy())。此后文件与目录一律不入网、在传的在分片/成员边界暂停。
-        link.setFileVote(Link.VOTE_IN_CALL, true);
+        link.setFileVote(Link.VOTE_IN_CALL, true, peerIp);
         final boolean vm = videoMode;
         final int lv = level;
         // ⚠音频设备初始化(AudioSystem.getLine/line.open)可能阻塞数百毫秒~数秒,必须放到独立线程:startTalking在PC由**网络读线程**调用(见PcMain的Link.Listener转发),在那里阻塞会卡死整条会话(收不到对端帧→对端判死掉线;挂断时再抢VoiceEngine的锁就死锁、UI无法关闭)。
@@ -1119,7 +1119,7 @@ public final class CallManager {
         pendingStartTalking = false;
         setState(State.IDLE);
         // 挂断⇒"通话中"这一票收回为0。若三票全为0,setFileVote内部会自动续发一次待发队列(对端没应答就停在PAUSED等手动"继续")。
-        link.setFileVote(Link.VOTE_IN_CALL, false);
+        link.setFileVote(Link.VOTE_IN_CALL, false, ip);
         Listener l = listener;
         if (l != null) {
             l.onCallEnded(ip, reason, wasVideo, durationMs, wasOutgoing);

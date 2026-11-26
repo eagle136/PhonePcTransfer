@@ -10,9 +10,12 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.provider.DocumentsContract
 import android.util.Log
+import java.io.Closeable
 import java.io.File
+import java.io.FileInputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.nio.channels.FileChannel
 
 /** 文件收发相关工具 */
 object FileIO {
@@ -121,14 +124,53 @@ object FileIO {
     }
 
     /**
+     * 可 seek 的源通道（P1-4 零拷贝用）。
+     * 只有真正的文件 fd 才拿得到；云盘/虚拟文档等流式 provider 返回 null，调用方回落到流式发送。
+     * close 时按「先流、后 PFD」的顺序关，重复关闭一律吞掉异常。
+     */
+    class SeekableSource(val channel: FileChannel, private val closer: () -> Unit) : Closeable {
+        override fun close() {
+            runCatching { closer() }
+        }
+    }
+
+    /**
+     * 打开**可随机访问**的源（transferTo 用）。`file://` 走本地 FileInputStream；
+     * `content://` 走 openFileDescriptor（MediaStore 文档通常给的是可 seek 的真 fd）。
+     * 任何一步失败都返回 null，绝不抛给上层：上层据此回落到流式发送。
+     */
+    fun openSourceChannel(ctx: Context, uri: Uri): SeekableSource? {
+        if (uri.scheme == "file") {
+            val p = uri.path
+            if (!p.isNullOrEmpty()) {
+                val fis = runCatching { FileInputStream(File(p)) }.getOrNull() ?: return null
+                return SeekableSource(fis.channel) { runCatching { fis.close() } }
+            }
+        }
+        val pfd = runCatching { ctx.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
+            ?: return null
+        val fis = runCatching { FileInputStream(pfd.fileDescriptor) }.getOrNull()
+        if (fis == null) {
+            runCatching { pfd.close() }
+            return null
+        }
+        return SeekableSource(fis.channel) {
+            runCatching { fis.close() }
+            runCatching { pfd.close() }
+        }
+    }
+
+    /**
      * 为接收到的文件创建输出流：API 29+ 走 MediaStore Downloads（免存储权限，用户在"下载/手机电脑互传"里能看到）；
      * 失败或 API 28 及以下退回到应用专属外部目录。relPath：文件夹成员时为「文件夹内相对路径」（如 `sub/a.txt`）落进同名子目录；null/空 = 普通单文件，直接落「下载/手机电脑互传」根目录。
      */
-    fun createSink(ctx: Context, name: String, mime: String, relPath: String? = null): Sink {
+    fun createSink(ctx: Context, name: String, mime: String, relPath: String? = null, overwrite: Boolean = false): Sink {
         // ⚠️ 唯一名必须自己先算好（见 uniqueFileName）：一旦交给 MediaStore 去重，
         //    它会往**整个名字末尾**追加（`xxx.apk.1`、`xxx.jpeg (1)`），扩展名被顶到中间，
         //    系统按扩展名认类型时直接认不出来（APK 装不上、图片/视频打不开）。
-        val safe = uniqueFileName(ctx, name, relPath)
+        // P2-4：文件夹成员（overwrite=true）按「文件夹内相对路径」**覆盖**同名旧文件——与 PC 端 directory 语义一致；
+        //       单文件仍走唯一名，绝不覆盖用户在下载目录里的其他文件。
+        val safe = if (overwrite) sanitize(name) else uniqueFileName(ctx, name, relPath)
         val subDir = relDirOf(relPath)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             runCatching {
@@ -138,6 +180,7 @@ object FileIO {
                 } else {
                     "${Environment.DIRECTORY_DOWNLOADS}/$DOWNLOAD_SUBDIR/$subDir"
                 }
+                if (overwrite) deleteOwnEntry(ctx, rp, safe)
                 val values = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, safe)
                     put(MediaStore.MediaColumns.MIME_TYPE, mime)
@@ -155,10 +198,44 @@ object FileIO {
         }
         val dir = fallbackDir(ctx, subDir)
         dir.mkdirs()
+        if (overwrite) {
+            // 覆盖：同名文件直接截断重写（输出流默认 truncate）
+            val f = File(dir, safe)
+            return Sink(f.outputStream(), f.absolutePath, f.absolutePath)
+        }
         // 走到这里说明 MediaStore 那条路没走成：落点在应用私有目录，跟下载目录**不是同一个位置**，
         // 上面算出的 safe 有没有被占在这儿才知道 —— 原子创建、撞名就地换号，绝不覆盖旧文件。
         val f = createExclusiveIn(dir, safe)
         return Sink(f.outputStream(), f.absolutePath, f.absolutePath)
+    }
+
+    /**
+     * P2-4：覆盖前先删掉**本应用自己**建的同名 MediaStore 条目（连同文件）。
+     * 只删 owner == 本包的条目；别人的文件不碰（没权限也不该动），交给 MediaStore 自己去重命名。
+     */
+    private fun deleteOwnEntry(ctx: Context, rp: String, displayName: String) {
+        val ids = runCatching {
+            ctx.contentResolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.OWNER_PACKAGE_NAME),
+                "${MediaStore.MediaColumns.RELATIVE_PATH}=? AND ${MediaStore.MediaColumns.DISPLAY_NAME}=?",
+                arrayOf("$rp/", displayName), null
+            )?.use { c ->
+                val out = ArrayList<Long>()
+                while (c.moveToNext()) {
+                    if (c.getString(1) == ctx.packageName) out.add(c.getLong(0))
+                }
+                out
+            }
+        }.getOrNull().orEmpty()
+        ids.forEach { id ->
+            runCatching {
+                ctx.contentResolver.delete(
+                    ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id), null, null
+                )
+            }.onFailure { Log.w(TAG, "覆盖删除旧条目 $displayName 失败: ${it.message}") }
+        }
+        if (ids.isNotEmpty()) Log.i(TAG, "文件夹成员覆盖：先删同名旧条目 $displayName ×${ids.size}")
     }
 
     /** 相对路径里的目录部分（逐段清洗）；没有子目录返回空串 */
@@ -314,6 +391,30 @@ object FileIO {
                 File(uri).delete()
             }
         }
+    }
+
+    /**
+     * P4-1 续传：把半成品截断到 len（32MB 块边界 / 首个校验失败块起点）。
+     * 路径文件用 RandomAccessFile；MediaStore 用 rw fd 的 FileChannel.truncate。
+     * 截断失败（部分 provider 不支持）时调用方必须按「从 0 重传」处理，绝不能继续 append。
+     */
+    fun truncateLen(ctx: Context, uri: String, len: Long): Boolean {
+        if (uri.isEmpty() || len < 0) return false
+        return runCatching {
+            if (uri.startsWith("content://")) {
+                val pfd = ctx.contentResolver.openFileDescriptor(Uri.parse(uri), "rw") ?: return false
+                pfd.use { d ->
+                    java.io.FileOutputStream(d.fileDescriptor).channel.use { ch ->
+                        ch.truncate(len)
+                    }
+                }
+            } else {
+                val f = File(uri)
+                if (!f.exists()) return false
+                java.io.RandomAccessFile(f, "rw").use { it.setLength(len) }
+            }
+            true
+        }.getOrDefault(false)
     }
 
     /**
@@ -544,6 +645,38 @@ object FileIO {
     private fun randomTag(): String =
         String.format(java.util.Locale.US, "%06x", java.util.Random().nextInt(0x1000000))
 
+    /**
+     * 文件夹成员相对路径清洗（逐段 sanitize；"."/".." 段直接丢弃）。
+     * 供接收端做「清洗撞名」检测，落盘与检测用同一口径。
+     */
+    fun sanitizeRelPath(relPath: String): String =
+        relPath.split('/').filter { it.isNotEmpty() && it != "." && it != ".." }
+            .joinToString("/") { sanitize(it) }
+
+    /** 给文件名/相对路径追加序号（保留扩展名）："a_.txt" → "a_ (2).txt"（结果仍受 MAX_NAME_BYTES 上限约束） */
+    fun withOrdinalRel(rel: String, n: Int): String {
+        val parent = rel.substringBeforeLast('/', "")
+        val base = rel.substringAfterLast('/')
+        val dot = base.lastIndexOf('.')
+        val head = if (dot > 0) base.substring(0, dot) else base
+        val ext = if (dot > 0) base.substring(dot) else ""
+        val renamed = clampName("$head ($n)$ext")
+        return if (parent.isEmpty()) renamed else "$parent/$renamed"
+    }
+
+    /**
+     * 接收端 [NameRules.MAX_NAME_BYTES] 字节上限兜底（发送端已校验过，这里只防老端/异常数据）：
+     * 超长时保留扩展名并预留 8 字节给 " (n)" 序号，主名按码点截断（绝不劈开代理对）。
+     */
+    fun clampName(name: String): String {
+        if (NameRules.utf8Bytes(name) <= NameRules.MAX_NAME_BYTES) return name
+        val dot = name.lastIndexOf('.')
+        val ext = if (dot > 0 && name.length - dot - 1 in 1..12) name.substring(dot) else ""
+        val stem = if (ext.isEmpty()) name else name.substring(0, dot)
+        val budget = (NameRules.MAX_NAME_BYTES - NameRules.utf8Bytes(ext) - 8).coerceAtLeast(4)
+        return NameRules.trimToBytes(stem, budget) + ext
+    }
+
     private fun sanitize(name: String): String {
         val base = name.substringAfterLast('/').substringAfterLast('\\')
         var cleaned = stripEmoji(base).replace(Regex("[\\\\:*?\"<>|]"), "_").trim()
@@ -561,6 +694,7 @@ object FileIO {
                 return "file_${randomTag()}${cleaned.substring(dot)}"
             }
         }
-        return cleaned
+        // MAX_NAME_BYTES 上限兜底（保留扩展名/序号余量）；超长名单在本轮已由发送端拦截，这里只防老端
+        return clampName(cleaned)
     }
 }

@@ -129,6 +129,7 @@ jobs:
           rm -rf pc/build/concentus && mkdir -p pc/build/concentus
           (cd pc/build/concentus && jar xf ../../lib/concentus-1.0.2.jar io)
           cp -r pc/build/concentus/io pc/build/classes/
+          printf 'version=%s\n' "$APP_VERSION" > pc/build/classes/version.properties
           jar --create --file pc/dist/PhonePcTransfer-PC.jar \
             --main-class com.phonepctransfer.pc.PcMain -C pc/build/classes .
 
@@ -145,7 +146,7 @@ jobs:
           APP_VER: ${{ needs.version.outputs.name }}
         run: |
           export PP_JDK_HOME="$(cygpath -u "$JAVA_HOME")"
-          bash make-msi.sh
+          bash tools/make-msi.sh
           mkdir -p dist
           cp "out/手机电脑互传-$APP_VER.msi" "dist/PhonePcTransfer-$APP_VER.msi"
           cp pc/dist/PhonePcTransfer-PC.jar dist/
@@ -179,8 +180,9 @@ jobs:
           cat > notes.md <<EOF
           ## 更新日志
 
-          - 修复了一些问题，提高了稳定性
-          - 断网重装，联网会自动同步数据
+          - 增加配对验证
+          - 优化传输效率
+          - 修复大量潜在 bug
 
           | 平台 | 文件 | 说明 |
           |---|---|---|

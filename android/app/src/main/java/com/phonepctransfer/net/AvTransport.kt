@@ -6,6 +6,7 @@ import com.phonepctransfer.util.CallCounters
 import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -742,7 +743,14 @@ class AvTransport(private val link: Link, private val sink: Sink) {
         val b = boundTcp
         boundTcp = null
         b?.release()
-        // 3.3本轮只落了UDP侧自有IO:TCP档不在此起startMediaIo,mediaUsesMainTcp仍true
+        // 本轮只落 UDP 侧自有 IO：TCP 档的媒体 IO 尚未实现，媒体实际走主连接带内。
+        // S29：如实标降级（UI 要提示）并释放 ④ 预建的那条 mediaTcp —— 留着既占一条连接又容易
+        // 被误判成"TCP 档生效"
+        inbandDowngraded = true
+        val mt = mediaTcp
+        mediaTcp = null
+        runCatching { mt?.close() }
+        Log.i(TAG, "[媒体定档] TCP 档 $t 的媒体 IO 未实现，媒体回落带内并已释放预建连接（UI 显示降级）")
         startAliveWatchdog()
     }
 
@@ -839,6 +847,11 @@ class AvTransport(private val link: Link, private val sink: Sink) {
                 return
             }
             val now = System.currentTimeMillis()
+            // S28：只接受通话对端的源地址——定档后不再让任意主机的"合法格式"媒体包进来播放/改目标
+            val srcIp = (p.socketAddress as? InetSocketAddress)?.address?.hostAddress
+            if (spec.peerIp.isNotEmpty() && !sameHost(srcIp, spec.peerIp)) {
+                continue
+            }
             notePeerSource(p.socketAddress)
             notePeerMediaPacket()
             val dg = try {
@@ -964,6 +977,12 @@ class AvTransport(private val link: Link, private val sink: Sink) {
     private fun notePeerSource(from: SocketAddress?) {
         val a = from as? InetSocketAddress ?: return
         val addr = a.address ?: return
+        // S28：源 IP 必须等于通话对端——UDP 源地址可伪造，不能凭一个包就把后续媒体目标改写过去
+        val expect = spec.peerIp
+        if (expect.isNotEmpty() && !sameHost(addr.hostAddress, expect)) {
+            Log.w(TAG, "[媒体目标] 拒绝非对端源 ${addr.hostAddress}:${a.port}（期望 $expect），忽略该包")
+            return
+        }
         val old = peerMediaTarget
         if (old != null && old == a) {
             return   // 源没变 ⇒ 不写、不打日志
@@ -973,6 +992,13 @@ class AvTransport(private val link: Link, private val sink: Sink) {
                 (if (old == null) "首次 " else "$old → ") +
                 addr.hostAddress + ":" + a.port +
                 "（invite/accept 里的 IP 只是初值，不是唯一目标 —— D10 / 2.7）")
+    }
+
+    /** 两个地址是不是同一台主机（同字符串优先，IPv4/IPv6 文本差异走 InetAddress 比较） */
+    private fun sameHost(a: String?, b: String): Boolean {
+        if (a.isNullOrEmpty()) return false
+        if (a == b) return true
+        return runCatching { InetAddress.getByName(a) == InetAddress.getByName(b) }.getOrDefault(false)
     }
 
     /** 2.7:该往哪打:有实测收包源用它;没有退回初值(invite/accept的IP+对端广告端口) */

@@ -16,6 +16,12 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.StandardSocketOptions;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
@@ -74,6 +80,17 @@ public final class Link {
         void onClipToClipboard(String text);
 
         void onLog(String s);
+
+        /**
+         * 「必须让用户看见」的提示（发送前校验失败、空文件夹/命名不合规导致的取消等）。
+         * 实现方负责切 UI 线程再弹对话框 —— 回调可能来自任意后台线程。
+         */
+        default void onNotice(String text) {
+        }
+
+        /** P4-5：配对覆盖层状态变化；null = 关掉覆盖层 */
+        default void onPairState(PairUi u) {
+        }
 
         // ==================== 语音通话回调 ====================
         default void onCallInvite(String peerIp, String name) {
@@ -208,6 +225,52 @@ public final class Link {
     private Clip clip;
     Store store;
 
+    /** 当前正在配对覆盖层上的设备 IP（空 = 没有覆盖层） */
+    volatile String pairUiIp = "";
+
+    /**
+     * 用户点了设备但会话还没握手：等这次连接起来后按「用户主动发起」出示配对码。
+     * 空 = 没有待办。带时间戳，超过 {@link #PAIR_TAP_INTENT_TTL_MS} 的连接不再补弹，避免几秒后的自动重连又把码弹出来。
+     */
+    private volatile String pendingPairIp = "";
+    private volatile long pendingPairAt = 0L;
+
+    /**
+     * P4-5 配对覆盖层状态（给 UI 用）。
+     * showCode=true → 本端用户点了这台设备，由本端显示 6 位码让对方读；
+     * showCode=false → 对端点设备后本端切到数字键盘输入对方显示的码。
+     * 两端都不再随连接自动弹。
+     */
+    public static final class PairUi {
+        public final String ip;
+        public final String name;
+        public final boolean showCode;
+        public final String code;
+        public final int attemptsLeft;
+        public final long ttlMs;
+        public final String message;
+        public final boolean done;
+        public final boolean ok;
+
+        public PairUi(String ip, String name, boolean showCode, String code,
+                      int attemptsLeft, long ttlMs, String message, boolean done, boolean ok) {
+            this.ip = ip;
+            this.name = name;
+            this.showCode = showCode;
+            this.code = code;
+            this.attemptsLeft = attemptsLeft;
+            this.ttlMs = ttlMs;
+            this.message = message;
+            this.done = done;
+            this.ok = ok;
+        }
+
+        public PairUi(String ip, String name, boolean showCode, String code,
+                      int attemptsLeft, long ttlMs, String message) {
+            this(ip, name, showCode, code, attemptsLeft, ttlMs, message, false, false);
+        }
+    }
+
     /** "窗口不可见(隐藏进托盘)"判据(PcMain注入=()=>!win.isVisible(),默认false=恒按前台处理);
      *  true且对端不是已知设备(握手过+有消息/文件往来,见Store.isTrustedAddr)⇒adopt拒接该入向连接(与安卓端同规则,防托盘后台被陌生设备恶意连入) */
     public volatile java.util.function.BooleanSupplier windowHidden = () -> false;
@@ -218,49 +281,194 @@ public final class Link {
     public static final int VOTE_IN_CALL = 0;
     /** 票 ②：原本"没网络"（发送入口发现无会话时写，握手完成清） */
     public static final int VOTE_NO_NETWORK = 1;
-    /** 票③:原本"被拒绝"(数据流量确认被拒时写,清零点=用户在气泡上手动重试) */
+    /** 票③:原本"被拒绝"(数据流量确认被拒时写;作用域=该设备,10 分钟自动解除) */
     public static final int VOTE_CONSENT_DENIED = 2;
 
-    private volatile boolean voteInCall;
-    private volatile boolean voteNoNetwork;
-    private volatile boolean voteConsentDenied;
+    /** 票③存活时长：到期自动解除，不再「拒一次永久发不出」 */
+    static final long DENY_TTL_MS = 10L * 60 * 1000;
 
-    /** 文件与目录发送的排他投票,裁决=三票取最大值(任一为1即1);
-     *  1时:新条目不入网改走既有待发台账排队,在传的那一条在下一个分片边界就地暂停;
-     *  ⚠与AvTransport.aggregationAllowed()是两个不同的判据(那条读媒体承载,本条读通话与发送状态),不许共用读口 */
-    public boolean fileGateBlocked() {
-        return voteInCall || voteNoNetwork || voteConsentDenied;
+    /** 票③一条记录：只对这台设备生效 */
+    private static final class DenyVote {
+        final String peerIp;
+        final long at;
+
+        DenyVote(String peerIp) {
+            this.peerIp = peerIp;
+            this.at = System.currentTimeMillis();
+        }
     }
 
-    /** 写一票。只在裁决真的翻转(有1⇄全0)时打一行日志(不周期打印),且在全0那一刻自动触发一次续发:
-     *  flushPending→resendPendingFile→doSendFile顶部的negotiateResume就是那一次file_query,应答按偏移续,不应答退回暂停等手动"继续";
+    /** 票③登记表：设备组键 → 记录（同一台设备的多个地址用 convKeyOf 归并） */
+    private final java.util.concurrent.ConcurrentHashMap<String, DenyVote> denyVotes =
+            new java.util.concurrent.ConcurrentHashMap<String, DenyVote>();
+
+    /** 票①：通话中的设备组键（按设备投——与 A 通话不再堵住发给 B 的文件） */
+    private final java.util.Set<String> inCallKeys = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** 票②：原本"没网络"的设备组键（按设备投——A 离线不再堵住发给 B 的文件） */
+    private final java.util.Set<String> offlineKeys = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** 文件与目录发送的排他投票,裁决=三票取或;1时新条目不入网走待发台账,在传的在下一分片边界暂停。
+     *  票①/②按设备组键投，票③必须带 peerIp 才生效，避免「A 被拒/离线 ⇒ B 也发不出去」；
+     *  ⚠与AvTransport.aggregationAllowed()是两个不同的判据(那条读媒体承载,本条读通话与发送状态),不许共用读口 */
+    public boolean fileGateBlocked() {
+        return !inCallKeys.isEmpty() || !offlineKeys.isEmpty();
+    }
+
+    public boolean fileGateBlocked(String peerIp) {
+        String key = peerKeyOf(peerIp);
+        if (key.isEmpty()) {
+            return hasDenyVote(peerIp);
+        }
+        return inCallKeys.contains(key) || offlineKeys.contains(key) || hasDenyVote(peerIp);
+    }
+
+    /** 设备组键（与 sessionByGroup 同一判据；取不到时退回 IP 原串） */
+    String peerKeyOf(String ip) {
+        if (ip == null || ip.isEmpty()) {
+            return "";
+        }
+        if (store == null) {
+            return ip;
+        }
+        String k = store.convKeyOf(ip);
+        return (k == null || k.isEmpty()) ? ip : k;
+    }
+
+    /** 票③是否仍在拦这台设备（到期即清） */
+    boolean hasDenyVote(String peerIp) {
+        if (peerIp == null || peerIp.isEmpty() || denyVotes.isEmpty()) {
+            return false;
+        }
+        String k = peerKeyOf(peerIp);
+        DenyVote v = denyVotes.get(k);
+        if (v == null) {
+            return false;
+        }
+        if (System.currentTimeMillis() - v.at > DENY_TTL_MS) {
+            denyVotes.remove(k, v);
+            log("[文件排他] 票③到期自动解除（设备 " + v.peerIp + "）");
+            return false;
+        }
+        return true;
+    }
+
+    /** 投票③：只登记这一台设备（PC 恒不在数据网，不存在「切网自动解除」，靠到期/手动恢复） */
+    void denyConsent(String peerIp, String note) {
+        String k = peerKeyOf(peerIp);
+        if (k.isEmpty()) {
+            return;
+        }
+        denyVotes.put(k, new DenyVote(peerIp));
+        log("[文件排他] 票③投 1（设备 " + peerIp + "）：" + note + "；作用域=该设备，10 分钟后自动解除");
+    }
+
+    /** 清票③。flush=true 时只补发这台设备的待发条目（手动重试自己会发，传 false） */
+    void clearDenyConsent(String peerIp, boolean flush) {
+        String k = peerKeyOf(peerIp);
+        boolean removed = denyVotes.remove(k) != null;
+        if (!removed && peerIp != null && !peerIp.isEmpty()) {
+            // 气泡重试常带的是断线前记下的 IP：按记录里的 peerIp 再兜底清一次
+            for (java.util.Iterator<java.util.Map.Entry<String, DenyVote>> it =
+                    denyVotes.entrySet().iterator(); it.hasNext(); ) {
+                if (it.next().getValue().peerIp.equals(peerIp)) {
+                    it.remove();
+                    removed = true;
+                }
+            }
+        }
+        if (!removed) {
+            return;
+        }
+        log("[文件排他] 票③清 0（设备 " + peerIp + "）");
+        if (flush && !fileGateBlocked(peerIp)) {
+            try {
+                uiSendExec.execute(this::flushPending);
+            } catch (Exception e) {
+                log("恢复文件发送后的自动续发被拒（多半是本机正在退出）：" + e);
+            }
+        }
+    }
+
+    /** 显式恢复入口（菜单/错误横幅可调）：清该设备的票③并立刻补发它的待发条目 */
+    public void resumeFileSend(String peerIp) {
+        clearDenyConsent(peerIp, true);
+    }
+
+    /** 给入口日志用的真实原因（不再一律写「通话期不入网」） */
+    String gateReason(String peerIp) {
+        String key = peerKeyOf(peerIp);
+        if (!key.isEmpty() && inCallKeys.contains(key)) {
+            return "通话中不入网";
+        }
+        if (!key.isEmpty() && offlineKeys.contains(key)) {
+            return "当前无连接";
+        }
+        if (hasDenyVote(peerIp)) {
+            return "上次已拒绝使用数据流量（设备 " + peerIp + "）";
+        }
+        return "文件排他";
+    }
+
+    /** 票③到期自动解除（心跳每 5s 顺带跑）；只清票、不补发（避免对端又收到确认弹窗） */
+    void pruneDenyVotes() {
+        if (denyVotes.isEmpty()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        for (java.util.Iterator<java.util.Map.Entry<String, DenyVote>> it =
+                denyVotes.entrySet().iterator(); it.hasNext(); ) {
+            java.util.Map.Entry<String, DenyVote> e = it.next();
+            if (now - e.getValue().at <= DENY_TTL_MS) {
+                continue;
+            }
+            it.remove();
+            log("[文件排他] 票③到期自动解除（设备 " + e.getValue().peerIp + "）");
+        }
+    }
+
+    /** 写一票（按设备）。只在裁决真的翻转时打一行日志，且该设备全 0 那一刻自动触发一次续发：
      *  ⚠票②(没网络)的解除点就是握手完成,那里本来就有flushPending(ip)⇒这一票解除时不再重复触发,免得同一条目排两次 */
     public synchronized void setFileVote(int which, boolean on) {
-        boolean before = fileGateBlocked();
+        setFileVote(which, on, "");
+    }
+
+    public synchronized void setFileVote(int which, boolean on, String peerIp) {
+        String key = peerKeyOf(peerIp);
+        if (key.isEmpty()) {
+            return;
+        }
+        boolean before = fileGateBlocked(peerIp);
         switch (which) {
             case VOTE_IN_CALL:
-                voteInCall = on;
+                if (on) {
+                    inCallKeys.add(key);
+                } else {
+                    inCallKeys.remove(key);
+                }
                 break;
             case VOTE_NO_NETWORK:
-                voteNoNetwork = on;
+                if (on) {
+                    offlineKeys.add(key);
+                } else {
+                    offlineKeys.remove(key);
+                }
                 break;
-            case VOTE_CONSENT_DENIED:
-                voteConsentDenied = on;
-                break;
+            // 票③改走 denyConsent / clearDenyConsent（按设备、限时），不再走这张票
             default:
                 return;
         }
-        boolean after = fileGateBlocked();
+        boolean after = fileGateBlocked(peerIp);
         if (before == after) {
             return;
         }
-        log(after ? "[文件排他] 投票翻转 0→1 ⇒ 文件与目录不入网、在传的暂停（D16）"
-                  : "[文件排他] 投票翻转 1→0 ⇒ 自动续发一次（D16）");
-        if (!after && which != VOTE_NO_NETWORK) {
+        log(after ? "[文件排他] 投票翻转 0→1 ⇒ 该设备的文件与目录不入网、在传的暂停（D16，设备 " + peerIp + "）"
+                  : "[文件排他] 投票翻转 1→0 ⇒ 该设备自动续发一次（D16，设备 " + peerIp + "）");
+        if (!after && which == VOTE_IN_CALL) {
             // ⚠续发不许跑在调用方的线程上:调用点是CallManager.endCall(挂断按钮=EDT),而flushPending会读pending.jsonl(文件I/O)并同步发文本/剪贴板帧;
             //   甩到既有的UI发送线程=与安卓端flushPending()的io{}同一口径
             try {
-                uiSendExec.execute(this::flushPending);
+                final String onlyIp = peerIp;
+                uiSendExec.execute(() -> flushPending(onlyIp));
             } catch (Exception e) {
                 log("解除文件排他后的自动续发被拒（多半是本机正在退出）：" + e);
             }
@@ -279,23 +487,58 @@ public final class Link {
     private volatile String peerLabel = "";
     private volatile boolean running = false;
 
-    private volatile ServerSocket serverSocket;
+    private volatile ServerSocketChannel serverSocket;
     final CopyOnWriteArrayList<Session> sessions = new CopyOnWriteArrayList<Session>();
     /** 已握手会话：deviceId → 会话。只用于「同一台设备的双连接」去重，不同设备各留各的 */
     final ConcurrentHashMap<String, Session> byPeer =
             new ConcurrentHashMap<String, Session>();
+
+    /**
+     * 2 期：数据通道（lane）连接池。key = 对端 IP，value = lane 号 → 会话。
+     * lane 0 永远是主连接（{@link #byPeer} 里那条），这里只放 lane > 0 的纯数据连接；
+     * 它们不注册 peer、不参与去重、不进 UI。
+     */
+    final ConcurrentHashMap<String, ConcurrentHashMap<Integer, Session>> laneMap =
+            new ConcurrentHashMap<String, ConcurrentHashMap<Integer, Session>>();
+
+    /** 已声明走多通道、但 file_meta 还没到的 mid → 对端声明的通道数 */
+    final ConcurrentHashMap<String, Integer> multiMids = new ConcurrentHashMap<String, Integer>();
+
+    /**
+     * 多通道发送「等接收端建好 Rx」的 latch（mid → latch）。发送端先登记、再发 xe_begin+file_meta，
+     * 收到对端 xe_ready 才起数据通道；超时（{@link #XE_READY_WAIT_MS}）降级为主连接单通道发，不失败。
+     * 根因：接收端只在解析到 file_meta 时才 createRx，早到的分片会因「未知 mid」被丢弃 →
+     * 留下补不齐的单元缺口 → 重排环窗口卡死 30s。
+     */
+    final ConcurrentHashMap<String, java.util.concurrent.CountDownLatch> xeReadyLatches =
+            new ConcurrentHashMap<String, java.util.concurrent.CountDownLatch>();
+    /** 等 xe_ready 的上限：局域网往返是毫秒级，2s 只用于兜住「对端不支持/异常」→ 降级单通道 */
+    static final long XE_READY_WAIT_MS = 2000L;
+
+    void expectXeReady(String mid, java.util.concurrent.CountDownLatch latch) {
+        xeReadyLatches.put(mid, latch);
+    }
+
+    void clearXeReady(String mid) {
+        xeReadyLatches.remove(mid);
+    }
 
     // ==================== 保活重连 ====================
 
     /** 连接成功过就要保持长连接:通话/视频/文件传输结束后会话不能掉;
      *  只对"本端主动发起成功"的会话自动重连(能连上说明这个方向可达,对端可能有防火墙只放行单向来连);
      *  对端发起的入向会话不重试(本方向可能被挡,SYN长时间悬挂),由对端的保活负责;每15s一次直到连上/程序退出 */
-    private final java.util.concurrent.ScheduledExecutorService keepAliveExec =
-            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "pp-keepalive");
-                t.setDaemon(true);
-                return t;
-            });
+    private java.util.concurrent.ScheduledExecutorService keepAliveExec = newKeepAliveExec();
+
+    /** P2-6：stop() 会 shutdownNow，start() 必须能重建（字段不能是 final） */
+    private java.util.concurrent.ScheduledExecutorService newKeepAliveExec() {
+        return java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "pp-keepalive");
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
     private final ConcurrentHashMap<String, java.util.concurrent.ScheduledFuture<?>> keepAliveJobs =
             new ConcurrentHashMap<String, java.util.concurrent.ScheduledFuture<?>>();
 
@@ -305,6 +548,30 @@ public final class Link {
 
     /** 会话「快速失败」判据：连上不足这个时长就被断开 */
     static final long FAST_FAIL_MS = 10_000L;
+
+    /**
+     * 会话 socket 的收发缓冲（KB）。0 = 不显式设置，交给内核窗口自动调整（默认，P1-5 结论）。
+     * A/B 时改成 1024 / 4096 即可切回固定缓冲，无需改别处。
+     */
+    static final int SOCK_BUF_KB = 0;
+
+    /**
+     * 并发数据通道数（含主连接）。**已回到单连接 = 1**：单通道续传实测 1.1GB 约 8s（140MB/s），
+     * 第二条 TCP 连接没有实测收益却多一条断链路径；带宽改由自适应帧大小跑满（见 AdaptiveFrame）。
+     * hello 用该值广播，对端 lanesFor 取 min 后不会再拨 lane。
+     */
+    static final int LANES = 1;
+    /** lane 拨号超时（与主连接一致，3s 足够局域网/热点） */
+    static final int LANE_CONNECT_TIMEOUT_MS = 3000;
+    /** 等 lane 握手的上限；超时按该 lane 不可用处理，降级不失败 */
+    static final long LANE_HANDSHAKE_WAIT_MS = 2500L;
+
+    /**
+     * 发送侧零拷贝开关（P1-4 A/B）。false 时文件一律走原来的流式分片路径。
+     * Android 的 transferTo 走内核 sendfile；Windows 的 JDK 可能内部回落成拷贝循环，
+     * 若 PC 端实测反而更慢，把它改成 false 即可。
+     */
+    static final boolean ZC_SEND = true;
     /** 连续这么多次快速失败→保活重连退避(15s→60s),避免"连上就断"风暴 */
     static final int FAST_FAIL_LIMIT = 3;
 
@@ -315,12 +582,16 @@ public final class Link {
      *  不共用UI发送线程(uiSendExec):那条要处理消息/剪贴板/ack,被大文件占住会让聊天消息排队卡住;
      *  不影响通话与消息:音视频帧由采集、编码线程直接调sendAudio/sendVideo,消息与ack走sendOrDrop,都不进这条队列,
      *  只按帧粒度抢同一个socket的写锁,文件排队再长也不会让语音/视频/消息"排在文件后面" */
-    private final java.util.concurrent.ExecutorService fileSendExec =
-            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "pp-file-send");
-                t.setDaemon(true);
-                return t;
-            });
+    private java.util.concurrent.ExecutorService fileSendExec = newFileSendExec();
+
+    /** P2-6：stop() 会 shutdownNow，start() 必须能重建 */
+    private java.util.concurrent.ExecutorService newFileSendExec() {
+        return java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "pp-file-send");
+            t.setDaemon(true);
+            return t;
+        });
+    }
 
     /** 排队等待中的文件 / 文件夹条数（不含正在传的那一个） */
     int fileSendQueueDepth() {
@@ -646,6 +917,12 @@ public final class Link {
         return sessionByGroup(ip) != null;
     }
 
+    /** 指定设备已连上但还没配对（设备列表提示「未配对，点一下配对」用；没连接 = false） */
+    public boolean isDeviceUnpaired(String ip) {
+        Session s = sessionByGroup(ip);
+        return s != null && !s.paired;
+    }
+
     /** 当前会话（主动发送的目标）；未连接返回 null。
      *  选中地址没会话时回落到同设备的另一个地址（见 [sessionByGroup]）。 */
     Session target() {
@@ -764,7 +1041,105 @@ final LinkSend send = new LinkSend(this);
 final LinkCall call = new LinkCall(this);
     final LinkConsent consent = new LinkConsent(this);
 
+        /**
+         * SocketChannel 直通输入流。
+         *
+         * **不能用 Channels.newInputStream**：它在阻塞模式下先 {@code synchronized(channel)} 再 read()，
+         * 对端没数据时读线程一直抱着这把锁，同一条连接的写线程（控制帧/file_query/取消帧）全排在后面，
+         * 只能等对端下一帧把读唤醒（实际是心跳 ping，实测卡 5s）。SocketChannel 本身保证
+         * 「一个读线程 + 一个写线程」并发安全，读侧不需要额外互斥。
+         */
+        static final class ChannelIn extends InputStream {
+            private final SocketChannel ch;
+            private final ByteBuffer one = ByteBuffer.allocate(1);
+
+            ChannelIn(SocketChannel ch) {
+                this.ch = ch;
+            }
+
+            @Override
+            public int read() throws IOException {
+                one.clear();
+                int n = ch.read(one);
+                return n <= 0 ? -1 : (one.get(0) & 0xff);
+            }
+
+            @Override
+            public int read(byte[] b, int off, int len) throws IOException {
+                if (len == 0) {
+                    return 0;
+                }
+                int n = ch.read(ByteBuffer.wrap(b, off, len));
+                return n < 0 ? -1 : n;
+            }
+
+            @Override
+            public int available() {
+                return 0;
+            }
+
+            @Override
+            public void close() {
+                try {
+                    ch.close();
+                } catch (Exception ignore) {
+                }
+            }
+        }
+
+        /**
+         * SocketChannel 直通输出流（理由见 {@link ChannelIn}）：直接 channel.write，不碰 channel 监视器锁；
+         * 写与写的互斥由 {@link Session#writeLock} 负责（零拷贝分片也在同一把锁内）。
+         */
+        static final class ChannelOut extends OutputStream {
+            private final SocketChannel ch;
+            private final byte[] one = new byte[1];
+
+            ChannelOut(SocketChannel ch) {
+                this.ch = ch;
+            }
+
+            @Override
+            public void write(int b) throws IOException {
+                one[0] = (byte) b;
+                write(one, 0, 1);
+            }
+
+            @Override
+            public void write(byte[] b, int off, int len) throws IOException {
+                if (len == 0) {
+                    return;
+                }
+                ByteBuffer bb = ByteBuffer.wrap(b, off, len);
+                while (bb.hasRemaining()) {
+                    if (ch.write(bb) < 0) {
+                        throw new IOException("会话已关闭");
+                    }
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+                try {
+                    ch.close();
+                } catch (Exception ignore) {
+                }
+            }
+        }
+
         final class Session {
+        /**
+         * 底层用 SocketChannel 而不是 Socket：文件分片的发送侧要靠
+         * FileChannel.transferTo(..., SocketChannel) 走 sendfile/TransmitFile 零拷贝，
+         * 目标必须是真的 SocketChannel（包一层流或 Socket 就会被 JDK 退化成普通拷贝）。
+         * 控制帧/音视频帧走自带流式封装 {@link ChannelIn}/{@link ChannelOut}——**不能用
+         * Channels.newInputStream/newOutputStream**（理由见 ChannelIn 注释：会在阻塞读时持锁，写帧被拖到下一次心跳）。
+         */
+        final SocketChannel channel;
         final Socket socket;
         final boolean outgoing;
         final InputStream input;
@@ -780,6 +1155,12 @@ final LinkCall call = new LinkCall(this);
         volatile boolean handshaked = false;
         /** 对端能力(由hello协商得到)。握手前是"全false"——因此默认不会发视频帧 */
         final PeerCaps caps = new PeerCaps();
+        /** 2 期：本条连接的角色。0 = 主连接（唯一注册 peer 的那条）；>0 = 纯数据通道 */
+        volatile int lane = 0;
+        /** 2 期：对端声明的最大通道数。老端不带 lanes 字段 → 1（不支持多通道） */
+        volatile int peerLanes = 1;
+        /** 这条 lane 连接已握手、可写数据 */
+        volatile boolean laneReady = false;
         volatile long lastRx = System.currentTimeMillis();
         volatile long lastTx = System.currentTimeMillis();
         /** 会话建立时刻:连上不到{@link #FAST_FAIL_MS}就被断=有东西在秒杀会话(保活退避用) */
@@ -787,28 +1168,52 @@ final LinkCall call = new LinkCall(this);
         /** 已发出ping但之后未收到任何帧(含pong)时为true——判死依据,防自身ping刷lastTx骗过看门狗 */
         volatile boolean pingOutstanding = false;
         volatile boolean closed = false;
+        /**
+         * 非文件帧（JSON/音频/视频/ping）**本次写出的开始时刻**，0 = 当前没有在写（P1-3 写看门狗）。
+         * <p>Socket 没有写超时：对端半死（TCP 在但不读）时 write 会永久阻塞并占住 {@link #writeLock}，
+         * 于是 tryPing 永远 tryLock 失败 → pingOutstanding 置不上 → 35s 判死永不触发 → 会话假活。
+         * 心跳线程据此判死并 close()，让阻塞中的写立刻抛异常。文件分片不计入（大块传输本来就可能写很久）。
+         */
+        volatile long writeStartedAt = 0L;
+
+        // ===== P4-5 配对状态 =====
+        /** 内容通道是否已放行（配对通过或 token 命中） */
+        volatile boolean paired = false;
+        /** 0=无/发起方等待，1=接收方出示码，2=发起方输入码 */
+        volatile int pairRole = 0;
+        volatile String pairCode = "";
+        volatile int pairAttemptsLeft = 0;
+        volatile long pairDeadline = 0L;
+        /** 本端在这条连接上实际带出去的配对 token（空=没带）；空 token 的 pair_ok 只认它 */
+        volatile String pairTokenSent = "";
+        /** 是否已经走完一次 onSessionReady（重发 hello 不再重复补发/hsync） */
+        volatile boolean readyOnce = false;
 
         String remoteIp() {
             return remoteIp;
         }
 
-        Session(Socket s, boolean out) throws Exception {
-            this.socket = s;
+        Session(SocketChannel ch, boolean out) throws Exception {
+            this.channel = ch;
+            this.socket = ch.socket();
             this.outgoing = out;
-            InetAddress a = s.getInetAddress();
+            InetAddress a = this.socket.getInetAddress();
             this.remoteIp = a == null ? "" : a.getHostAddress();
-            // 大一点的收发缓冲:分片1MB起,默认8KB太小会白白多走系统调用
+            // P1-5：**不再显式设置 SO_SNDBUF/SO_RCVBUF**。
+            // 应用层一旦设值，内核就关闭发送/接收窗口的自动调整（Windows receive-window auto-tuning），
+            // 在速率与 RTT 都在波动的无线链路上固定缓冲只会更差。A/B 时改 SOCK_BUF_KB 即可。
             try {
-                s.setSendBufferSize(1 << 20);
-                s.setReceiveBufferSize(1 << 20);
-                // 诊断:读回内核实际值。注意TCP窗口缩放是握手时按当时的缓冲定死的,
-                // 这里(accept/connect之后)只能改缓冲、改不了缩放因子——读回值仅供对照
-                log("[sock] " + remoteIp + " snd=" + s.getSendBufferSize()
-                        + " rcv=" + s.getReceiveBufferSize() + (out ? " (主动)" : " (被动)"));
+                this.socket.setTcpNoDelay(true);
+                if (SOCK_BUF_KB > 0) {
+                    this.socket.setSendBufferSize(SOCK_BUF_KB * 1024);
+                    this.socket.setReceiveBufferSize(SOCK_BUF_KB * 1024);
+                }
+                log("[sock] " + remoteIp + " snd=" + this.socket.getSendBufferSize()
+                        + " rcv=" + this.socket.getReceiveBufferSize() + (out ? " (主动)" : " (被动)"));
             } catch (Exception ignore) {
             }
-            this.input = new DataInputStream(new BufferedInputStream(s.getInputStream()));
-            this.output = new BufferedOutputStream(s.getOutputStream());
+            this.input = new DataInputStream(new BufferedInputStream(new ChannelIn(ch)));
+            this.output = new BufferedOutputStream(new ChannelOut(ch));
         }
 
         void send(Map<String, Object> m) throws Exception {
@@ -817,9 +1222,11 @@ final LinkCall call = new LinkCall(this);
                 if (closed) {
                     throw new IllegalStateException("会话已关闭");
                 }
+                writeStartedAt = System.currentTimeMillis();
                 Protocol.write(output, m);
                 lastTx = System.currentTimeMillis();
             } finally {
+                writeStartedAt = 0L;
                 writeLock.unlock();
             }
         }
@@ -838,6 +1245,94 @@ final LinkCall call = new LinkCall(this);
             }
         }
 
+        /**
+         * 零拷贝发送一块（P1-4）：帧头走 channel，载荷由 {@link FileChannel#transferTo} 直接从文件
+         * 送进 socket（Linux sendfile / Windows TransmitFile），数据不经过用户态内存。
+         * <p>transferTo 一旦半途失败就不可续写：已写出字节 &gt; 0 再报错就直接抛给上层断链重传；
+         * 一个字节都没写就失败，才回落到普通拷贝（顺序仍然正确）。
+         */
+        void sendChunkFile(String mid, int seq, FileChannel src, long pos, int len) throws Exception {
+            writeLock.lock();
+            try {
+                if (closed) {
+                    throw new IllegalStateException("会话已关闭");
+                }
+                // 控制帧/音视频帧可能还压在 8KB 缓冲里：必须先落地，否则顺序错乱
+                output.flush();
+                byte[] head = Protocol.chunkHeader(mid, seq, len);
+                writeFully(ByteBuffer.wrap(head));
+                long at = pos;
+                int remain = len;
+                long copied = 0L;
+                while (remain > 0) {
+                    long n;
+                    try {
+                        n = src.transferTo(at, remain, channel);
+                    } catch (Throwable t) {
+                        if (copied == 0L) {
+                            TxStats.zcFallback();
+                            copyRange(src, at, remain);
+                            remain = 0;
+                            break;
+                        }
+                        throw t;
+                    }
+                    if (n <= 0) {
+                        if (copied == 0L) {
+                            TxStats.zcFallback();
+                            copyRange(src, at, remain);
+                            remain = 0;
+                            break;
+                        }
+                        throw new IOException("transferTo 无进展 n=" + n + " at=" + at + " remain=" + remain);
+                    }
+                    at += n;
+                    remain -= (int) n;
+                    copied += n;
+                }
+                if (copied > 0) {
+                    TxStats.zeroCopy(copied);
+                }
+                lastTx = System.currentTimeMillis();
+            } finally {
+                writeLock.unlock();
+            }
+        }
+
+        private void writeFully(ByteBuffer bb) throws IOException {
+            while (bb.hasRemaining()) {
+                int n = channel.write(bb);
+                if (n <= 0) {
+                    throw new IOException("channel closed while writing header");
+                }
+            }
+        }
+
+        /** 回落拷贝用的直接缓冲：每会话复用一个，避免每块都新申请 1MB 直接内存 */
+        private ByteBuffer zcTmp;
+
+        /** 零拷贝不可用时的块内回落：FileChannel → 直接缓冲 → channel（仍是一次内核拷贝） */
+        private void copyRange(FileChannel src, long pos, int len) throws IOException {
+            if (zcTmp == null) {
+                zcTmp = ByteBuffer.allocateDirect(1 << 20);
+            }
+            ByteBuffer tmp = zcTmp;
+            long at = pos;
+            int remain = len;
+            while (remain > 0) {
+                tmp.clear();
+                tmp.limit(Math.min(remain, tmp.capacity()));
+                int r = src.read(tmp, at);
+                if (r < 0) {
+                    throw new java.io.EOFException("源文件在 " + at + " 处提前结束");
+                }
+                tmp.flip();
+                writeFully(tmp);
+                at += r;
+                remain -= r;
+            }
+        }
+
         /** 语音音频帧:与JSON控制帧/文件分片共用写锁,保证帧不交错。
          * @return 本次写入耗时(ms)——上层(语音码率自适应)据此判断链路是否拥塞 */
         long sendAudio(int seq, long ts, byte[] buf, int off, int len) throws Exception {
@@ -847,10 +1342,12 @@ final LinkCall call = new LinkCall(this);
                     throw new IllegalStateException("会话已关闭");
                 }
                 long t0 = System.nanoTime();
+                writeStartedAt = System.currentTimeMillis();
                 Protocol.writeAudio(output, seq, ts, buf, off, len);
                 lastTx = System.currentTimeMillis();
                 return (System.nanoTime() - t0) / 1_000_000L;
             } finally {
+                writeStartedAt = 0L;
                 writeLock.unlock();
             }
         }
@@ -864,10 +1361,12 @@ final LinkCall call = new LinkCall(this);
                     throw new IllegalStateException("会话已关闭");
                 }
                 long t0 = System.nanoTime();
+                writeStartedAt = System.currentTimeMillis();
                 Protocol.writeVideo(output, seq, ts, flag, buf, off, len);
                 lastTx = System.currentTimeMillis();
                 return (System.nanoTime() - t0) / 1_000_000L;
             } finally {
+                writeStartedAt = 0L;
                 writeLock.unlock();
             }
         }
@@ -882,6 +1381,7 @@ final LinkCall call = new LinkCall(this);
                 if (closed) {
                     return true;
                 }
+                writeStartedAt = System.currentTimeMillis();
                 Protocol.write(output, Protocol.ping());
                 lastTx = System.currentTimeMillis();
                 return true;
@@ -889,6 +1389,7 @@ final LinkCall call = new LinkCall(this);
                 close();  // 与 sendOrDrop 同语义：发送失败即判死
                 return true;
             } finally {
+                writeStartedAt = 0L;
                 writeLock.unlock();
             }
         }
@@ -899,7 +1400,7 @@ final LinkCall call = new LinkCall(this);
             }
             closed = true;
             try {
-                socket.close();
+                channel.close();
             } catch (Exception ignore) {
             }
         }
@@ -912,6 +1413,19 @@ final LinkCall call = new LinkCall(this);
             return;
         }
         running = true;
+        // P2-6：线程池是一次性的，stop() 已 shutdownNow；重启链路必须重建，否则第一个任务就 RejectedExecutionException
+        if (keepAliveExec.isShutdown()) {
+            keepAliveExec = newKeepAliveExec();
+        }
+        if (fileSendExec.isShutdown()) {
+            fileSendExec = newFileSendExec();
+        }
+        if (uiSendExec.isShutdown()) {
+            uiSendExec = newUiSendExec();
+        }
+        if (frameExec.isShutdown()) {
+            frameExec = newFrameExec();
+        }
         if (store != null) {
             store.purgeStalePartials(PARTIAL_MAX_AGE_MS);
         }
@@ -936,8 +1450,9 @@ final LinkCall call = new LinkCall(this);
         keepAliveExec.shutdownNow();
         fileSendExec.shutdownNow();
         uiSendExec.shutdownNow();
+        frameExec.shutdownNow();
         try {
-            ServerSocket ss = serverSocket;
+            ServerSocketChannel ss = serverSocket;
             if (ss != null) {
                 ss.close();
             }
@@ -951,6 +1466,36 @@ final LinkCall call = new LinkCall(this);
         byPeer.clear();
         // 停止链路前取消的mid不会被发送循环处理到,清掉避免残留到进程结束(重启后不应再有"幽灵取消"命中新传输)
         cancelled.clear();
+        // P2-6：运行时容器一并清。接收上下文先停写线程、关流（不删半成品，留给续传）再清表，
+        // 否则下一次 start() 会命中上一轮的 Rx（旧进度/旧 sink）
+        synchronized (rxMap) {
+            for (Rx rx : new java.util.ArrayList<Rx>(rxMap.values())) {
+                rx.writerAlive = false;
+                synchronized (rx.flushLock) {
+                    rx.flushLock.notifyAll();
+                }
+                try {
+                    rx.sink.close();
+                } catch (Exception ignore) {
+                }
+            }
+            rxMap.clear();
+        }
+        synchronized (dirMap) {
+            dirMap.clear();
+        }
+        pausedMids.clear();
+        resumeWaiters.clear();
+        blkAckWaiters.clear();
+        resumeNeedBlk.clear();
+        resumePrep.clear();
+        memberOfMid.clear();
+        dirHaveBox.clear();
+        dirMemberAck.clear();
+        consent.clearAll();
+        // 回执登记同理：停机后不该再有等 ack 的条目（待发台账是持久的，重启照旧补发）
+        send.awaitingAck.clear();
+        send.rejectedAck.clear();
         pendingConnectIps = null;
         wakeUp();
         setState(State.STOPPED, "");
@@ -991,6 +1536,11 @@ final LinkCall call = new LinkCall(this);
         }
     }
 
+    /** 连接工人是否还有请求在处理（未出队或在拨号中）——启动阶段等一次尝试出结果用 */
+    boolean isDialing() {
+        return pendingConnectIps != null || connectingIp != null;
+    }
+
     static Thread daemon(Runnable r, String name) {
         Thread t = new Thread(r, name);
         t.setDaemon(true);
@@ -1002,12 +1552,12 @@ final LinkCall call = new LinkCall(this);
 
     private void acceptLoop() {
         // 绑定重试:与Android端对称。端口被占(旧实例退出中/TIME_WAIT等)时一次失败就永久退出会让本机"谁都连不上",每3s重试直到成功或停止
-        ServerSocket ss = null;
+        ServerSocketChannel ss = null;
         int attempt = 0;
         while (running && ss == null) {
             try {
-                ServerSocket s = new ServerSocket();
-                s.setReuseAddress(true);
+                ServerSocketChannel s = ServerSocketChannel.open();
+                s.setOption(StandardSocketOptions.SO_REUSEADDR, Boolean.TRUE);
                 s.bind(new InetSocketAddress(port()));
                 ss = s;
             } catch (Throwable t) {
@@ -1028,8 +1578,8 @@ final LinkCall call = new LinkCall(this);
             serverSocket = ss;
             log("开始监听 TCP " + port() + (attempt > 0 ? "（重试 " + attempt + " 次后成功）" : ""));
             while (running) {
-                Socket sk = ss.accept();
-                sk.setTcpNoDelay(true);
+                SocketChannel sk = ss.accept();
+                sk.socket().setTcpNoDelay(true);
                 adopt(sk, false);
             }
         } catch (Throwable t) {
@@ -1081,15 +1631,14 @@ final LinkCall call = new LinkCall(this);
                 stateNote = "";
                 refreshState();
                 Session s = null;
+                // 首个候选（多半是上次成功地址）给足 3s；同设备的其它候选多是换网前的过期地址，
+                // 给它 1.2s 就够（实测 .48 那种死地址每个吃满 3s，白白拖慢首连）
+                final int connectTimeout = target.equals(requested) ? 3000 : 1200;
                 try {
-                    Socket sk = new Socket();
-                    sk.setTcpNoDelay(true);
-                    try {
-                        sk.setSendBufferSize(1 << 20);
-                        sk.setReceiveBufferSize(1 << 20);
-                    } catch (Exception ignore) {
-                    }
-                    sk.connect(new InetSocketAddress(target, port()), 3000);
+                    // SocketChannel 的 socket 适配器支持带超时的 connect；语义与原实现一致
+                    SocketChannel sk = SocketChannel.open();
+                    sk.socket().setTcpNoDelay(true);
+                    sk.socket().connect(new InetSocketAddress(target, port()), connectTimeout);
                     log("主动连接 " + target + ":" + port() + " 成功");
                     s = adopt(sk, true);
                     // TCP通≠这台设备在线:地址可能被别的主机/服务占用;
@@ -1162,10 +1711,15 @@ final LinkCall call = new LinkCall(this);
     }
 
     /** @return 新建的会话（供调用方等握手确认）；创建/首帧失败返回 null */
-    private Session adopt(Socket socket, boolean outgoing) {
+    private Session adopt(SocketChannel socket, boolean outgoing) {
+        return adopt(socket, outgoing, 0);
+    }
+
+    private Session adopt(SocketChannel socket, boolean outgoing, int lane) {
         Session s;
         try {
             s = new Session(socket, outgoing);
+            s.lane = lane;
         } catch (Exception e) {
             log("创建会话失败: " + e);
             try {
@@ -1181,7 +1735,7 @@ final LinkCall call = new LinkCall(this);
             if (store != null) {
                 store.markBlockedGroup(key);
             }
-            blockDebugReport(key);
+            // 调试出口已移除（发布包不留标准输出痕迹）
             s.close();
             return null;
         }
@@ -1195,23 +1749,126 @@ final LinkCall call = new LinkCall(this);
         }
         sessions.add(s);
         log("接纳" + (outgoing ? "主动" : "被动") + "连接 " + s.remoteIp()
+                + (lane > 0 ? "（数据通道 lane=" + lane + "）" : "")
                 + "（当前在线 " + sessions.size() + " 条）");
         try {
-            s.send(Protocol.hello(myId(), myName(), "windows", localVidCap, false, localVCodecs));
+            // token 按设备身份（deviceId）优先、IP 兜底：只认 IP 的话，对端换 IP/本机换了接入点就查空，
+            // hello 不带 token ⇒ 对端把你当新设备拖去重新配对
+            String helloTok = store == null ? "" : store.pairedTokenFor(s.remoteIp());
+            s.pairTokenSent = helloTok;
+            s.send(Protocol.hello(myId(), myName(), "windows", localVidCap, false, localVCodecs,
+                    LANES, lane, helloTok));
         } catch (Exception e) {
             s.close();
             sessions.remove(s);
             return null;
         }
-        daemon(() -> readLoop(s), "pp-read-" + s.remoteIp());
+        daemon(() -> readLoop(s), (lane > 0 ? "pp-read-l" + lane : "pp-read-") + s.remoteIp());
         return s;
+    }
+
+    // ==================== 2 期：数据通道（lane）连接池 ====================
+
+    /**
+     * 取本次传输可用的通道集合（含主连接）。want 与对端能力取小；
+     * 某条 lane 建不起来就按实际条数发，不因此失败（最差退化为 1 期单通道）。
+     */
+    java.util.List<Session> lanesFor(Session main, int want) {
+        int n = Math.max(1, Math.min(want, main.peerLanes));
+        java.util.ArrayList<Session> list = new java.util.ArrayList<Session>(n);
+        list.add(main);
+        if (n <= 1) {
+            return list;
+        }
+        for (int l = 1; l < n; l++) {
+            Session exist = laneMap.getOrDefault(main.remoteIp(), new ConcurrentHashMap<Integer, Session>()).get(Integer.valueOf(l));
+            if (exist != null && !exist.closed && exist.laneReady) {
+                list.add(exist);
+                continue;
+            }
+            Session ns = null;
+            try {
+                ns = dialLane(main, l);
+            } catch (Throwable ignore) {
+            }
+            if (ns == null) {
+                break;
+            }
+            list.add(ns);
+        }
+        if (list.size() < n) {
+            log("多通道：只建起 " + list.size() + "/" + n + " 条通道，按实际条数发送");
+        }
+        return list;
+    }
+
+    /** 拨一条数据通道：连上 → adopt(lane) → 等对端 hello 完成挂载；失败返回 null（调用方降级） */
+    private Session dialLane(Session main, int lane) {
+        String ip = main.remoteIp();
+        if (ip.isEmpty()) {
+            return null;
+        }
+        SocketChannel sk = null;
+        try {
+            sk = SocketChannel.open();
+            sk.socket().setTcpNoDelay(true);
+            sk.socket().connect(new InetSocketAddress(ip, port()), LANE_CONNECT_TIMEOUT_MS);
+            Session ns = adopt(sk, true, lane);
+            if (ns == null) {
+                return null;
+            }
+            long t0 = System.currentTimeMillis();
+            while (running && !ns.closed && System.currentTimeMillis() - t0 < LANE_HANDSHAKE_WAIT_MS) {
+                if (ns.laneReady) {
+                    laneMap.computeIfAbsent(ip, k -> new ConcurrentHashMap<Integer, Session>())
+                            .put(Integer.valueOf(lane), ns);
+                    log("数据通道 lane=" + lane + " 建立 " + ip);
+                    return ns;
+                }
+                waitFor(50);
+            }
+            log("数据通道 lane=" + lane + " 握手超时（" + ip + "），降级不用它");
+            ns.close();
+            return null;
+        } catch (Throwable t) {
+            log("数据通道 lane=" + lane + " 连接失败（" + ip + "）：" + t.getMessage());
+            if (sk != null) {
+                try {
+                    sk.close();
+                } catch (Exception ignore) {
+                }
+            }
+            return null;
+        }
+    }
+
+    /** 主连接断开时顺手收掉它的所有 lane（避免半开连接堆积） */
+    void closeLanes(String ip) {
+        ConcurrentHashMap<Integer, Session> m = laneMap.remove(ip);
+        if (m == null) {
+            return;
+        }
+        for (java.util.Map.Entry<Integer, Session> e : m.entrySet()) {
+            try {
+                e.getValue().close();
+            } catch (Exception ignore) {
+            }
+            sessions.remove(e.getValue());
+            log("数据通道 lane=" + e.getKey() + " 随主连接关闭");
+        }
     }
 
     private void readLoop(Session s) {
         try {
             while (running && !s.closed) {
                 long rfT0 = System.nanoTime();
-                Protocol.Frame f = Protocol.readFrame(s.input);
+                // 快路径：解析到分片头就先问「这块落到哪」，能直读进 4MB 轮转缓冲就不分配临时数组
+                Protocol.Frame f = Protocol.readFrameInto(s.input, new Protocol.ChunkSinkResolver() {
+                    @Override
+                    public Protocol.ChunkSink resolve(String mid, int seq, int len) {
+                        return rx.reserveDirectChunk(mid, seq, len);
+                    }
+                });
                 TxStats.read(System.nanoTime() - rfT0);
                 if (f == null) {
                     break;
@@ -1220,9 +1877,13 @@ final LinkCall call = new LinkCall(this);
                 s.pingOutstanding = false;
                 if (f instanceof Protocol.Frame.JsonF) {
                     handleFrame(s, ((Protocol.Frame.JsonF) f).j);
+                } else if (!s.paired) {
+                    // P4-5 闸门补全：二进制分片/音频/视频同样受配对约束（原来只拦 JSON，
+                    // 跳过 hello 直灌二进制帧可绕过配对）；未配对静默丢弃
+                    continue;
                 } else if (f instanceof Protocol.Frame.Chunk) {
                     Protocol.Frame.Chunk c = (Protocol.Frame.Chunk) f;
-                    rx.onChunk(s, c.mid, c.seq, c.data, c.len);
+                    rx.onChunk(s, c.mid, c.seq, c.data, c.len, c.off, c.direct);
                 } else if (f instanceof Protocol.Frame.Audio) {
                     Protocol.Frame.Audio a = (Protocol.Frame.Audio) f;
                     Listener l = listener;
@@ -1251,11 +1912,36 @@ final LinkCall call = new LinkCall(this);
             }
             log("会话结束 " + s.remoteIp()
                     + " peer=" + (s.peerName.isEmpty() ? "?" : s.peerName)
-                    + (s.handshaked ? "" : " (未握手)"));
-            rx.abortRxsFor(s.remoteIp());
+                    + (s.handshaked ? "" : " (未握手)")
+                    + (s.lane > 0 ? " (lane " + s.lane + ")" : ""));
+            if (s.lane > 0) {
+                // 数据通道断开：只摘自己，**不能**中止该对端的接收（主连接还在传）
+                ConcurrentHashMap<Integer, Session> m = laneMap.get(s.remoteIp());
+                if (m != null && m.get(Integer.valueOf(s.lane)) == s) {
+                    m.remove(Integer.valueOf(s.lane));
+                }
+            } else {
+                // 去重收尾保护：同设备已有另一条握手完成且未关闭的会话（本条是被淘汰/半旧的连接）时，
+                // 不能按 IP 清扫接收与 lane，否则会把新会话上刚建立的传输误杀
+                boolean newerAlive = false;
+                for (Session o : sessions) {
+                    if (o != s && !o.closed && o.handshaked && o.remoteIp().equals(s.remoteIp())) {
+                        newerAlive = true;
+                        break;
+                    }
+                }
+                if (newerAlive) {
+                    log("会话结束 " + s.remoteIp() + "：同 IP 已有新会话，跳过接收/通道清扫");
+                } else {
+                    rx.abortRxsFor(s.remoteIp());
+                    // 单任务槽：断链兜底释放发送侧（接收侧已在 abortRxsFor 里按对端收口）
+                    releaseTaskFor(s.remoteIp(), "send");
+                    closeLanes(s.remoteIp());
+                }
+            }
             notifyPeers();
             // 保活重连:本端发起成功过的会话断开后自动重连(保持长连接;单向防火墙场景由可达的一端负责重连)。入向会话不重试
-            if (running && s.handshaked && s.outgoing) {
+            if (running && s.lane == 0 && s.handshaked && s.outgoing) {
                 noteSessionDrop(s);          // 「连上就断」记账（保活退避判定用）
                 scheduleKeepAlive(s.remoteIp());
             }
@@ -1272,16 +1958,48 @@ final LinkCall call = new LinkCall(this);
             if (!running) {
                 return;
             }
-            // 停滞看门狗（5s 周期）：先收后发，再回收闲置目录
+            // 停滞看门狗（5s 周期）：先收后发，再回收闲置目录；顺便撤掉 60s 没等到落盘回执的登记
             rx.scanStalledRx();
             scanStalledSends();
+            send.scanAckTimeouts();
+            pruneDenyVotes();     // 票③到期自动解除（P1-1）
             rx.pruneDirs();
             for (Session s : sessions) {
                 if (s.closed) {
                     continue;
                 }
+                // 写看门狗（P1-3，与安卓同口径）：Socket 没有写超时，对端不读时 write 会一直阻塞并占着写锁；
+                // 关会话让阻塞中的写立即抛异常，写线程自己清标记、上层按断链处理。
+                // 只统计非文件帧（send/sendAudio/sendVideo/ping 写入期间置 writeStartedAt）
+                long wAt = s.writeStartedAt;
+                if (wAt > 0 && System.currentTimeMillis() - wAt > CONTROL_WRITE_TIMEOUT_MS) {
+                    log("非文件帧写入超过 " + (CONTROL_WRITE_TIMEOUT_MS / 1000)
+                            + "s 未完成（对端不读/半死），关闭会话解阻塞");
+                    s.close();
+                    continue;
+                }
                 if (!s.handshaked && System.currentTimeMillis() - s.lastRx > 8000) {
                     log("握手超时，关闭会话");
+                    s.close();
+                    continue;
+                }
+                // P4-5 配对超时：到点还没配好就关会话并提示，避免半开连接一直挂在列表里
+                if (s.handshaked && !s.paired && s.pairDeadline > 0
+                        && System.currentTimeMillis() > s.pairDeadline) {
+                    log("配对超时（" + s.peerName + " " + s.remoteIp() + "），通知对端关弹窗并关闭会话");
+                    // 先告诉对端「这次配对作废」：否则对端会一直停在出示码/输入键盘的界面上，
+                    // 自己这边的超时提示关掉了，对端却像卡死一样（两端状态必须一起收）
+                    if (!s.closed) {
+                        trySend(s, Protocol.pairCancel());
+                    }
+                    if (pairUiMatches(s)) {
+                        pairUiIp = "";
+                        if (listener != null) {
+                            listener.onPairState(new PairUi(s.remoteIp(), s.peerName,
+                                    s.pairRole == 1, "", 0, 0,
+                                    "配对超时，请重连后重新配对", true, false));
+                        }
+                    }
                     s.close();
                     continue;
                 }
@@ -1337,6 +2055,18 @@ final LinkCall call = new LinkCall(this);
         if (type.startsWith("clip") && !LocalIps.isLanPeer(s.remoteIp())) {
             return;
         }
+        // ===== P4-5 闸门：未配对的会话只准走心跳与配对握手，任何内容帧直接丢 =====
+        // 不再以 handshaked 为前提：TCP 连上后、hello 到达前同样要拦——
+        // 否则跳过 hello 直发内容帧就能绕过配对往本机写消息/文件（首次连接必须先输配对码）
+        if (s.lane == 0 && !s.paired && !PAIRED_ALLOWED_FRAMES.contains(type)) {
+            log("未配对会话 " + s.remoteIp() + " 发来 " + type + "，已丢弃（内容通道要配对通过后才放行）");
+            return;
+        }
+        // lane 会话只承载分片与通道控制帧，其余内容帧一律丢弃（防绕过配对闸门注水）
+        if (s.lane > 0 && !LANE_ALLOWED_FRAMES.contains(type)) {
+            log("数据通道 lane=" + s.lane + " 收到非通道帧 " + type + "，已丢弃");
+            return;
+        }
         switch (type) {
             case "hello":
                 onHello(s, j);
@@ -1346,10 +2076,32 @@ final LinkCall call = new LinkCall(this);
                 break;
             case "pong":
                 break;
+            case "pair_need":
+                runFrameTask("pair_need", () -> onPairNeed(s, j));
+                break;
+            case "pair_submit":
+                runFrameTask("pair_submit", () -> onPairSubmit(s, j));
+                break;
+            case "pair_ok":
+                runFrameTask("pair_ok", () -> onPairOk(s, j));
+                break;
+            case "pair_fail":
+                runFrameTask("pair_fail", () -> onPairFail(s, j));
+                break;
+            case "pair_cancel":
+                runFrameTask("pair_cancel", () -> onPairCancel(s));
+                break;
             case "busy": {
-                // 只可能来自旧版本对端:它还是"同一时刻只服务一个对端"。新版本不再发这个帧;
-                // 收到就如实告诉用户(点了设备但对方被旧版本占着),不做退避轮询——本端本来就不重试
+                // 新协议：带 mid = 本机这一条被"单任务槽"回绝了。只暂缓该条目（不关会话），
+                //   等对端空出来发的 sync_req 触发待发队列重试；
+                // 不带 mid = 旧版本对端（"同一时刻只服务一个对端"），维持老逻辑：提示 + 断开会话
+                String mid = Json.str(j, "mid", "");
+                String name = Json.str(j, "name", "");
                 String holder = Json.str(j, "holder", "");
+                if (!mid.isEmpty()) {
+                    markPeerBusy(mid, name.isEmpty() ? holder : name, s.remoteIp());
+                    break;
+                }
                 log("对端（旧版本）返回忙" + (holder.isEmpty() ? "" : "：正与 " + holder + " 会话")
                         + "，本端不自动重试，稍后再点一次设备");
                 stateNote = "对端忙（旧版本同时只服务一个对端），稍后再点一次";
@@ -1368,8 +2120,8 @@ final LinkCall call = new LinkCall(this);
                     m.peerIp = s.remoteIp();
                     m.dir = Msg.DIR_PEER;
                     m.kind = Msg.KIND_TEXT;
-                    m.text = Json.str(j, "text", "");
-                    m.ts = Json.lng(j, "ts", System.currentTimeMillis());
+                    m.text = Protocol.limitText(Json.str(j, "text", ""));
+                    m.ts = Protocol.saneTs(Json.lng(j, "ts", System.currentTimeMillis()));
                     emit(m);
                 }
                 trySend(s, Protocol.ack(mid, true));
@@ -1405,9 +2157,41 @@ final LinkCall call = new LinkCall(this);
                 break;
             }
             case "file_meta":
-            case "file_done":
                 trustContent(s.remoteIp());   // 已知设备打点③：收到文件
                 rx.onFileFrame(s, j);
+                break;
+            case "file_done": {
+                trustContent(s.remoteIp());
+                // 落盘收尾（最长 60s）不能坐在网络读线程上：期间读线程不读 socket ⇒ 心跳把自己判死、
+                // 对端 ack 也等不到。投到单线程收尾执行器，同一文件夹的 file_done 一定先于 dir_end
+                final Session fs = s;
+                final Map<String, Object> fj = j;
+                runRxFinalize("file_done", () -> rx.onFileFrame(fs, fj));
+                break;
+            }
+            // ===== 2 期多通道：开传声明在 file_meta 之前到达，接收端据此把该 mid 建成重排环 =====
+            case "xe_begin":
+                rx.onXeBegin(s, j);
+                break;
+            case "xe_end": {
+                String emid = Json.str(j, "mid", "");
+                if (!emid.isEmpty()) {
+                    multiMids.remove(emid);
+                }
+                break;
+            }
+            case "xe_ready": {
+                // 接收端 Rx 已建好 → 放行发送端的多通道线程
+                String rmid = Json.str(j, "mid", "");
+                java.util.concurrent.CountDownLatch latch =
+                        rmid.isEmpty() ? null : xeReadyLatches.get(rmid);
+                if (latch != null) {
+                    latch.countDown();
+                }
+                break;
+            }
+            case "lane_ok":
+                log("数据通道 lane=" + Json.integer(j, "lane", 0) + " 对端已挂载");
                 break;
             case "file_query":
                 rx.onFileQuery(s, j);
@@ -1418,13 +2202,26 @@ final LinkCall call = new LinkCall(this);
             case "file_verify":
                 rx.onFileVerify(j);
                 break;
+            // 32MB 分块大小校验：核验请求 / 核验结果
+            case "blk_ack":
+                rx.onBlkAck(j);
+                break;
+            case "blk_verify":
+                runFrameTask("blk_verify", () -> rx.onBlkVerify(s, j));
+                break;
             case "dir_meta":
                 trustContent(s.remoteIp());   // 文件夹成员同样算文件往来
                 rx.onDirMeta(s, j);
                 break;
-            case "dir_end":
-                rx.onDirEnd(s, j);
+            case "dir_have":
+                rx.onDirHave(j);
                 break;
+            case "dir_end": {
+                final Session fs = s;
+                final Map<String, Object> fj = j;
+                runRxFinalize("dir_end", () -> rx.onDirEnd(fs, fj));
+                break;
+            }
             case "dir_missing":
                 rx.onDirMissing(j);
                 break;
@@ -1432,13 +2229,25 @@ final LinkCall call = new LinkCall(this);
                 rx.onRemoteFileCancel(Json.str(j, "mid", ""));
                 break;
             case "sync_req":
+                // 对端空出来了（它刚释放任务槽）：先清掉它名下的 busy 记号，再补发 ——
+                // 否则那些被回绝的条目会一直等到 TTL 过期才重试
+                clearPeerBusyFor(s.remoteIp());
                 // 只补发**这台设备**的待发内容，不波及其他会话
                 flushPending(s.remoteIp());
                 break;
             case "ack": {
-                // "对端确认收到"应答。文件/文本在本地发送成功路径(file_done/send返回)已置OK,
-                // 这里再走updated只会拿一个kind默认TEXT、fileSize=0的裸帧重绘气泡——把文件气泡污染成空白文本、还把0B写进历史(实测)。故只记日志,不emit
-                log("对端已确认收到 mid=" + Json.str(j, "mid", ""));
+                // "对端确认收到"应答。**文件的落盘确认以它为准**：send.applyAck 用登记时留下的完整
+                // 气泡快照(mid/peerIp/kind/fileName/fileSize)重绘，不会重犯"裸帧被当TEXT画成空白气泡、
+                // 还把0B写进历史"的老坑；文本/其它无登记的 mid 返回 false，只记日志
+                String ackMid = Json.str(j, "mid", "");
+                boolean ackOk = Json.bool(j, "ok", true);
+                // 文件夹成员的回执：只记账，要不要重发由 dir_end 的清单对账说了算
+                if (onMemberAck(ackMid, ackOk)) {
+                    break;
+                }
+                if (!send.applyAck(ackMid, ackOk)) {
+                    log("对端回执 mid=" + ackMid + (ackOk ? " ok" : " fail") + "（无在途文件登记，仅记录）");
+                }
                 break;
             }
             case "call_invite": {
@@ -1537,11 +2346,11 @@ final LinkCall call = new LinkCall(this);
                 break;
             }
             // 数据流量确认:v2.7。PC恒不在运营商数据网络(有线/无线局域网),所以收到询问一律自动同意,不需要打扰用户;
-            //  data_ans是发起方阻塞等待的唤醒信号→直接投信箱,不排队
+            //  只需回 data_ans 给发起方。data_ask 的 mid 由对端生成,与本机等待信箱的 mid 不可能相同,
+            //  往本机信箱投递是空操作,已移除(本机信箱只由下方 data_ans 分支投递)。
             case "data_ask": {
                 String dmid = Json.str(j, "mid", "");
                 if (!dmid.isEmpty()) {
-                    consent.deliverDataAns(dmid, true);
                     consent.replyDataAsk(s.remoteIp(), dmid, true);
                     log("对端请求用数据流量传输（kind=" + Json.str(j, "kind", "file")
                             + "）：本机非数据网络，已自动同意");
@@ -1560,7 +2369,7 @@ final LinkCall call = new LinkCall(this);
                 final Session fs = s;
                 final Map<String, Object> fj = j;
                 final String ftype = type;
-                daemon(() -> {
+                runFrameTask("hsync", () -> {
                     if ("hsync_mids".equals(ftype)) {
                         hsync.onHsyncMids(fs, fj);
                     } else if ("hsync_pull".equals(ftype)) {
@@ -1568,16 +2377,16 @@ final LinkCall call = new LinkCall(this);
                     } else {
                         hsync.onHsyncMsg(fs, fj);
                     }
-                }, "pp-hsync");
+                });
                 break;
             }
             // ==================== 消息删除同步（v2.4）====================
 
-            // 清历史文件可能不快，不卡网络读线程 → 工作线程
+            // 清历史文件可能不快，不卡网络读线程 → 有界工作池
             case "msg_del": {
                 final Session fs = s;
                 final Map<String, Object> fj = j;
-                daemon(() -> hsync.onRemoteMsgDel(fs, fj), "pp-msgdel");
+                runFrameTask("msg_del", () -> hsync.onRemoteMsgDel(fs, fj));
                 break;
             }
             default:
@@ -1593,6 +2402,88 @@ final LinkCall call = new LinkCall(this);
         String pid = Json.str(j, "id", "");
         if (pid.isEmpty()) {
             s.close();
+            return;
+        }
+        // 自连闸门：对端自称的 deviceId 就是本机 ⇒ 连到了自己（本机 IP / 环回被当设备填进了列表）。
+        // 放进来会绑出「自己是自己的设备」的组，而且那一行 lastId=本机 id 在列表里被过滤掉、删不掉，
+        // 之后每次启动都自连一轮。与安卓端同口径，必须在任何绑定/登记之前拒掉。
+        if (pid.equals(myId())) {
+            log("握手：对端自报 deviceId 与本机相同（" + s.remoteIp() + "），判定自连，关闭会话");
+            s.close();
+            sessions.remove(s);
+            return;
+        }
+        // ===== 版本闸门（v4）：hello 必须自报协议版本，不一致直接拒连（与安卓同口径）=====
+        int peerVer = Json.integer(j, "ver", 0);
+        if (peerVer != Protocol.PROTO_VER) {
+            log("对端协议 v" + peerVer + " 与本端 v" + Protocol.PROTO_VER
+                    + " 不一致（缺 ver 按 0 计），拒绝连接；请把两端都升级到最新版本");
+            stateNote = "对端版本过旧（协议 v" + peerVer + "），请同时升级两端";
+            s.close();
+            return;
+        }
+        // ===== 分片大小闸门（v3）：old 端不带 chunk → 按 1MB 处理，两端 offset 换算不一致会把文件写错位 =====
+        int peerChunk = Json.integer(j, "chunk", 1024 * 1024);
+        if (peerChunk != Protocol.CHUNK_SIZE) {
+            log("对端分片 " + peerChunk + "B 与本端 " + Protocol.CHUNK_SIZE
+                    + "B 不一致（旧版本），拒绝连接；请把两端都升级到最新版本");
+            stateNote = "对端版本过旧（分片 " + peerChunk + "B），请同时升级两端";
+            s.close();
+            return;
+        }
+        // P4-1 32MB 分块校验 / P4-5 配对能力闸门：老端不带这两个字段 → 续传/配对都无法协商，直接拒
+        int peerBlk = Json.integer(j, "blk", 0);
+        boolean peerPairCap = Json.bool(j, "pr", false);
+        if (peerBlk != Protocol.BLOCK_SIZE || !peerPairCap) {
+            log("对端缺 32MB 分块校验/配对能力（blk=" + peerBlk + " pr=" + peerPairCap
+                    + "），拒绝连接；请把两端都升级到最新版本");
+            stateNote = "对端版本过旧（不支持分块校验/设备配对），请同时升级两端";
+            s.close();
+            return;
+        }
+        // ===== 2 期：数据通道（lane）连接只挂载，不注册 peer、不参与去重 =====
+        s.peerLanes = Math.max(1, Json.integer(j, "lanes", 1));
+        int jlane = Json.integer(j, "lane", 0);
+        if (jlane > 0) {
+            // 安全闸门：lane 必须从属于一条已握手、已配对的同设备主连接，否则不挂
+            Session laneMain = byPeer.get(pid);
+            if (laneMain == null || laneMain.closed || !laneMain.handshaked || !laneMain.paired) {
+                log("拒绝挂载数据通道 lane=" + jlane + "：" + s.remoteIp()
+                        + " 无已配对主连接（peer=" + pid + "）");
+                s.close();
+                sessions.remove(s);
+                return;
+            }
+            s.lane = jlane;
+            s.peerId = pid;
+            s.peerName = Json.str(j, "name", pid);
+            s.handshaked = true;
+            s.laneReady = true;
+            s.paired = true;   // 数据通道不做配对，主连接配对通过后才可能被拨
+            laneMap.computeIfAbsent(s.remoteIp(), k -> new ConcurrentHashMap<Integer, Session>())
+                    .put(Integer.valueOf(jlane), s);
+            log("数据通道 lane=" + jlane + " 已挂载 " + s.remoteIp()
+                    + "（对端 lanes=" + s.peerLanes + "）");
+            try {
+                s.send(Protocol.laneOk(jlane));
+            } catch (Throwable ignore) {
+            }
+            return;
+        }
+        // 拨号方自己的 lane 会话：收到的是对端把自己当主连接发来的 hello（lane=0），同样不能走去重
+        if (s.lane > 0) {
+            Session laneMain = byPeer.get(pid);
+            if (laneMain == null || laneMain.closed || !laneMain.handshaked || !laneMain.paired) {
+                log("数据通道 lane=" + s.lane + " 主连接未就绪（peer=" + pid + "），关闭");
+                s.close();
+                sessions.remove(s);
+                return;
+            }
+            s.peerId = pid;
+            s.peerName = Json.str(j, "name", pid);
+            s.handshaked = true;
+            s.laneReady = true;
+            s.paired = true;
             return;
         }
         s.peerId = pid;
@@ -1635,6 +2526,16 @@ final LinkCall call = new LinkCall(this);
                 return;
             }
             byPeer.remove(pid, exist);
+            // 新连接顶掉旧连接时，把旧连接上**进行中的配对**迁移过来：
+            // 不迁移的话，刚出示的码/正在输入的角色会随去重一起消失，对端提交的 pair_submit
+            // 就没人核对（两端都停在配对界面，用户看到的就是「卡死」）
+            if (!exist.paired && exist.pairRole != 0 && !s.paired) {
+                s.pairRole = exist.pairRole;
+                s.pairCode = exist.pairCode;
+                s.pairAttemptsLeft = exist.pairAttemptsLeft;
+                s.pairDeadline = exist.pairDeadline;
+                log("配对：进行中的配对（role=" + s.pairRole + "）已迁移到新连接（" + s.remoteIp() + "）");
+            }
             exist.close();
             sessions.remove(exist);
         }
@@ -1663,28 +2564,531 @@ final LinkCall call = new LinkCall(this);
         // 这台设备已可达⇒撤掉还没轮到的候选地址(可能是被动连上,也可能是对端抢先拨通)
         clearPendingFor(s.remoteIp());
 
+        // 同一台设备换了局域网地址：新的连上、旧的自动删 —— 这一步**要等身份验证通过**才做（onSessionReady）。
+        // 握手只证明「对端自称是这个 id」（bindDeviceIfFree 在这里照旧做身份绑定），
+        // 地址被 DHCP 复用给别的设备时不能凭自称就把这台设备的历史地址删掉。
+
         // 第一台连上来的设备默认成为"当前对话";当前选中目标没有健康会话时也跟过去——
         // 否则selectedIp停在旧IP/点过但连不上的地址(如扫描列表里的IPv6条目)上:状态恒显"未连接"、发消息进待发队列收不到(修复,与Android端对称)
         if (selectedIp == null || selectedIp.isEmpty() || sessionOf(selectedIp) == null) {
             selectedIp = s.remoteIp();
             selectedLabel = s.peerName;
+        } else if (store != null && selectedIp.equals(s.remoteIp()) == false
+                && store.convKeyOf(selectedIp).equals(pid)) {
+            // 当前对话就是这台设备：这次是在它的新地址上握手的，选中地址跟过去，
+            // 免得顶栏/聊天区停在一条马上要被验证通过的会话清掉的老 IP 上
+            selectedIp = s.remoteIp();
+            selectedLabel = s.peerName;
         }
         notifyPeers();
         refreshState();
-        // D16:这台设备可达⇒撤掉"没网络"那一票;紧跟着下面那句既有的flushPending负责续发
-        // (setFileVote对这一票不再自动flush,避免同一条目排两次)
-        setFileVote(VOTE_NO_NETWORK, false);
-        // 只补发属于这台设备的待发内容
+        // ===== P4-5：配对状态机 =====
+        // token 命中 → 直接放行内容通道；新设备 → 接收方出示 6 位码 / 发起方弹数字键盘。
+        // 原来的 setFileVote/flushPending/pullPeerClip/hsync 全部搬进 onSessionReady，配对通过后才执行
+        startPairingOrActivate(s, j);
+    }
+
+    /** 对单条会话重发 hello（配对自愈用：把按 deviceId 取到的权威 token 带过去） */
+    private void resendHello(Session s, String tok) {
+        if (s == null || s.closed) {
+            return;
+        }
+        try {
+            s.send(Protocol.hello(myId(), myName(), "windows", localVidCap, false, localVCodecs,
+                    LANES, s.lane, tok));
+        } catch (Exception e) {
+            log("重发 hello 失败（" + s.remoteIp() + "）：" + e);
+        }
+    }
+
+    // ==================== P4-5 配对状态机 ====================
+
+    /**
+     * 配对入口。
+     * <ul>
+     *   <li>双方都持有同一 token：发起方等 pair_ok；接收方回 pair_ok 后直接放行。</li>
+     *   <li>用户点了设备：由点的那一端出示 6 位码（见 {@link #requestPair}），对端收到 pair_need 切到数字键盘。</li>
+     *   <li>用户没点：**两端都不弹**。会话留在「已连接、未配对」，列表提示「未配对 — 单击这台设备出示配对码」。</li>
+     * </ul>
+     */
+    private void startPairingOrActivate(Session s, Map<String, Object> j) {
+        String pid = s.peerId;
+        String peerTok = Json.str(j, "tok", "");
+        String myTok = store == null ? "" : store.pairedTokenOf(pid);
+        boolean tokenMatch = !myTok.isEmpty() && !peerTok.isEmpty()
+                && MessageDigest.isEqual(myTok.getBytes(StandardCharsets.UTF_8),
+                peerTok.getBytes(StandardCharsets.UTF_8));
+        if (!tokenMatch && !myTok.isEmpty() && peerTok.isEmpty() && store != null) {
+            // 对端这次没带 token ≠ 它清过数据：可能只是它换了 IP（按 IP 查表查空）、刚启动还没读到缓存、
+            // 或者只更新了一端。**绝不能在这里删本机配对记录**——旧实现正是在这里 unpair，
+            // 重启/换 DHCP 一次就要重配，而且两端互相删、再也回不去。保留记录，这次按"未配对"走 6 位码。
+            log("配对：对端本次未带 token（" + s.remoteIp() + "），按未配对处理，保留本机配对记录");
+            // 本机记录还在、只是**这次带过去的 token 不对**（按地址查空/地址被别的设备占了）⇒
+            // 用按 deviceId 取到的权威 token 补发一次 hello。两端都这么做就能互相核对上，
+            // 不用用户重新配对（这就是「连接过的设备反复要验证」的根因之一）。
+            if (!myTok.equals(s.pairTokenSent)) {
+                s.pairTokenSent = myTok;
+                resendHello(s, myTok);
+                log("配对：对端没带 token，已按 deviceId 补发一次带 token 的 hello（" + s.remoteIp() + "）");
+            }
+        }
+        if (tokenMatch) {
+            // 身份核对通过 ⇒ 刷新「设备 → 本次地址」缓存（换过 IP 的旧缓存会失效/被 DHCP 复用）
+            if (store != null) {
+                store.markPaired(pid, s.peerName, myTok, s.remoteIp());
+            }
+            // token 已经放行 → 用户之前点的配对意图自动作废
+            if (matchesPendingPair(s)) {
+                clearPendingPair();
+            }
+            if (!s.outgoing) {
+                // 接收方：token 已核对通过，明确告诉发起方「不用配对」
+                s.paired = true;
+                trySend(s, Protocol.pairOk(""));
+                onSessionReady(s);
+            } else {
+                // 已就绪会话重发 hello（能力更新）：保持配对态，不重走等待
+                if (s.paired) {
+                    log("配对：已就绪会话收到 hello 重发，保持配对（" + s.remoteIp() + "）");
+                    return;
+                }
+                // 本机这次 hello 带过去的 token 不是权威值（按地址取，地址缓存被清过或被别的设备占了）⇒
+                // 对端拿不到能对上号的 token，只能当我们没配对。用按 deviceId 取到的权威 token 补发一次 hello：
+                // 对端重新核对，命中就直接回 pair_ok，不用用户重新配对。
+                if (!myTok.equals(s.pairTokenSent)) {
+                    s.pairTokenSent = myTok;
+                    resendHello(s, myTok);
+                    log("配对：本次 hello 的 token 与设备身份不符，已按 deviceId 补发一次（" + s.remoteIp() + "）");
+                }
+                // 发起方：token 已带过去，等 pair_ok 或 pair_need（由心跳看 pairDeadline）
+                s.paired = false;
+                s.pairRole = 0;
+                s.pairDeadline = System.currentTimeMillis() + PAIR_TTL_MS;
+                log("配对：本机持有 token，等待对端确认（" + s.remoteIp() + "）");
+            }
+            return;
+        }
+        // 已配对且内容通道已放行的会话，收到 hello 重发（能力更新/解码器枚举完）时 token 可能对不上
+        // （本端换过 IP、或只更新了一端）——**不能因此把会话降级成未配对**：
+        // 旧实现这里 s.paired=false，随后该连接上所有内容帧被配对闸门丢掉，用户看到的是连接忽然"半死"。
+        if (s.paired) {
+            log("配对：已就绪会话收到 token 对不上的 hello 重发，保持配对（" + s.remoteIp() + "）");
+            return;
+        }
+        // 配对进行中（本端已出示码 / 正在输入码）时收到 hello 重发（例如视频解码器枚举完后的能力更新），
+        // **绝不能把配对状态清掉**：旧实现会清空 pairRole/pairCode，对端随后提交的码就被当成
+        // 「没有待核对的码」静默丢弃；若这里还重新生成一次码，用户照着旧码输永远不对 —— 两端都停在配对界面。
+        if (s.pairRole != 0 || !s.pairCode.isEmpty()) {
+            log("配对：配对进行中（role=" + s.pairRole + "），忽略 hello 重发对配对状态的重置（" + s.remoteIp() + "）");
+            return;
+        }
+        s.paired = false;
+        s.pairAttemptsLeft = PAIR_MAX_ATTEMPTS;
+        s.pairRole = 0;
+        s.pairCode = "";
+        // 不设 pairDeadline：没弹窗就不该因为「配对超时」把一条好连接关掉
+        s.pairDeadline = 0L;
+        if (matchesPendingPair(s)) {
+            clearPendingPair();
+            log("配对：" + s.peerName + "(" + pid + ") 是用户刚点的设备，连接已建立，出示配对码");
+            showPairAsCode(s);
+        } else {
+            // 本端是发起方、但用户没点这台设备（启动自动连接/扫描后自动连接）：**不自动出示**。
+            // 自动弹与设计相反（列表与安卓端都写着「未配对，点一下配对」），
+            // 现象就是「选了保留数据，一启动就被糊一脸 PIN 页」；用户点一下设备走 requestPair 即可。
+            log("配对：" + s.peerName + "(" + pid + ") 已连接但未配对，等用户点设备再出示配对码（不自动弹）");
+        }
+    }
+
+    /**
+     * 用户主动点了一台设备：未配对就走「本端出示 6 位码 → 对端输入」。
+     * 连接还没起来时只记下意图，握手完成后再出示（见 {@link #startPairingOrActivate}）。
+     */
+    public void requestPair(String ip) {
+        if (ip == null) {
+            return;
+        }
+        String v = ip.trim();
+        if (v.isEmpty()) {
+            return;
+        }
+        Session s = sessionByGroup(v);
+        if (s == null || s.closed || !s.handshaked) {
+            pendingPairIp = v;
+            pendingPairAt = System.currentTimeMillis();
+            log("配对：已记下用户配对意图（" + v + "），连接建立后出示配对码");
+            return;
+        }
+        if (s.paired) {
+            return;
+        }
+        // 已经在输入码（弹窗还开着）：保持现状，别把它切成「出示码」，否则两端都可能亮码、谁都没法输
+        if (s.pairRole == 2) {
+            return;
+        }
+        clearPendingPair();
+        showPairAsCode(s);
+    }
+
+    /** 本端出示 6 位码并通知对端弹出数字键盘（只在用户主动点设备时调用，不再随连接自动弹） */
+    private void showPairAsCode(Session s) {
+        if (s == null || s.paired || s.closed) {
+            return;
+        }
+        // 已经在出示码：沿用旧码，只把覆盖层重新推给界面。重新生成会让用户照着旧码输永远不对
+        if (s.pairRole == 1 && !s.pairCode.isEmpty()) {
+            showPairUi(new PairUi(s.remoteIp(), s.peerName, true, s.pairCode,
+                    s.pairAttemptsLeft, PAIR_TTL_MS, ""));
+            return;
+        }
+        String code = newPairCode();
+        s.pairCode = code;
+        s.pairRole = 1;
+        s.pairAttemptsLeft = PAIR_MAX_ATTEMPTS;
+        s.pairDeadline = System.currentTimeMillis() + PAIR_TTL_MS;
+        log("配对：用户主动发起 " + s.peerName + "(" + s.peerId + ")，本端出示 6 位码，等待对方输入");
+        showPairUi(new PairUi(s.remoteIp(), s.peerName, true, code,
+                PAIR_MAX_ATTEMPTS, PAIR_TTL_MS, ""));
+        // 点设备/握手回调可能就在 EDT 上：帧一律丢进 uiSendExec，别在 EDT 直接写 socket（写锁被文件占住时界面会卡死）
+        uiSendExec.execute(() -> {
+            if (!s.closed) {
+                trySend(s, Protocol.pairNeed(PAIR_TTL_MS));
+            }
+        });
+    }
+
+    /** 用户点的地址是否就是这条会话的设备（同设备换地址也算同一台） */
+    private boolean matchesPendingPair(Session s) {
+        String want = pendingPairIp;
+        if (want == null || want.isEmpty()) {
+            return false;
+        }
+        if (System.currentTimeMillis() - pendingPairAt > PAIR_TAP_INTENT_TTL_MS) {
+            return false;
+        }
+        if (want.equals(s.remoteIp())) {
+            return true;
+        }
+        if (store == null) {
+            return false;
+        }
+        return store.convKeyOf(want).equals(store.convKeyOf(s.remoteIp()));
+    }
+
+    private void clearPendingPair() {
+        pendingPairIp = "";
+        pendingPairAt = 0L;
+    }
+
+    /** 配对完成：内容通道正式可用（补发待发消息 + 历史同步 + 剪贴板协商） */
+    private void onSessionReady(Session s) {
+        if (s == null || s.closed) {
+            return;
+        }
+        boolean first = !s.readyOnce;
+        s.readyOnce = true;
+        s.paired = true;
+        s.pairRole = 0;
+        s.pairCode = "";
+        s.pairDeadline = 0L;
+        // 配对成功即「已知设备」（与安卓端同口径）：配对码本身就是用户授权，
+        // 不再要求先收发过消息/文件——否则配对完不发消息，托盘后台重连会被自己的白名单挡掉
+        if (store != null) {
+            store.markTrustedPaired(store.convKeyOf(s.remoteIp()));
+            // 设备身份=deviceId+token：把 token 的地址缓存对齐到本次这条地址
+            // （旧地址清理在握手阶段做，见 startPairingOrActivate）
+            String tok = store.pairedTokenOf(s.peerId);
+            if (tok != null && !tok.isEmpty()) {
+                store.markPaired(s.peerId, s.peerName, tok, s.remoteIp());
+            }
+        }
+        // ==== 身份验证通过之后，才替换这台设备的历史地址 ====
+        // 先验证、再替换：握手阶段只做身份绑定（谁自称是谁），不删任何旧地址；
+        // 只有 token 命中 / 6 位码配对成功（走到这里）才认定「同一台设备换了局域网地址」，
+        // 新的连上、旧的自动删。否则 DHCP 把老地址分给别的设备时会误删这台设备的历史记录。
+        // 判「旧地址还有没有会话」必须按精确 IP（isConnectedIp），不能按设备组判，否则新地址的会话
+        // 会让旧地址一直算「连着的」，旧地址永远删不掉。
+        if (store != null && !s.peerId.isEmpty()) {
+            boolean selWasThisDevice = selectedIp != null && !selectedIp.isEmpty()
+                    && store.convKeyOf(selectedIp).equals(s.peerId);
+            if (store.syncGroupLanIp(s.peerId, s.remoteIp(), ip -> isConnectedIp(ip))) {
+                log("设备换地址：" + s.peerName + "(" + s.peerId + ") 局域网地址已切到 " + s.remoteIp());
+                // 当前对话就是这台设备：选中地址跟到刚验证通过的新地址上（旧地址马上被删）
+                if (selWasThisDevice && !s.remoteIp().equals(selectedIp)) {
+                    selectedIp = s.remoteIp();
+                    selectedLabel = s.peerName;
+                }
+            }
+        }
+        if (matchesPendingPair(s)) {
+            clearPendingPair();
+        }
+        if (pairUiMatches(s)) {
+            clearPairUi();
+        }
+        notifyPeers();
+        refreshState();
+        if (!first) {
+            // 重发 hello 触发的二次 ready：只刷新状态，不再重复补发/hsync
+            return;
+        }
+        // 这台设备可达→撤掉它自己的"没网络"票；下面 flushPending 负责续发
+        setFileVote(VOTE_NO_NETWORK, false, s.remoteIp());
         flushPending(s.remoteIp());
         // 剪贴板只跟「当前对话的那台」协商，不往别的设备推
         if (isSelected(s)) {
-            pullPeerClip();
+            // pair_ok 刚发出去、对端要收完这条才进 ready，它的配对闸门会丢掉早到的 clip_pull
+            // （真机日志实测：「未配对会话 192.168.5.12 发来 clip_pull，已丢弃」= 每次重连第一次剪贴板同步丢失）。
+            // 推迟一小段再拉，避开这个时序。
+            scheduleClipPull(s);
         }
-        // 历史同步(hsync,v2.3):双方都支持(hs=1)时互报mid清单、各取所需;
-        //  startHsync要扫history文件,不能卡网络读线程⇒工作线程(与Android端对称)
         if (s.caps.hs) {
-            daemon(() -> hsync.startHsync(s), "pp-hsync");
+            runFrameTask("hsync_start", () -> hsync.startHsync(s));
         }
+    }
+
+    private void showPairUi(PairUi u) {
+        pairUiIp = u.ip;
+        if (listener != null) {
+            listener.onPairState(u);
+        }
+    }
+
+    /**
+     * 这条会话是不是覆盖层上那台设备。按**设备组键**比较（同设备换网卡/热点换地址时 raw IP 会变），
+     * 否则配对完成/提交核对/取消都会因为地址不同而对不上，覆盖层就关不掉。
+     */
+    private boolean pairUiMatches(Session s) {
+        if (s == null) {
+            return false;
+        }
+        String cur = pairUiIp;
+        String ip = s.remoteIp();
+        if (cur.isEmpty() || ip.isEmpty()) {
+            return false;
+        }
+        if (cur.equals(ip)) {
+            return true;
+        }
+        return store != null && store.convKeyOf(cur).equals(store.convKeyOf(ip));
+    }
+
+    /** 关会话并从所有表里摘掉（配对取消/失败/超时共用） */
+    private void dropSession(Session s) {
+        if (s == null) {
+            return;
+        }
+        s.close();
+        sessions.remove(s);
+        if (!s.peerId.isEmpty()) {
+            byPeer.remove(s.peerId, s);
+        }
+        notifyPeers();
+        refreshState();
+    }
+
+    /** 发起方用户提交 6 位码（覆盖层数字键盘「确认」调用；**在 EDT 上**，发送必须异步） */
+    public void submitPairCode(String ip, String code) {
+        StringBuilder digits = new StringBuilder();
+        for (int i = 0; i < code.length() && digits.length() < PAIR_CODE_LEN; i++) {
+            char c = code.charAt(i);
+            if (c >= '0' && c <= '9') {
+                digits.append(c);
+            }
+        }
+        if (digits.length() != PAIR_CODE_LEN) {
+            return;
+        }
+        Session s = sessionByGroup(ip);
+        if (s == null || s.closed || s.pairRole != 2 || s.paired) {
+            // 连接被重连替换 / 对端已取消 / 已超时：不能一声不响地什么都不做，
+            // 否则键盘按了像卡死。给明确结果并收掉本端覆盖层，用户重新点设备即可再配。
+            log("配对：提交被忽略（会话=" + (s == null ? ip : s.remoteIp())
+                    + " role=" + (s == null ? -1 : s.pairRole) + "）");
+            showPairUi(new PairUi(ip, s == null ? "" : s.peerName, false, "",
+                    0, 0, "配对状态已失效，请关闭后重新点设备配对", true, false));
+            return;
+        }
+        final String digitsFinal = digits.toString();
+        // 先本地切「正在验证…」，再把帧交给 uiSendExec：
+        // EDT 直接写 socket 会等写锁（文件分片可能正占着），对端读得慢时界面就卡在这里
+        showPairUi(new PairUi(s.remoteIp(), s.peerName, false, "",
+                s.pairAttemptsLeft, PAIR_TTL_MS, "正在验证…"));
+        uiSendExec.execute(() -> {
+            if (!s.closed) {
+                trySend(s, Protocol.pairSubmit(digitsFinal));
+            }
+        });
+    }
+
+    /**
+     * 放弃本次配对（覆盖层「取消」调用）：只关掉两端的配对弹窗，**保留连接**。
+     * 之前是直接断会话，而两端启动时都会自动连，断完几秒又被连上、码又弹出来——用户根本取消不掉。
+     * 现在连接留在「已连接但未配对」，用户下次点设备再重新出示码。
+     */
+    public void cancelPairing(String ip) {
+        Session s = sessionByGroup(ip);
+        if (s != null && s.paired) {
+            // 已经配对成功：只把这层提示关掉
+            clearPairUi();
+            return;
+        }
+        log("配对：用户取消 " + (s == null ? ip : s.peerName + "(" + s.remoteIp() + ")")
+                + "，保留连接");
+        clearPendingPair();
+        if (s != null) {
+            s.pairRole = 0;
+            s.pairCode = "";
+            s.pairDeadline = 0L;
+            if (!s.closed && s.handshaked) {
+                // 通知对端把它那半边的配对弹窗也关掉（否则对端会一直停在输入框）；
+                // 取消按钮在 EDT 上，发送一律走 uiSendExec，别让写锁把界面卡住
+                uiSendExec.execute(() -> {
+                    if (!s.closed) {
+                        trySend(s, Protocol.pairCancel());
+                    }
+                });
+            }
+        }
+        // 不管有没有会话都要关掉本端覆盖层：旧实现里会话已断时这里直接 return，弹窗会卡住关不掉
+        clearPairUi();
+    }
+
+    private void clearPairUi() {
+        pairUiIp = "";
+        if (listener != null) {
+            listener.onPairState(null);
+        }
+    }
+
+    /** 对端在它那边点了「取消」：关掉本端弹窗，连接保留 */
+    private void onPairCancel(Session s) {
+        if (s.paired) {
+            return;
+        }
+        log("配对：对端取消（" + s.remoteIp() + "）");
+        s.pairRole = 0;
+        s.pairCode = "";
+        s.pairDeadline = 0L;
+        if (pairUiMatches(s)) {
+            clearPairUi();
+        }
+    }
+
+    private void onPairSubmit(Session s, Map<String, Object> j) {
+        if (s.paired) {
+            return;
+        }
+        if (s.pairRole != 1 || s.pairCode.length() != PAIR_CODE_LEN) {
+            // 本端此刻没有可核对的码（连接被重连替换 / 已取消 / 已超时）：
+            // 明确回一帧 pair_cancel 让对端从「正在验证…」退出并关掉键盘，
+            // 本端若还挂着覆盖层也一并收掉。旧实现直接 return ⇒ 两端都停在配对界面（用户看到的就是「卡死」）。
+            log("配对：收到提交但本端没有待核对的码（role=" + s.pairRole + "），回 pair_cancel 让对端退出");
+            if (!s.closed) {
+                trySend(s, Protocol.pairCancel());
+            }
+            s.pairRole = 0;
+            s.pairCode = "";
+            s.pairDeadline = 0L;
+            if (pairUiMatches(s)) {
+                showPairUi(new PairUi(s.remoteIp(), s.peerName, false, "",
+                        0, 0, "配对状态已失效，请关闭后重新点设备配对", true, false));
+            }
+            return;
+        }
+        String code = Json.str(j, "code", "");
+        boolean ok = code.length() == PAIR_CODE_LEN
+                && MessageDigest.isEqual(s.pairCode.getBytes(StandardCharsets.UTF_8),
+                code.getBytes(StandardCharsets.UTF_8));
+        if (ok) {
+            String token = newPairToken();
+            if (store != null) {
+                store.markPaired(s.peerId, s.peerName, token, s.remoteIp());
+            }
+            trySend(s, Protocol.pairOk(token));
+            log("配对成功：" + s.peerName + "(" + s.peerId + ")");
+            onSessionReady(s);
+        } else {
+            s.pairAttemptsLeft -= 1;
+            if (s.pairAttemptsLeft <= 0) {
+                log("配对失败：" + s.peerName + " 连续输错，关闭会话");
+                trySend(s, Protocol.pairFail(0));
+                showPairUi(new PairUi(s.remoteIp(), s.peerName, true, "",
+                        0, 0, "配对码错误次数过多，请重连后重新配对", true, false));
+                dropSession(s);
+            } else {
+                trySend(s, Protocol.pairFail(s.pairAttemptsLeft));
+                showPairUi(new PairUi(s.remoteIp(), s.peerName, true, s.pairCode,
+                        s.pairAttemptsLeft, PAIR_TTL_MS,
+                        "配对码不正确，还剩 " + s.pairAttemptsLeft + " 次"));
+            }
+        }
+    }
+
+    /**
+     * 对端点设备、出示它的码，本端切到数字键盘。
+     * 两端都可能主动点：本端此刻也在出示码时（同时发起），按 deviceId 定一方出示、一方输入，
+     * 否则两边都亮码、谁都没法输入。比较口径两端对称（myId 与 peerId 互换），必然只有一方保留码。
+     */
+    private void onPairNeed(Session s, Map<String, Object> j) {
+        if (s.paired) {
+            return;
+        }
+        long ttl = Json.lng(j, "ttl", PAIR_TTL_MS);
+        if (s.pairRole == 1 && !s.pairCode.isEmpty()) {
+            if (myId().compareTo(s.peerId) <= 0) {
+                log("配对：两端同时发起，本端继续出示配对码（" + s.remoteIp() + "）");
+                return;
+            }
+            log("配对：两端同时发起，本端改为输入对端的配对码（" + s.remoteIp() + "）");
+            s.pairCode = "";
+        }
+        s.pairRole = 2;
+        s.pairAttemptsLeft = PAIR_MAX_ATTEMPTS;
+        s.pairDeadline = System.currentTimeMillis() + ttl;
+        showPairUi(new PairUi(s.remoteIp(), s.peerName, false, "",
+                s.pairAttemptsLeft, ttl, "请输入对方设备上显示的 6 位配对码"));
+    }
+
+    private void onPairOk(Session s, Map<String, Object> j) {
+        String token = Json.str(j, "token", "");
+        if (!token.isEmpty()) {
+            if (store != null) {
+                store.markPaired(s.peerId, s.peerName, token, s.remoteIp());
+            }
+        } else if (store == null || store.pairedTokenOf(s.peerId).isEmpty()) {
+            log("配对确认回来了但本机没有 token（会话=" + s.remoteIp() + "），按未配对处理");
+            return;
+        } else if (!s.outgoing || s.pairTokenSent.isEmpty()) {
+            // 空 token 的 pair_ok 只对"确实带过 token 的发起方"有效，防伪造对端空口放行
+            log("配对确认缺 token 且本端未带过 token（会话=" + s.remoteIp() + "），按未配对处理");
+            return;
+        }
+        log("配对成功（token 校验）：" + s.peerName + "(" + s.peerId + ")");
+        onSessionReady(s);
+    }
+
+    private void onPairFail(Session s, Map<String, Object> j) {
+        int left = Math.max(0, Json.integer(j, "left", 0));
+        s.pairAttemptsLeft = left;
+        if (left <= 0) {
+            showPairUi(new PairUi(s.remoteIp(), s.peerName, false, "",
+                    0, 0, "配对码错误次数过多，请重连后重新配对", true, false));
+            dropSession(s);
+        } else {
+            showPairUi(new PairUi(s.remoteIp(), s.peerName, false, "",
+                    left, PAIR_TTL_MS, "配对码不正确，还剩 " + left + " 次"));
+        }
+    }
+
+    private static String newPairCode() {
+        return String.format(java.util.Locale.US, "%06d", PAIR_RANDOM.nextInt(1_000_000));
+    }
+
+    private static String newPairToken() {
+        byte[] b = new byte[16];
+        PAIR_RANDOM.nextBytes(b);
+        return hex(b);
     }
 
     /** 这条会话是不是当前对话目标 */
@@ -1703,12 +3107,12 @@ final LinkCall call = new LinkCall(this);
         }
     }
 
-    // ==================== 文件接收（双 4MB 缓冲 + 断点续传） ====================
+    // ==================== 文件接收（缓冲池 + 断点续传） ====================
 
     /**
      * 一个正在接收的文件。
-     * 双缓冲：数据先进 bufA/bufB（各 4MB），一块填满就交给落盘线程、自己切到另一块继续填；
-     * 两块都未落完时才阻塞（天然背压）。digest 覆盖整个文件（含续传前缀）。
+     * 缓冲池：数据直读进当前块（8MB），攒满 1MB 即入队交落盘线程、自己取下一块空闲块继续填；
+     * 没有空闲块时排队等（天然背压）；正在写盘的块绝不会再被读线程复用。见 LinkReceive.Rx。
      */
 
     final Map<String, Rx> rxMap = new HashMap<String, Rx>();
@@ -1752,6 +3156,39 @@ final LinkCall call = new LinkCall(this);
     final ConcurrentHashMap<String, ArrayBlockingQueue<Long>> resumeWaiters =
             new ConcurrentHashMap<String, ArrayBlockingQueue<Long>>();
 
+    // ===== 32MB 分块大小校验（不做 hash） =====
+    /** 发送端等「大小核验 + 截断确认」：blk_ack 带回实际核验通过的偏移 */
+    static final class BlkAckResult {
+        final boolean ok;
+        final long offset;
+
+        BlkAckResult(boolean ok, long offset) {
+            this.ok = ok;
+            this.offset = offset;
+        }
+    }
+
+    final ConcurrentHashMap<String, ArrayBlockingQueue<BlkAckResult>> blkAckWaiters =
+            new ConcurrentHashMap<String, ArrayBlockingQueue<BlkAckResult>>();
+    /** file_resume.needBlk=true */
+    final ConcurrentHashMap<String, Boolean> resumeNeedBlk = new ConcurrentHashMap<String, Boolean>();
+    /** 接收端待续传准备（file_query 命中半成品后等发送端选块起点） */
+    static final class ResumePrep {
+        final String mid, name, path;
+        final long size;
+        final String peerIp;
+
+        ResumePrep(String mid, String name, long size, String peerIp, String path) {
+            this.mid = mid;
+            this.name = name;
+            this.size = size;
+            this.peerIp = peerIp;
+            this.path = path;
+        }
+    }
+
+    final ConcurrentHashMap<String, ResumePrep> resumePrep = new ConcurrentHashMap<String, ResumePrep>();
+
     /** 正在发送中的 mid（含文件夹整体）：防止握手补发与在途传输重复发同一条 */
     final java.util.Set<String> inFlight =
             java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
@@ -1769,6 +3206,161 @@ final LinkCall call = new LinkCall(this);
     final java.util.Set<String> pausedMids =
             java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
 
+    // ==================== 单任务槽（一个设备同一时刻只传一个任务） ====================
+    /** 对端对某 mid 回过 busy 的时刻：本地发送在分片边界查它，命中就暂停该条目（不关会话），
+     *  过期自动失效（对端可能已断线重连、session 换了） */
+    static final long PEER_BUSY_TTL_MS = 120_000L;
+    final ConcurrentHashMap<String, Long> peerBusyAt = new ConcurrentHashMap<String, Long>();
+    /** 哪个 mid 是被哪台设备回绝的（对端发 sync_req=它空出来了 ⇒ 按 peer 一次性清，立刻重试） */
+    final ConcurrentHashMap<String, String> peerBusyPeer = new ConcurrentHashMap<String, String>();
+
+    /** 被回绝过的接收 mid/目录 id：其后续帧（成员 file_meta）直接回 busy，不走"隐式建目录"兜底 */
+    final java.util.Set<String> busyIds =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+    /** 任务槽：taskMid 空=空闲；kind ∈ {"send","recv"}；文件夹整体算一个任务（mid=目录气泡 mid） */
+    private final Object taskLock = new Object();
+    private String taskMid, taskPeer, taskKind, taskName;
+
+    /** 占用任务槽的文案（回 busy 时告诉对端"本机在忙什么"）；空闲返回 "" */
+    String busyHolder() {
+        synchronized (taskLock) {
+            if (taskMid == null) {
+                return "";
+            }
+            return (taskName == null || taskName.isEmpty()) ? taskKind + " " + taskMid : taskName;
+        }
+    }
+
+    String taskMid() {
+        synchronized (taskLock) {
+            return taskMid;
+        }
+    }
+
+    /** 占任务槽：同一 mid 幂等（文件夹成员/续传重入）；被别的任务占着返回 false */
+    boolean claimTask(String mid, String peer, String kind, String name) {
+        if (mid == null || mid.isEmpty()) {
+            return true;
+        }
+        synchronized (taskLock) {
+            if (taskMid == null) {
+                taskMid = mid;
+                taskPeer = peer;
+                taskKind = kind;
+                taskName = name;
+                busyIds.remove(mid);
+                return true;
+            }
+            return taskMid.equals(mid);
+        }
+    }
+
+    /** 等空槽再开传（**只允许发送串行队列线程调用**，别的线程阻塞等会卡住读线程/UI） */
+    boolean awaitTaskSlot(String mid, String peer, String kind, String name) throws InterruptedException {
+        while (!claimTask(mid, peer, kind, name)) {
+            if (sessionByGroup(peer) == null) {
+                return false;   // 对端已断，别再空等
+            }
+            Thread.sleep(500L);
+        }
+        return true;
+    }
+
+    /** 释放任务槽；notifyPeer=true 时补一个 sync_req，让被 busy 拦下的条目立刻重试 */
+    void releaseTask(String mid, boolean notifyPeer) {
+        if (mid == null || mid.isEmpty()) {
+            return;
+        }
+        String peer = null;
+        synchronized (taskLock) {
+            if (mid.equals(taskMid)) {
+                peer = taskPeer;
+                taskMid = null;
+                taskPeer = null;
+                taskKind = null;
+                taskName = null;
+            }
+        }
+        if (peer != null && notifyPeer) {
+            notifyPeerIdle(peer);
+        }
+    }
+
+    /** 断链时按"对端+方向"兜底释放（文件夹成员不逐条释放，只能这样收口） */
+    void releaseTaskFor(String peerIp, String kind) {
+        if (peerIp == null || peerIp.isEmpty()) {
+            return;
+        }
+        synchronized (taskLock) {
+            if (peerIp.equals(taskPeer) && (kind == null || kind.equals(taskKind))) {
+                taskMid = null;
+                taskPeer = null;
+                taskKind = null;
+                taskName = null;
+            }
+        }
+    }
+
+    /** 告诉对端"我这边空出来了，重新对一遍待发队列" */
+    void notifyPeerIdle(String peerIp) {
+        Session s = sessionByGroup(peerIp);
+        if (s == null || s.closed || !s.handshaked) {
+            return;
+        }
+        trySend(s, Protocol.syncReq());
+    }
+
+    void markPeerBusy(String mid, String name, String peer) {
+        if (mid == null || mid.isEmpty()) {
+            return;
+        }
+        peerBusyAt.put(mid, System.currentTimeMillis());
+        if (peer != null && !peer.isEmpty()) {
+            peerBusyPeer.put(mid, peer);
+        }
+        log("对端忙，暂缓 " + (name == null || name.isEmpty() ? mid : name) + "（mid=" + mid + "）");
+        stateNote = "对端正在传输其它任务，本条暂停，对方空闲后自动重试";
+    }
+
+    boolean consumePeerBusy(String mid) {
+        Long t = peerBusyAt.get(mid);
+        if (t == null) {
+            return false;
+        }
+        if (System.currentTimeMillis() - t.longValue() > PEER_BUSY_TTL_MS) {
+            peerBusyAt.remove(mid);
+            peerBusyPeer.remove(mid);
+            return false;
+        }
+        return true;
+    }
+
+    /** 对端发来 sync_req = 它刚空出来：清掉它名下的 busy 记号，待发队列立刻重试 */
+    void clearPeerBusyFor(String peerIp) {
+        if (peerIp == null || peerIp.isEmpty()) {
+            return;
+        }
+        java.util.Iterator<Map.Entry<String, String>> it = peerBusyPeer.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, String> e = it.next();
+            if (peerIp.equals(e.getValue())) {
+                peerBusyAt.remove(e.getKey());
+                it.remove();
+            }
+        }
+    }
+
+    void markBusyId(String id) {
+        if (id != null && !id.isEmpty()) {
+            busyIds.add(id);
+        }
+    }
+
+    boolean isBusyId(String id) {
+        return id != null && !id.isEmpty() && busyIds.contains(id);
+    }
+
     /** 发送停滞看门狗:在途mid30s没写出新字节(对端半死、socket写阻塞)时,
      *  关掉对应会话强制解阻塞⇒发送循环抛异常⇒现有catch⇒进待发队列⇒重连后自动续传;
      *  由心跳线程每{@link #STALL_SCAN_MS}顺带调用(不新开线程)。
@@ -1783,9 +3375,17 @@ final LinkCall call = new LinkCall(this);
             }
             if (now - t.longValue() > STALL_TIMEOUT_MS) {
                 String ip = inFlightPeer.get(mid);
-                if (ip != null && !ip.isEmpty()) {
-                    staleIps.add(ip);
+                if (ip == null || ip.isEmpty()) {
+                    continue;
                 }
+                // 反向仍在正常收包 ⇒ 是「对端读得慢/被限速」的背压，不是链路死：交给自适应帧降速，
+                // 别把整条会话（含反向正在收的那一份）一起关掉（互传时最容易踩）
+                Session ses = sessionByGroup(ip);
+                if (ses != null && !ses.closed && now - ses.lastRx < STALL_TIMEOUT_MS) {
+                    log("发送停滞 " + (now - t.longValue()) + "ms（" + ip + "），但仍在收对端数据（背压），不关会话");
+                    continue;
+                }
+                staleIps.add(ip);
             }
         }
         for (String ip : staleIps) {
@@ -1816,27 +3416,47 @@ final LinkCall call = new LinkCall(this);
         return false;
     }
 
-    // ==================== 续传完成 MD5 核对（端到端） ====================
-
-    /** 一次续传核对的会话状态：两端 MD5 各自后台算，谁先就绪都不阻塞 */
+    // ==================== 续传完成大小核对（端到端，不做 hash） ====================
 
     /** 发送端在途核对表（普通单文件续传才登记） */
     final ConcurrentHashMap<String, VerifyState> verifyMap =
             new ConcurrentHashMap<String, VerifyState>();
 
-    /** 核对超时:大文件MD5双方都要读一遍全盘,给足2分钟;超时只记日志不改传输结果 */
-    static final long VERIFY_TIMEOUT_MS = 120_000L;
+    /** 核对超时：只 stat 文件大小不读内容，整文件按 10s 预算；超时只记日志不改传输结果 */
+    static final long VERIFY_TIMEOUT_MS = 10_000L;
 
     /** 半成品过期时限:3天没人续传的孤儿半成品(取消帧丢失/对端重传换mid)启动时回收 */
     static final long PARTIAL_MAX_AGE_MS = 3L * 24 * 3600 * 1000;
+
+    // ===== P4-5 配对 =====
+    /** 配对码位数（6 位；输入长度、核对、生成三处统一用它） */
+    static final int PAIR_CODE_LEN = 6;
+    /** 配对码/等待输入的有效期（2 分钟） */
+    static final long PAIR_TTL_MS = 120_000L;
+    static final int PAIR_MAX_ATTEMPTS = 3;
+    static final java.security.SecureRandom PAIR_RANDOM = new java.security.SecureRandom();
+
+    /** 未配对会话仍允许的帧（心跳 + 配对握手本身） */
+    static final java.util.Set<String> PAIRED_ALLOWED_FRAMES = new java.util.HashSet<String>(
+            Arrays.asList("hello", "ping", "pong", "busy",
+                    "pair_need", "pair_submit", "pair_ok", "pair_fail", "pair_cancel"));
+
+    /** 用户点设备后等会话握手的最长时限：超过就不再补弹配对码（防几秒后的自动重连又弹出） */
+    static final long PAIR_TAP_INTENT_TTL_MS = 30_000L;
+
+    /** lane 数据通道允许的帧（分片与通道控制），其余内容帧一律不认 */
+    static final java.util.Set<String> LANE_ALLOWED_FRAMES = new java.util.HashSet<String>(
+            Arrays.asList("hello", "ping", "pong", "lane_ok", "xe_begin", "xe_end", "xe_ready", "busy"));
 
     /** 判"假连接(半开)"的收包空闲阈值:超过一轮心跳周期(5s)仍无收包才算 */
     private static final long STALE_RX_MS = 20_000L;
 
     /** 接收/发送停滞判定阈值:30s无任何真实进度(对端半死但TCP心跳仍正常);
      *  心跳仍正常是因为对端进程活着、只是发送线程卡死/被杀——心跳帧保不了业务帧 */
-    static final long STALL_TIMEOUT_MS = 30_000L;
+    /** 非文件帧写看门狗时限（P1-3，与安卓 Link.CONTROL_WRITE_TIMEOUT_MS 同值 15s） */
+    static final long CONTROL_WRITE_TIMEOUT_MS = 15_000L;
 
+    static final long STALL_TIMEOUT_MS = 30_000L;
     /** 停滞看门狗扫描周期（= 心跳周期）：心跳线程每 5s 顺带扫一次，不新开线程 */
     static final long STALL_SCAN_MS = 5_000L;
 
@@ -1850,14 +3470,80 @@ final LinkCall call = new LinkCall(this);
 
     /** UI发起的小帧(文本/剪贴板/同步)统一丢到这里发:EDT只入队,socket写不占UI线程——对端读不动时界面不再跟着卡(Android端有sendExec,PC这里补齐);
      *  单线程保序:同一线程提交的文本按原顺序到达对端 */
-    final java.util.concurrent.ExecutorService uiSendExec =
+    java.util.concurrent.ExecutorService uiSendExec = newUiSendExec();
+
+    /**
+     * P4-4：hsync / msg_del / 配对核对等「按帧触发」任务统一走有界池（0 核 + 3 线程 + 128 队列，空闲 60s 回收）。
+     * 不再每帧 new Thread；队列满丢弃并记日志。
+     */
+    private java.util.concurrent.ExecutorService frameExec = newFrameExec();
+
+    /** 接收收尾执行器（单线程）：file_done / dir_end 的落盘与清单对账最长 60s，绝不能坐在网络读线程上
+     *  （读线程不读 socket ⇒ 心跳把自己判死、对端等不到 ack）。单线程同时保证同一文件夹成员的
+     *  file_done 一定先于 dir_end 执行，onDirEnd 不会把"还在写盘"的成员误判成缺件 */
+    private final java.util.concurrent.ExecutorService rxFinalizeExec =
             java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "pp-ui-send");
+                Thread t = new Thread(r, "pp-rx-finalize");
                 t.setDaemon(true);
                 return t;
             });
 
+    void runRxFinalize(String tag, Runnable r) {
+        try {
+            rxFinalizeExec.execute(() -> {
+                try {
+                    r.run();
+                } catch (Throwable t) {
+                    log("接收收尾失败(" + tag + "): " + t);
+                }
+            });
+        } catch (Throwable t) {
+            log("接收收尾入队失败(" + tag + "): " + t);
+        }
+    }
+
+    private java.util.concurrent.ExecutorService newFrameExec() {
+        java.util.concurrent.ThreadPoolExecutor pool = new java.util.concurrent.ThreadPoolExecutor(
+                0, 3, 60L, java.util.concurrent.TimeUnit.SECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<Runnable>(128),
+                r -> {
+                    Thread t = new Thread(r, "pp-frame-task");
+                    t.setDaemon(true);
+                    return t;
+                },
+                new java.util.concurrent.ThreadPoolExecutor.DiscardPolicy());
+        pool.allowCoreThreadTimeOut(true);
+        return pool;
+    }
+
+    void runFrameTask(String tag, Runnable r) {
+        try {
+            if (frameExec.isShutdown()) {
+                return;
+            }
+            frameExec.execute(() -> {
+                try {
+                    r.run();
+                } catch (Throwable t) {
+                    log("后台帧任务失败(" + tag + "): " + t);
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException re) {
+            log("后台帧任务过多，丢弃 " + tag + "（P4-4 限流）");
+        }
+    }
+
+    /** P2-6：stop() 会 shutdownNow，start() 必须能重建 */
+    java.util.concurrent.ExecutorService newUiSendExec() {
+        return java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "pp-ui-send");
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
     public Msg sendText(String text) {
+        text = Protocol.limitText(text);
         trustContent(selectedIp());   // 已知设备打点④：发出文本
         Msg m = new Msg();
         m.mid = newMid();
@@ -1908,7 +3594,14 @@ final LinkCall call = new LinkCall(this);
             }
         }
         if (targets.isEmpty()) {
-            log("剪贴板暂存待发（当前无已连接设备，连上后自动补发）");
+            // 无设备丢弃口径（S7，与安卓同口径）：连"选中设备"都没有就别暂存——
+            // peerIp 空的 CLIP 条目只能靠 flushPending 的 onlyIp 兜底，容易变成长期积压
+            String sel = selectedIp();
+            if (sel == null || sel.isEmpty()) {
+                log("剪贴板未推送：当前没有已连接设备、也没有选中设备（不暂存）");
+                return false;
+            }
+            log("剪贴板暂存待发（选中设备 " + sel + " 未连接，连上后自动补发）");
             Msg m = new Msg();
             m.mid = newMid();
             m.peerIp = selectedIp();
@@ -1942,15 +3635,107 @@ final LinkCall call = new LinkCall(this);
     final java.util.Set<String> cancelled =
             java.util.Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
 
-    /** 文件夹发送状态：dirMid → 已完成的成员 relPath（重发时跳过） */
-    final ConcurrentHashMap<String, ConcurrentHashMap<String, Boolean>> dirSendState =
-            new ConcurrentHashMap<String, ConcurrentHashMap<String, Boolean>>();
+    /**
+     * 取消墓碑：用户点「取消发送」后把 mid **长期**记住（不随发送循环消费掉）。
+     *
+     * 为什么要有：[cancelled] 是「这次尝试到此为止」的一次性信号，发送循环读到就 remove。
+     * 但同一条文件可能已经排进了串行发送队列（syncNow→flushPendingNow 的「待发补发」任务），
+     * 循环一消费掉标记，排队的任务就会拿同一个 mid **重新开传**——取消完过几秒对端又冒出一个
+     * 气泡继续收，本端气泡已移除、看不到进度。
+     * 墓碑只在用户显式「继续/重试」（[forgetCanceled]）时清除。
+     */
+    private final java.util.Set<String> cancelTombs =
+            java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<String>());
+
+    /** 取消墓碑保留上限（只防内存无限增长） */
+    private static final int CANCEL_TOMB_MAX = 256;
+
+    /** 记一条取消墓碑（超出上限按最老的淘汰） */
+    void markCanceled(String mid) {
+        if (mid == null || mid.isEmpty()) {
+            return;
+        }
+        synchronized (cancelTombs) {
+            cancelTombs.add(mid);
+            if (cancelTombs.size() > CANCEL_TOMB_MAX) {
+                java.util.Iterator<String> it = cancelTombs.iterator();
+                while (cancelTombs.size() > CANCEL_TOMB_MAX && it.hasNext()) {
+                    it.next();
+                    it.remove();
+                }
+            }
+        }
+    }
+
+    /** 用户显式重试/继续：清墓碑，允许这一条重新发送 */
+    void forgetCanceled(String mid) {
+        if (mid == null || mid.isEmpty()) {
+            return;
+        }
+        synchronized (cancelTombs) {
+            cancelTombs.remove(mid);
+        }
+    }
+
+    /** 这条（或它所属的文件夹）是否已被用户取消且还没被「继续」 */
+    boolean isCanceled(String mid, String dirId) {
+        if (mid != null && cancelTombs.contains(mid)) {
+            return true;
+        }
+        return dirId != null && !dirId.isEmpty() && cancelTombs.contains(dirId);
+    }
+
+    /**
+     * 文件夹发送时对端「已经在盘上」的成员清单（dir_have）信箱：dirMid → 容量 1 的信箱。
+     * 断链重发整目录时对端先回报这份清单，发送端据此跳过，只补真正缺的文件（局域网，按文件粒度即可）。
+     */
+    final ConcurrentHashMap<String, ArrayBlockingQueue<java.util.List<String>>> dirHaveBox =
+            new ConcurrentHashMap<String, ArrayBlockingQueue<java.util.List<String>>>();
+
+    /** 成员 mid → 「目录 mid + \\u0001 + 成员 relPath」：成员 ack 到达时据此记账（S15/S24） */
+    final ConcurrentHashMap<String, String> dirMemberAck = new ConcurrentHashMap<String, String>();
+
+    /** 文件夹成员回执：只做记账/日志（要重发哪些由 dir_end 的清单对账决定，不再维护第二份完成表） */
+    boolean onMemberAck(String mid, boolean ok) {
+        if (mid == null || mid.isEmpty()) {
+            return false;
+        }
+        String v = dirMemberAck.remove(mid);
+        if (v == null) {
+            return false;
+        }
+        int sep = v.indexOf('\u0001');
+        if (sep <= 0) {
+            return true;
+        }
+        String relPath = v.substring(sep + 1);
+        if (!ok) {
+            log("成员 " + relPath + " 对端回报未收妥，等 dir_end 清单对账后补发");
+        }
+        return true;
+    }
+
+    /** 整目录收尾/取消时清掉该目录的成员回执登记（防无界增长） */
+    void clearMemberAcks(String dirId) {
+        if (dirId == null || dirId.isEmpty()) {
+            return;
+        }
+        java.util.Iterator<java.util.Map.Entry<String, String>> it = dirMemberAck.entrySet().iterator();
+        while (it.hasNext()) {
+            if (it.next().getValue().startsWith(dirId + "\u0001")) {
+                it.remove();
+            }
+        }
+    }
 
     boolean isCancelled(String mid, String dirId) {
         if (cancelled.contains(mid)) {
             return true;
         }
-        return dirId != null && !dirId.isEmpty() && cancelled.contains(dirId);
+        if (dirId != null && !dirId.isEmpty() && cancelled.contains(dirId)) {
+            return true;
+        }
+        return isCanceled(mid, dirId);
     }
     public void sendFile(File f) { trustContent(selectedIp()); send.sendFile(f, false); }
 
@@ -1967,9 +3752,9 @@ final LinkCall call = new LinkCall(this);
 
     public boolean sendCallInvite(String name, String ip, boolean vid, int lv, int af) { return call.sendCallInvite(name, ip, vid, lv, af); }
 
-    public boolean sendCallInvite(String name, String ip, boolean vid, int lv, int af,
+    public boolean sendCallInvite(String name, String ip, String peerIp, boolean vid, int lv, int af,
                                   int mport, boolean mudp, String msid) {
-        return call.sendCallInvite(name, ip, vid, lv, af, mport, mudp, msid);
+        return call.sendCallInvite(name, ip, peerIp, vid, lv, af, mport, mudp, msid);
     }
 
     public void sendCallAccept(String ip) { call.sendCallAccept(ip); }
@@ -2032,7 +3817,7 @@ final LinkCall call = new LinkCall(this);
 
     public String newConsentMid() { return consent.newConsentMid(); }
 
-    /** 主动发文件夹。空文件夹也照发（fileCount=0），不再静默拒绝 */
+    /** 主动发文件夹。**空文件夹一律忽略**（不建气泡/不进待发/不发 dir_meta，双端同一规则） */
     public void sendFolder(File dir) {
         trustContent(selectedIp());   // 已知设备打点⑤：发出文件夹（成员各自也算）
         List<File> files = new ArrayList<File>();
@@ -2042,10 +3827,25 @@ final LinkCall call = new LinkCall(this);
         if (skipped[0] > 0) {
             log("注意：目录过深/过大或部分子树读取失败，" + skipped[0] + " 个分支未包含在传输中");
         }
+        // 空文件夹直接忽略：不记清单、不出气泡、不入待发
+        if (files.isEmpty() && skipped[0] == 0) {
+            log("空文件夹已忽略：" + dir.getName() + " 内没有任何文件，本次未发送");
+            return;
+        }
         // 一个文件都没读到、却又有整块读失败:这是"读不到"而不是"空的";
         // 照发一个count=0的文件夹会让用户以为传成功了,实际什么都没传
-        if (files.isEmpty() && skipped[0] > 0) {
+        if (files.isEmpty()) {
             log("文件夹内容读取失败（" + skipped[0] + " 个分支未读到），已中止发送 —— 请确认该目录仍可访问");
+            return;
+        }
+        // 发送前名校验：文件夹名 + 每个成员相对路径；任一项不合格 → 提示并取消整次发送
+        List<String> rels = new ArrayList<String>();
+        for (File f : files) {
+            rels.add(LinkNames.relPathOf(dir, f));
+        }
+        String fnameErr = LinkNames.folderError(dir.getName(), rels);
+        if (fnameErr != null) {
+            notifyUser(fnameErr + "，已取消发送");
             return;
         }
         Msg m = new Msg();
@@ -2065,7 +3865,7 @@ final LinkCall call = new LinkCall(this);
         m.progress = 0;
         Session fs2 = sessionByGroup(selectedIp());
         // 投票为1时文件夹同样不入网,与单文件走同一条排队分支(拦在入口)
-        if (fs2 != null && !fileGateBlocked()) {
+        if (fs2 != null && !fileGateBlocked(m.peerIp)) {
             m.peerIp = fs2.remoteIp();
             m.status = Msg.ST_PENDING;
             emit(m);
@@ -2078,6 +3878,10 @@ final LinkCall call = new LinkCall(this);
                 int dc = consent.ensureDataConsent(item.peerIp, item.mid, DataConsent.KIND_FILE,
                         "发送文件夹", item.fileName, item.fileSize);
                 if (dc != DataConsent.OK) {
+                    if (dc == DataConsent.REMOTE_TIMEOUT) {
+                        send.pauseByDataTimeout(item, DataConsent.KIND_FILE);
+                        return;
+                    }
                     send.denyFileByData(item, dc == DataConsent.REMOTE_REFUSED
                             ? DataConsent.peerRefusedText(DataConsent.KIND_FILE) : LOCAL_DENY_TEXT);
                     return;
@@ -2093,22 +3897,24 @@ final LinkCall call = new LinkCall(this);
                 store.addPending(m);
             }
             if (fs2 == null) {
-                setFileVote(VOTE_NO_NETWORK, true);
+                setFileVote(VOTE_NO_NETWORK, true, m.peerIp);
                 log("设备 " + (selectedIp().isEmpty() ? "（未选择）" : selectedIp())
                         + " 未连接，文件夹 " + m.fileName + "（" + files.size() + " 个文件）进入待发队列");
             } else {
-                log("[文件排他] 通话期不入网：文件夹 " + m.fileName + "（" + files.size()
-                        + " 个文件）排队，结束后自动续发（D16）");
+                log("[文件排他] " + gateReason(m.peerIp) + "：文件夹 " + m.fileName + "（" + files.size()
+                        + " 个文件）排队，恢复后自动续发（D16）");
             }
         }
     }
 
     /** 对端报缺失后最多补发几轮;再缺说明是真发不过去,如实报失败而不是死循环 */
-    static final int DIR_RESEND_ROUNDS = 2;
+    static final int DIR_RESEND_ROUNDS = 1;
     /** 等dir_missing回执的时长:对端要先把本轮全部成员落盘、算校验和才核对 */
     static final long DIR_MISSING_WAIT_MS = 60_000L;
     /** 无清单时对端不会回执，等短一拍即可 */
     static final long DIR_MISSING_WAIT_SHORT_MS = 5_000L;
+    /** 等对端「已有成员清单」（dir_have）的时长：局域网同一事件循环内就回，1s 足够兜老端 */
+    static final long DIR_HAVE_WAIT_MS = 1_000L;
     /** dir_meta成员清单在线上最多多少字符(超了就不带,退化为"只按数量核对") */
     static final int DIR_LIST_MAX_CHARS = 2 * 1024 * 1024;
 
@@ -2195,7 +4001,9 @@ final LinkCall call = new LinkCall(this);
             return;
         }
         cancelled.add(mid);
-        dirSendState.remove(mid);
+        markCanceled(mid);
+        dirHaveBox.remove(mid);
+        clearMemberAcks(mid);
         // 这条内容原本发给谁，取消帧就发给谁（而不是"当前选中的设备"）
         String dest = store == null ? "" : store.pendingPeerIp(mid);
         if (store != null) {
@@ -2231,6 +4039,24 @@ final LinkCall call = new LinkCall(this);
         });
     }
 
+    /**
+     * 配对完成后推迟一点再拉对端剪贴板：pair_ok 还在路上，对端此刻尚未 ready，
+     * 它的「未配对会话」闸门会把 clip_pull 丢掉（真机重连时实测每次都丢第一发）。
+     */
+    private void scheduleClipPull(final Session s) {
+        daemon(() -> {
+            try {
+                Thread.sleep(400);
+            } catch (InterruptedException ignored) {
+                return;
+            }
+            if (s.closed || !s.paired) {
+                return;
+            }
+            pullPeerClip();
+        }, "pp-clip-pull");
+    }
+
     public void pullPeerClip() {
         final Session s = target();
         uiSendExec.execute(() -> {
@@ -2239,6 +4065,11 @@ final LinkCall call = new LinkCall(this);
                 return;
             }
             if (!LocalIps.isLanPeer(s.remoteIp())) {
+                return;
+            }
+            // 配对没走完就发 clip_pull 会被「未配对会话」闸门拦掉（CONNECTED 早于配对完成，
+            // 重连那一刻必撞）。配对完成时 onSessionReady 会再拉一次，这里安静跳过即可
+            if (!s.paired) {
                 return;
             }
             trySend(s, Protocol.clipPull());
@@ -2330,7 +4161,19 @@ final LinkCall call = new LinkCall(this);
                     continue;
                 }
             } else if (Msg.KIND_FILE.equals(p.kind)) {
-                if (cancelled.contains(p.mid)) {
+                // 已完整送达过这台设备 → 直接出队，不再与 hsync 补齐形成双发（S31）
+                if (send.isFileDelivered(p.mid, dest)) {
+                    store.removePending(p.mid);
+                    log("待发条目 " + p.fileName + " 此前已完整送达，直接出队");
+                    continue;
+                }
+                // 票①/②/③仍在拦这台设备：条目留在队列，解除后由 setFileVote/clearDenyConsent 触发补发。
+                // 不能直接 enqueue：否则票③还在时会走 ensureDataConsent 反复弹确认框
+                if (fileGateBlocked(dest)) {
+                    continue;
+                }
+                // 取消墓碑：用户取消过的条目不补发（队列入口还有一道同样的闸）
+                if (cancelled.contains(p.mid) || isCanceled(p.mid, null)) {
                     store.removePending(p.mid);
                     continue;
                 }
@@ -2343,13 +4186,37 @@ final LinkCall call = new LinkCall(this);
                     if (path.isDirectory()) {
                         LinkNames.listFilesRecursive(path, "", files, emptyDirs, skipped, 0);
                     }
-                    if (files.isEmpty() && emptyDirs.isEmpty()) {
+                    // 空文件夹一律忽略（双端统一规则）：没有任何成员 → 直接出队，绝不发 count=0 的 dir_meta
+                    if (files.isEmpty() && skipped[0] == 0) {
                         store.removePending(p.mid);
+                        log("待发文件夹 " + p.fileName + " 内没有任何文件，已忽略并出队");
+                        continue;
+                    }
+                    if (files.isEmpty()) {
+                        store.removePending(p.mid);
+                        log("待发文件夹 " + p.fileName + " 已不可读，移出待发队列");
+                        continue;
+                    }
+                    // 成员名校验：不合格 → 提示并取消该条（保持气泡为失败态，红叹号可再点）
+                    List<String> rels = new ArrayList<String>();
+                    for (File rf : files) {
+                        rels.add(LinkNames.relPathOf(path, rf));
+                    }
+                    String nameErr = LinkNames.folderError(p.fileName, rels);
+                    if (nameErr != null) {
+                        notifyUser(nameErr + "，已取消发送");
+                        send.denyFileByData(p, nameErr + "，已取消发送", false);
                         continue;
                     }
                 } else {
                     if (!path.exists()) {
                         store.removePending(p.mid);
+                        continue;
+                    }
+                    String nameErr = LinkNames.fileNameError(p.fileName);
+                    if (nameErr != null) {
+                        notifyUser(nameErr + "，已取消发送");
+                        send.denyFileByData(p, nameErr + "，已取消发送", false);
                         continue;
                     }
                 }
@@ -2454,11 +4321,22 @@ final LinkCall call = new LinkCall(this);
         }
     }
 
-    void trySend(Session s, Map<String, Object> m) {
+    /** 发一帧并如实回报是否真的交给 socket（墓碑确认、块校验兜底等需要按结果决定是否记账） */
+    boolean trySend(Session s, Map<String, Object> m) {
+        // ===== P4-5 发送侧闸门：未配对会话不允许发内容帧（配对帧/心跳在白名单里）；
+        // 与接收侧同口径，不以 handshaked 为前提（握手前也拦） =====
+        String frameType = Json.str(m, "type", "");
+        if (s != null && s.lane == 0 && !s.paired
+                && !PAIRED_ALLOWED_FRAMES.contains(frameType)) {
+            log("未配对会话 " + s.remoteIp() + " 试图发送 " + frameType + "，已拦截（请先完成配对）");
+            return false;
+        }
         try {
             s.send(m);
+            return true;
         } catch (Exception e) {
             log("发送失败: " + e);
+            return false;
         }
     }
 
@@ -2499,14 +4377,17 @@ final LinkCall call = new LinkCall(this);
         }
     }
 
-    // ===== 开发期调试出口 =====
-    // 只走标准输出，绝不进 log(...) → 不进 pc.log、不进界面。发布包保持 false。
-    private static final boolean BLOCK_DEBUG = false;
-
-    private static void blockDebugReport(String key) {
-        if (!BLOCK_DEBUG) {
-            return;
+    /** 提示用户 + 记日志（校验失败/空文件夹忽略等）。可在任意线程调用，UI 层自己切线程 */
+    void notifyUser(String s) {
+        Log.i(s);
+        Listener l = listener;
+        if (l != null) {
+            try {
+                l.onNotice(s);
+            } catch (Throwable ignore) {
+            }
         }
-        System.out.println("设备已标记 " + key);
     }
+
+    // ===== 开发期调试出口已移除 =====
 }

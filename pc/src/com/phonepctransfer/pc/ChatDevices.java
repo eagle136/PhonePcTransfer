@@ -232,6 +232,8 @@ final class ChatDevices {
         d.add(buildDeviceForm(group, isNew, ipField, remarkField, pickIp), BorderLayout.CENTER);
 
         JPanel btns = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 6));
+        btns.setOpaque(true);
+        btns.setBackground(Ui.SURFACE);
         if (!isNew) {
             JButton del = Ui.secondary(new JButton("删除"));
             del.addActionListener(e -> {
@@ -256,6 +258,12 @@ final class ChatDevices {
             if (isNew) {
                 if (ip.isEmpty()) {
                     JOptionPane.showMessageDialog(d, "IP 不能为空");
+                    return;
+                }
+                // 本机地址/环回不能当"对方设备"：加进去只会连到自己，握手会被自连闸门拒掉，
+                // 列表里就多一条永远连不上的行，还会被当成"当前对话"目标
+                if (isSelfAddr(ip)) {
+                    JOptionPane.showMessageDialog(d, "这是本机地址，不能作为设备添加");
                     return;
                 }
                 probeThen(d, ok, ip, () -> {
@@ -339,6 +347,24 @@ final class ChatDevices {
     /** 添加设备时的探测预算（3s） */
     private static final int PROBE_MS = 3000;
 
+    /** 本机地址/环回不能作为"对方设备"（与安卓端 isSelfAddress 同口径） */
+    private static boolean isSelfAddr(String ip) {
+        String v = ip == null ? "" : ip.trim();
+        if (v.isEmpty()) {
+            return false;
+        }
+        if (v.startsWith("127.") || v.equals("::1") || v.equals("0.0.0.0")
+                || v.equalsIgnoreCase("localhost")) {
+            return true;
+        }
+        for (String m : Discovery.localIpv4s()) {
+            if (v.equals(m)) {
+                return true;
+            }
+        }
+        return v.equals(Discovery.localIpv4());
+    }
+
     /**
      * 地址可达性探测：ICMP 与 TCP 两条路**并发**试，任一成功即返回 true，最多等 {@code budgetMs}。
      * 两条都是 daemon 线程，窗口关掉后不会拖着进程不退。
@@ -389,6 +415,9 @@ final class ChatDevices {
                                       JTextField ipField, JTextField remarkField, String[] pickIp) {
         JPanel form = new JPanel(new GridLayout(0, 1, 4, 6));
         form.setBorder(BorderFactory.createEmptyBorder(10, 12, 4, 12));
+        // 深色主题下默认 JPanel 底色是 LAF 的浅灰；DialogChrome 的圆角 SURFACE 会被它盖住
+        form.setOpaque(true);
+        form.setBackground(Ui.SURFACE);
 
         form.add(formLabel(isNew ? "IP 地址" : "添加地址（也是这台设备）"));
         form.add(ipField);
@@ -401,6 +430,7 @@ final class ChatDevices {
             form.add(formLabel("现有地址"));
             JPanel ipBox = new JPanel();
             ipBox.setLayout(new BoxLayout(ipBox, BoxLayout.Y_AXIS));
+            ipBox.setOpaque(false);
             for (final String a : group.ips) {
                 final JButton b = new JButton((a.equals(pickIp[0]) ? "● " : "○ ") + a);
                 // 档位：常规 15（=发送文件按钮同档）
@@ -440,6 +470,8 @@ final class ChatDevices {
         JLabel l = new JLabel(text);
         // 档位：常规 15（=发送文件按钮同档）
         l.setFont(new Font(ChatWindow.UI_FONT, Font.PLAIN, Ui.FS_STD));
+        // 深色主题：不显式给色就会用 LAF 的黑色字，贴在黑色底上等于看不见
+        l.setForeground(Ui.TEXT_MAIN);
         return l;
     }
 
@@ -453,12 +485,15 @@ final class ChatDevices {
     private final class DeviceRow extends JPanel {
         private final Store.Group group;
         private final boolean connected;
+        /** 已连上但还没配对：副标题提示「未配对，点一下配对」 */
+        private final boolean unpaired;
         /** 是否是「当前对话」的那台（聊天区正在显示它的记录） */
         private final boolean current;
 
-        DeviceRow(final Store.Group group, boolean connected, boolean current) {
+        DeviceRow(final Store.Group group, boolean connected, boolean unpaired, boolean current) {
             this.group = group;
             this.connected = connected;
+            this.unpaired = unpaired;
             this.current = current;
             setOpaque(true);
             setPreferredSize(new Dimension(ChatWindow.DEVICE_PANEL_W - 18, 46));
@@ -471,6 +506,7 @@ final class ChatDevices {
                             : "<br>共用地址（现属别的设备）: "
                                     + String.join("、", group.guestIps))
                     + (connected ? "<br>已连接" : "<br>未连接 — 单击连接")
+                    + (unpaired ? "<br>未配对 — 单击这台设备出示配对码" : "")
                     + (current ? "<br>当前对话设备" : "") + "</html>");
             addMouseListener(new MouseAdapter() {
                 @Override
@@ -483,6 +519,7 @@ final class ChatDevices {
                             return;
                         }
                         // 点一次 = 切为当前对话 + （没连才）连一次；失败不自动重试
+                        // 未配对时 switchConversation 内部会出示配对码（用户主动点才弹）
                         W.switchConversation(group.curIp, group.displayName());
                         if (W.link.isDeviceConnected(group.curIp)) {
                             W.setSub("当前对话：" + group.displayName() + "（" + group.curIp + "）");
@@ -516,6 +553,7 @@ final class ChatDevices {
                             // 别名行没有自己的地址：只能走「冲突确认 → 断开旧连接 → 切换」
                             W.switchConflictDevice(group);
                         } else {
+                            // 右键「连接/切换到该对话」也是用户主动点：未配对时内部会出示配对码
                             W.switchConversation(group.curIp, group.displayName());
                         }
                         refreshDevices();
@@ -558,12 +596,8 @@ final class ChatDevices {
                     JMenuItem del = new JMenuItem("删除");
                     del.setFont(f);
                     del.addActionListener(a -> {
-                        // 删整台设备（组内全部地址）
-                        for (String x : group.ips) {
-                            W.store.removePeer(x);
-                        }
-                        W.store.setGroupRemark(group.key, "");
-                        refreshDevices();
+                        // 先清会话并通知在线对端，再删整台设备，防止重发现后 hsync 复活旧消息。
+                        W.deleteDevice(group);
                     });
                     if (!group.alt) {
                         pm.addSeparator();
@@ -617,12 +651,13 @@ final class ChatDevices {
             g2.setColor(Ui.TEXT_MAIN);
             g2.drawString(ellipsize(g2, group.displayName(), ChatWindow.DEVICE_PANEL_W - 44), 24, 22);
 
-            // 副标题：当前地址（+ 地址数量）。与显示名相同（没备注也没广播名）时省略
-            String sub = group.curIp;
+            // 副标题：当前地址（+ 地址数量）。与显示名相同（没备注也没广播名）时省略。
+            // 未配对（连上但内容通道被闸门拦住）追加「· 未配对」：必须点这一行才会出示配对码。
+            String sub = group.curIp + (unpaired ? " · 未配对" : "");
             if (!sub.equals(group.displayName())) {
                 // 档位：最小 13（=IP 悬停提示同档）
                 g2.setFont(new Font(ChatWindow.UI_FONT, Font.PLAIN, Ui.FS_MIN));
-                g2.setColor(Ui.TEXT_SUB);
+                g2.setColor(unpaired ? new Color(0x15, 0x65, 0xC0) : Ui.TEXT_SUB);
                 g2.drawString(middleEllipsis(sub, g2.getFontMetrics(), ChatWindow.DEVICE_PANEL_W - 44), 24, 37);
             }
             g2.dispose();
@@ -839,20 +874,24 @@ final class ChatDevices {
             } else {
                 for (Store.Group g : groups) {
                     boolean online = false;
+                    boolean unpaired = false;
                     if (g.alt) {
                         // 别名行：看**这台设备身份**自己的会话 —— 那个 IP 上连着的可能是别人
                         online = W.link.isPeerConnected(g.key);
                     } else {
                         for (String a : g.ips) {
+                            // 已连上但没配对：列表里给提示，点这一行才会出示配对码
+                            if (W.link.isDeviceUnpaired(a)) {
+                                unpaired = true;
+                            }
                             if (W.link.isDeviceConnected(a)) {
                                 online = true;
-                                break;
                             }
                         }
                     }
                     boolean cur = W.shownIp != null && !W.shownIp.isEmpty()
                             && W.convKey(W.shownIp).equals(g.key);
-                    deviceListPanel.add(new DeviceRow(g, online, cur));
+                    deviceListPanel.add(new DeviceRow(g, online, unpaired, cur));
                 }
             }
             deviceListPanel.add(Box.createVerticalGlue());

@@ -1,14 +1,16 @@
 #!/bin/bash
 # 打 PC 端 MSI 安装包（含运行时/快捷方式/目录选择）。
-# ⚠️ 必须用 Git Bash 执行：/usr/bin/bash make-msi.sh
+# 本脚本是 MSI 打包内核，放在 <项目根>/tools/ 下；日常入口是项目根的 build_msi.py。
+# ⚠️ 必须用 Git Bash 执行：bash tools/make-msi.sh
 #    （裸 `bash` 会解析到 system32\bash.exe 即 WSL，PATH/路径全不对）
 # 内部版本号按构建时刻（YYMMDDHHMM）编码递增 —— Windows Installer 相同 ProductVersion 不做
 # 覆盖安装、低版本直接拒装，所以每次构建都必须比上一次大，jpackage 生成的 MSI 自带
-# MajorUpgrade 会自动卸旧装新。对外版本号由 APP_VER 控制（默认 1.2）。
+# MajorUpgrade 会自动卸旧装新。对外版本号由环境变量 APP_VER 控制（由 var 文件传入）。
 # 用法：先把最新 jar 放好（pc/dist/PhonePcTransfer-PC.jar），再跑本脚本；产物拷进根目录 out/。
 set -e
 # 自动适配执行环境：Git Bash 下 pwd=/c/...，WSL bash 下 pwd=/mnt/c/...（bash 命令可能解析到 WSL）
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+# 本文件位于 <项目根>/tools/，向上退一级得到项目根。
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # ⚠️ 父进程 cwd 是 Windows 形式时（从 IDE/命令行拉起的 shell 常见），pwd 会返回
 #    `C:/Users/...`。这种带**盘符冒号**的路径拼进 PATH，cygwin 反向转换 POSIX PATH 时
 #    按 `:` 拆条目，会把这一条切成 `C` + `/Users/...` 两段垃圾 → jpackage 报
@@ -142,31 +144,81 @@ fi
 echo "已生成入站放行脚本: installer/input/firewall-addrules.cmd ($(wc -c < "$FW_CMD") 字节，装在 <install>\\app\\ 下)"
 
 
-# ===== 构建临时目录：指到项目内 build/tmp =====
+# ===== 构建临时目录：指到项目内 build/tmp，且**每次构建一个独立子目录** =====
 # 本机系统 TEMP（AppData\Local\Temp）下 .NET 的 light.exe 建 .tmp 文件会被拒
-# （System.UnauthorizedAccessException），jpackage 自身的暂存目录同理 → 统一改到工程内，
-# 构建完可整目录删。
-BUILD_TMP="$PCROOT/build/tmp"
+# （System.UnauthorizedAccessException），jpackage 自身的暂存目录同理 → 统一改到工程内。
+# 之所以加 run.$$ 这一层：light.exe 会在工作目录里建 0000005d.2514 这类临时目录并先删后建，
+# 目录删不掉（被索引/杀软占着，或文件系统限制）时 light 直接返回 294 —— 复用同一个目录
+# 就等于把上一次的残留喂给下一次。每轮独立目录后，残留只会堆在 build/tmp 下，不影响出包。
+BUILD_TMP="$PCROOT/build/tmp/run.$$"
 mkdir -p "$BUILD_TMP"
 export TMP="$BUILD_TMP"
 export TEMP="$BUILD_TMP"
+trap 'rm -rf "$BUILD_TMP" "$JMOD_X" 2>/dev/null || true' EXIT
 
 # ===== jpackage 用的 JDK =====
-# 优先级：PP_JDK_HOME 环境变量（CI 用）> 本机安装的 Adoptium JDK 21 > 项目内置 tools/jdk21。
+# 优先级：PP_JDK_HOME 环境变量（CI 用）> 本机装有 jpackage 的 JDK 里版本最高的那份
+# > 项目内置 tools/jdk21。
 # 内置版的 NIO 访问检查在本机曾失效（Files.isWritable 恒 false → jpackage 误报
 # "Destination directory ... is not writable"），所以本机优先用系统安装版。
+# 之所以要「版本最高」：本机 Adoptium 装在**用户级**目录
+# （%LOCALAPPDATA%\Programs\Eclipse Adoptium），不在 Program Files 下，早先的写死路径
+# 找不到它，就退到内置 21.0.2 → 被下面的 21.0.7 下限挡住，出包直接失败。
+pick_jdk() {
+  best=""; bestkey=-1
+  for c in "$@"; do
+    [ -x "$c/bin/jpackage.exe" ] || continue
+    v=$(sed -n 's/^JAVA_VERSION="\([0-9.]*\)".*/\1/p' "$c/release" 2>/dev/null)
+    [ -n "$v" ] || continue
+    maj=${v%%.*}; rest=${v#*.}; min=${rest%%.*}; pat=${rest#*.}; pat=${pat%%.*}
+    case "$maj" in ''|*[!0-9]*) continue ;; esac
+    key=$(( 10#$maj * 1000000 + 10#${min:-0} * 1000 + 10#${pat:-0} ))
+    if [ "$key" -gt "$bestkey" ]; then bestkey=$key; best="$c"; fi
+  done
+  printf '%s' "$best"
+}
 if [ -n "${PP_JDK_HOME:-}" ]; then
   JP_HOME="$PP_JDK_HOME"
-elif [ -x "/c/Program Files/Eclipse Adoptium/jdk-21.0.12.101-hotspot/bin/jpackage.exe" ]; then
-  JP_HOME="/c/Program Files/Eclipse Adoptium/jdk-21.0.12.101-hotspot"
 else
-  JP_HOME="$PCROOT/tools/jdk21/jdk-21.0.2"
+  JP_HOME=$(pick_jdk \
+    "$HOME/AppData/Local/Programs/Eclipse Adoptium"/jdk-* \
+    "/c/Program Files/Eclipse Adoptium"/jdk-* \
+    "/c/Program Files/Java"/jdk-* \
+    "$HOME/AppData/Local/Programs/Java"/jdk-*)
+  [ -n "$JP_HOME" ] || JP_HOME="$PCROOT/tools/jdk21/jdk-21.0.2"
 fi
 if [ ! -x "$JP_HOME/bin/jpackage.exe" ]; then
   echo "[ERROR] 找不到 jpackage: $JP_HOME/bin/jpackage.exe"
-  echo "        设置 PP_JDK_HOME 指向 JDK 21+，或把 JDK 放到 pc/tools/jdk21/"
+  echo "        设置 PP_JDK_HOME 指向 JDK 21.0.7+（或 JDK 25），或把 JDK 放到 pc/tools/jdk21/"
   exit 1
 fi
+echo "[i] jpackage JDK: $JP_HOME"
+
+# ===== 随包运行时 tools/runtime 必须与 jpackage 用的 JDK 同版本 =====
+# 事故来源：仓库里那份 tools/runtime 长期停在 JDK 21.0.2，而 jpackage 用的是 21.0.12。
+# 21.0.2 在非 100% 显示缩放下有个渲染缺陷：JDialog / JFileChooser 这类二级窗口只画出
+# 标题栏，客户区整片空白（主窗口本身正常，所以开发机上看不出来）。实测 21.0.12 与
+# JBR 25 都正常。这里不再信任仓库里那份静态镜像：release 的 JAVA_VERSION 与 JP_HOME
+# 对不上就当场 jlink 重建，避免「源码/配置都改了、安装版还带着老缺陷」的错位。
+RT_MODS="java.base,java.datatransfer,java.xml,java.prefs,java.desktop,java.logging,java.management,java.security.sasl,java.naming,java.net.http,java.transaction.xa,java.sql,jdk.crypto.ec,jdk.crypto.cryptoki,jdk.unsupported,jdk.zipfs"
+JP_VER=$("$JP_HOME/bin/java.exe" -XshowSettings:properties -version 2>&1 | sed -n 's/.*java.version = //p' | tr -d '\r')
+# 版本下限：21 系低于 21.0.7 的补丁版带上述缺陷，直接拒绝出包（免得又发一版空白弹窗）
+case "$JP_VER" in
+  21.*)
+    JP_PATCH=$(echo "$JP_VER" | cut -d. -f3)
+    if [ "${JP_PATCH:-0}" -lt 7 ]; then
+      echo "[ERROR] JDK $JP_VER 已知会让二级窗口客户区整片空白；改用 21.0.7+ 或更新版本"
+      exit 1
+    fi ;;
+esac
+RT_VER=$(sed -n 's/^JAVA_VERSION="\(.*\)"/\1/p' tools/runtime/release 2>/dev/null || true)
+if [ ! -d tools/runtime ] || [ "$RT_VER" != "$JP_VER" ]; then
+  echo "[i] tools/runtime 版本 ${RT_VER:-无} != JDK $JP_VER —— 重建运行时镜像"
+  rm -rf tools/runtime
+  "$JP_HOME/bin/jlink.exe" --module-path "$JP_HOME/jmods" --add-modules "$RT_MODS" \
+    --output tools/runtime --strip-debug --no-header-files --no-man-pages --compress=zip-6
+fi
+echo "随包运行时: $(sed -n 's/^JAVA_VERSION=//p' tools/runtime/release)"
 
 # ===== BEGIN wxi-inject（完成页「立即运行」+ 卸载时「是否删用户数据」）=====
 # 两条功能都落在 MSI 的 WiX 层，Java 业务代码一行不动：
@@ -242,17 +294,20 @@ mkdir -p "$RES_DIR"
 # ---- 1) main.wxs 覆盖：从**本次真正使用的 JDK** 现取现改，只挪 include 那一行 ----
 # 不把 Oracle 模板抄进仓库（21.0.2 与 Adoptium 21.0.12 的模板可能不同，抄一份就会漂）。
 JMOD="$JP_HOME/jmods/jdk.jpackage.jmod"
-JMOD_X="$BUILD_TMP/jpmod-x"
+# 每次解包用**独立目录**，不依赖「先 rm -rf 固定目录」：
+# Windows 上残留目录里只要有一个文件还被索引/杀软/编辑器占着，rm -rf 就会
+# 「Directory not empty」直接把 set -e 打断（本机实测过）。唯一目录 + trap 清理最稳。
+JMOD_X="$BUILD_TMP/jpmod-x.$$"
+# 清理统一走上面那条 EXIT trap（$BUILD_TMP 与 $JMOD_X 一起删）
 if [ ! -f "$JMOD" ] || [ ! -x "$JP_HOME/bin/jmod.exe" ]; then
   echo "[ERROR] 取不到 $JMOD 或 jmod.exe：无法生成 main.wxs 覆盖（注入点挪不进 <Product>）"
   exit 1
 fi
-rm -rf "$JMOD_X"
 "$JP_HOME/bin/jmod.exe" extract --dir "$JMOD_X" "$JMOD" >/dev/null
 TMPL_WXS="$JMOD_X/classes/jdk/jpackage/internal/resources/main.wxs"
 if [ ! -f "$TMPL_WXS" ]; then
   echo "[ERROR] jmod 解包后没找到 main.wxs：$TMPL_WXS"
-  rm -rf "$JMOD_X"; exit 1
+  exit 1
 fi
 awk '
   /overrides\.wxi/ { next }                                   # 丢掉原位置（<Product> 之前）那行
@@ -264,7 +319,7 @@ awk '
   }
   { print }
 ' "$TMPL_WXS" > "$RES_DIR/main.wxs"
-rm -rf "$JMOD_X"
+# 解包目录由 EXIT trap 统一清理；这里不 rm（删不掉也只留个临时目录，不影响出包）
 n_inc=$(grep -c 'overrides\.wxi' "$RES_DIR/main.wxs")
 inc_ln=$(grep -n 'overrides\.wxi' "$RES_DIR/main.wxs" | head -1 | cut -d: -f1)
 open_ln=$(grep -n '<Product' "$RES_DIR/main.wxs" | head -1 | cut -d: -f1)
